@@ -1,0 +1,169 @@
+/**
+ * Executes a wrapped `xcodebuild` and tails its live result stream.
+ *
+ * Used by `bb xcode run -- xcodebuild …`. The wrapper is what upgrades a build
+ * from "we can see the process exists" (Tier 0) to per-section live progress
+ * with issues as they are emitted (Tier 3).
+ */
+
+import { spawn } from "node:child_process";
+import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  applyStreamEvent,
+  emptyProgress,
+  injectStreamFlags,
+  parseStreamLine,
+  splitLines,
+  type StreamEvent,
+  type StreamProgress,
+} from "./stream";
+
+export interface RunnerOptions {
+  argv: readonly string[];
+  cwd?: string;
+  /** Called on every parsed event; keep it cheap, it runs on the tail loop. */
+  onEvent?: (event: StreamEvent, progress: StreamProgress) => void;
+  /** Poll interval for the stream file tail. */
+  pollMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface RunnerResult {
+  exitCode: number;
+  bundlePath: string;
+  progress: StreamProgress;
+  stdoutTail: string;
+  stderrTail: string;
+}
+
+/** Keep only the last `limit` bytes of a growing string. */
+function tailOf(text: string, limit: number): string {
+  return text.length <= limit ? text : text.slice(text.length - limit);
+}
+
+/**
+ * Run xcodebuild with a result bundle + live stream, returning once it exits.
+ *
+ * The stream file is created up front because xcodebuild refuses to write to a
+ * path that does not already exist.
+ */
+export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> {
+  const workDir = await mkdtemp(join(tmpdir(), "bb-xcode-"));
+  const streamPath = join(workDir, "stream.ndjson");
+  const defaultBundle = join(workDir, "result.xcresult");
+  await writeFile(streamPath, "");
+
+  const injected = injectStreamFlags(options.argv, defaultBundle, streamPath);
+  const [command, ...args] = injected.argv;
+  if (!command) {
+    await rm(workDir, { recursive: true, force: true });
+    throw new Error("No command given to run.");
+  }
+
+  let progress = emptyProgress();
+  let stdout = "";
+  let stderr = "";
+
+  const child = spawn(command, args, {
+    cwd: options.cwd,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdout = tailOf(stdout + chunk.toString("utf8"), 200_000);
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr = tailOf(stderr + chunk.toString("utf8"), 64_000);
+  });
+
+  const onAbort = (): void => {
+    child.kill("SIGTERM");
+  };
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+
+  // Tail the stream file alongside the process. Reading by offset avoids
+  // re-parsing the whole file on every poll.
+  let stopTailing = false;
+  const tail = (async () => {
+    let offset = 0;
+    let carry = "";
+    const handle = await open(injected.streamPath, "r").catch(() => null);
+    if (!handle) return;
+    try {
+      while (!stopTailing) {
+        const stats = await handle.stat();
+        if (stats.size > offset) {
+          const length = stats.size - offset;
+          const buffer = Buffer.allocUnsafe(length);
+          const { bytesRead } = await handle.read(buffer, 0, length, offset);
+          offset += bytesRead;
+          const { lines, rest } = splitLines(
+            carry + buffer.subarray(0, bytesRead).toString("utf8"),
+          );
+          carry = rest;
+          for (const line of lines) {
+            const event = parseStreamLine(line);
+            if (!event) continue;
+            progress = applyStreamEvent(progress, event);
+            options.onEvent?.(event, progress);
+          }
+        }
+        await delay(options.pollMs ?? 250);
+      }
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  })();
+
+  const exitCode = await new Promise<number>((resolve) => {
+    child.on("error", () => resolve(127));
+    child.on("close", (code) => resolve(code ?? 0));
+  });
+
+  // Let the tail drain whatever xcodebuild flushed as it exited.
+  await delay(400);
+  stopTailing = true;
+  await tail.catch(() => undefined);
+  options.signal?.removeEventListener("abort", onAbort);
+
+  return {
+    exitCode,
+    bundlePath: injected.bundlePath,
+    progress,
+    stdoutTail: stdout,
+    stderrTail: stderr,
+  };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Interpret an xcodebuild exit code.
+ *
+ * 65 is the one that matters in practice: it means the build succeeded but
+ * tests failed, which is a very different outcome from a compile failure.
+ */
+export function describeExit(code: number): string {
+  switch (code) {
+    case 0:
+      return "succeeded";
+    case 64:
+      return "usage error";
+    case 65:
+      return "tests failed";
+    case 66:
+      return "input error";
+    case 70:
+      return "internal error";
+    case 130:
+      return "interrupted";
+    default:
+      return `exit ${code}`;
+  }
+}
