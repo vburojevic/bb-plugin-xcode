@@ -34,6 +34,10 @@ export function RunDetail({
 }) {
   const live = isLive(run);
   const problems = findings.length > 0 || failedTests.length > 0;
+  // `destinationLabel` is already resolved to "iPhone 17 Pro · iOS 26.5"; split
+  // it so the device and its runtime read as two facts rather than one string.
+  const [simulatorName, osVersion] = splitDestination(run.destinationLabel);
+  const containerName = basename(run.container);
   const testsBadge =
     run.testTotal !== null
       ? (run.testFailed ?? 0) > 0
@@ -45,7 +49,7 @@ export function RunDetail({
       : null;
 
   return (
-    <div className="px-3 pb-2 pt-1.5">
+    <div className="max-h-72 overflow-y-auto px-3 pb-2 pt-1.5">
       {statusHint(run.status) ? (
         <div className="flex items-start gap-1.5 pb-1.5 text-[11px] text-muted-foreground">
           <Icon name="Info" className="mt-0.5 size-3 shrink-0" aria-hidden />
@@ -55,22 +59,46 @@ export function RunDetail({
 
       {live ? <WorkerSwarm run={run} /> : null}
 
+      {/* Identity first — the simulator and what was pointed at it. This is
+          the group people actually open the row for: "which device, which
+          scheme, which configuration". Paths and process detail come after,
+          because they answer a rarer question. */}
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[11px]">
-        <Fact label="Kind" value={kindLabel(run.kind)} />
-        {run.destinationLabel ? (
+        {simulatorName ? <Fact label="Simulator" value={simulatorName} /> : null}
+        {osVersion ? <Fact label="Runtime" value={osVersion} /> : null}
+        {!simulatorName && run.destinationLabel ? (
           <Fact label="Destination" value={run.destinationLabel} />
         ) : null}
+        {run.scheme ? <Fact label="Scheme" value={run.scheme} /> : null}
+        {run.configuration ? (
+          <Fact label="Configuration" value={run.configuration} />
+        ) : null}
+        <Fact label="Action" value={kindLabel(run.kind)} />
+        {containerName ? <Fact label="Workspace" value={containerName} /> : null}
+        {run.projectName ? <Fact label="Project" value={run.projectName} /> : null}
         {run.branch ? <Fact label="Branch" value={run.branch} mono /> : null}
         {run.worktree ? <Fact label="Checkout" value={run.worktree} /> : null}
-        {run.projectName ? <Fact label="Project" value={run.projectName} /> : null}
-        <Fact label="Started" value={formatClock(run.startedAt)} />
+        <Fact
+          label="Started"
+          value={`${formatClock(run.startedAt)}${live ? "" : ` · ${formatDuration(run.durationMs)}`}`}
+        />
         {run.endedAt ? (
+          <Fact label="Finished" value={formatClock(run.endedAt)} />
+        ) : null}
+        {live && run.workerCount ? (
           <Fact
-            label="Finished"
-            value={`${formatClock(run.endedAt)} · ${formatDuration(run.durationMs)}`}
+            label="Compilers"
+            value={`${run.workerCount} running`}
           />
         ) : null}
+        {run.pid !== null ? <Fact label="Process" value={`pid ${run.pid}`} /> : null}
         {run.root ? <Fact label="Derived data" value={run.root} mono /> : null}
+        {run.bundlePath ? (
+          <Fact label="Result bundle" value={run.bundlePath} mono />
+        ) : null}
+        {run.destination && run.destination !== run.destinationLabel ? (
+          <Fact label="Destination spec" value={run.destination} mono />
+        ) : null}
       </dl>
 
       {run.errorCount > 0 || run.warningCount > 0 || testsBadge ? (
@@ -89,11 +117,25 @@ export function RunDetail({
               label={`${run.warningCount} warning${run.warningCount === 1 ? "" : "s"}`}
             />
           ) : null}
+          {run.analyzerCount > 0 ? (
+            <Chip
+              cls="bbx-status-warn"
+              icon="Info"
+              label={`${run.analyzerCount} analyzer`}
+            />
+          ) : null}
           {testsBadge ? (
             <Chip
               cls={testsBadge.cls}
               icon={(run.testFailed ?? 0) > 0 ? "CircleX" : "CircleCheck"}
               label={testsBadge.label}
+            />
+          ) : null}
+          {(run.testSkipped ?? 0) > 0 ? (
+            <Chip
+              cls="bbx-status-muted"
+              icon="CircleDashed"
+              label={`${run.testSkipped} skipped`}
             />
           ) : null}
         </div>
@@ -162,6 +204,21 @@ export function RunDetail({
       ) : null}
     </div>
   );
+}
+
+/** "iPhone 17 Pro · iOS 26.5" → ["iPhone 17 Pro", "iOS 26.5"]. */
+function splitDestination(label: string | null): [string | null, string | null] {
+  if (!label) return [null, null];
+  const parts = label.split("·").map((part) => part.trim());
+  if (parts.length < 2) return [label, null];
+  return [parts[0] ?? null, parts.slice(1).join(" · ")];
+}
+
+function basename(path: string | null): string | null {
+  if (!path) return null;
+  const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
+  const index = trimmed.lastIndexOf("/");
+  return index === -1 ? trimmed : trimmed.slice(index + 1);
 }
 
 function Fact({

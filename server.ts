@@ -34,6 +34,16 @@ import {
   type ThreadEventLike,
 } from "./src/thread-outcome";
 
+/**
+ * Findings and failed tests returned to the activity card.
+ *
+ * Ten was a card-sized number back when this fed a two-line summary; the
+ * disclosure is a scrollable panel and a broken build routinely has more than
+ * ten errors, where seeing only the first ten is actively misleading about the
+ * scale of the breakage.
+ */
+const FINDING_LIMIT = 40;
+
 export default async function plugin(bb: BbPluginApi): Promise<void> {
   const settings = bb.settings.define({
     scanIntervalSeconds: {
@@ -138,6 +148,26 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   const processedThreadTasks = new Set(
     (await bb.storage.kv.get<string[]>("processed-thread-tasks")) ?? [],
   );
+
+  /**
+   * Runs the user has dismissed from the activity banner.
+   *
+   * The banner keeps the last settled run on screen so "how did that go"
+   * outlives the build itself; this is the other half of that contract — an
+   * explicit way to say "seen it". Persisted, because a dismissal that came
+   * back on the next window reload would be worse than no dismissal at all.
+   */
+  const dismissedRuns = new Set(
+    (await bb.storage.kv.get<string[]>("dismissed-runs")) ?? [],
+  );
+  const persistDismissedRuns = async (): Promise<void> => {
+    const retained = [...dismissedRuns].slice(-500);
+    if (retained.length !== dismissedRuns.size) {
+      dismissedRuns.clear();
+      for (const id of retained) dismissedRuns.add(id);
+    }
+    await bb.storage.kv.set("dismissed-runs", retained);
+  };
 
   // Engine and collector reference each other (engine asks the collector for
   // project attribution); a late-bound holder breaks the cycle for TS.
@@ -461,11 +491,18 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         !scope || runMatchesScope(run, scope);
 
       const unresolved = store.listUnresolved().filter(inScope);
-      const finished = store
+      const settled = store
         .listRuns({ limit: 100 })
         .filter((run) => run.status !== "running" && run.status !== "finishing")
-        .filter(inScope)
-        .slice(0, 5);
+        .filter(inScope);
+      const finished = settled.slice(0, 5);
+      // Only ever the NEWEST settled run, and null once dismissed. Walking
+      // back to the one before would answer a question nobody asked: a run
+      // older than the one you just cleared is, by definition, staler news,
+      // and it would take a dozen clicks to get an empty card.
+      const newest = settled[0] ?? null;
+      const lastSettled =
+        newest && !dismissedRuns.has(newest.id) ? newest : null;
 
       const pinned = runId ? store.getRun(runId) : null;
       const run = pinned ?? unresolved[0] ?? finished[0] ?? null;
@@ -481,12 +518,13 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           .filter((entry) => entry.id !== run?.id)
           .map(toDto),
         recent: finished.filter((entry) => entry.id !== run?.id).map(toDto),
+        lastSettled: lastSettled ? toDto(lastSettled) : null,
         scope: scopeDto,
         findings: problems
           ? store
               .listFindings(run.id)
               .filter((finding) => finding.severity === "error")
-              .slice(0, 10)
+              .slice(0, FINDING_LIMIT)
               .map((finding) => ({
                 severity: finding.severity,
                 message: finding.message,
@@ -499,7 +537,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           ? store
               .listTests(run.id)
               .filter((test) => test.status === "failed")
-              .slice(0, 10)
+              .slice(0, FINDING_LIMIT)
               .map((test) => ({
                 suite: test.suite,
                 name: test.name,
@@ -510,6 +548,13 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
               }))
           : [],
       };
+    },
+
+    async dismissRun({ runId }) {
+      dismissedRuns.add(runId);
+      await persistDismissedRuns();
+      publish();
+      return { ok: true };
     },
 
     async rescan() {

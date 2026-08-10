@@ -1,24 +1,32 @@
 /**
- * The activity row — one build, one line, opening onto everything else.
+ * The activity row — one build, one line where it fits, never a collision.
  *
  * Two rules fight here and both win:
  *
  *  1. The FRAME is the host's. Geometry, radius, surface and rhythm come from
  *     `PromptStackCard` (see `.bbx-stack-card` in app.css) so the row sits in
- *     bb's prompt stack as a peer of "Running background command", not as a
- *     plugin bolted on beside it. 32px, `px-3 py-1.5`, `text-xs`.
- *  2. The CONTENTS are ours. Inside that frame a build says what only a build
- *     can: a pulsing Xcode-blue dot while compilers churn, a green check or a
- *     red cross when the verdict lands, the status word in that same colour,
- *     and a border that shifts with it. The host's flat grey is right for a
- *     shell command; a build has a state worth seeing across the room.
+ *     bb's prompt stack as a peer of "Running background command".
+ *  2. The CONTENTS are ours. State leads as a filled pill in the run's own
+ *     colour — BUILDING, SUCCEEDED, FAILED — because in a stack of neutral
+ *     grey rows the one fact a build has that a shell command doesn't is an
+ *     outcome, and it should be readable before anything else.
  *
- * Status colours are Xcode's own vocabulary blended with live theme tokens
- * (`--bbx`, set by `.bbx-status-*`), so they track any palette instead of
- * fighting it.
+ * ## Why it wraps instead of truncating
  *
- * The host has five row states, Xcode has seven — the mapping is the one
- * judgement call in this file:
+ * The fields are variable-length and unbounded: a scheme, a simulator name and
+ * OS, a branch that can run fifty characters. Held on one line with `shrink-0`
+ * they overlapped on a narrow composer — text drawn over text, which is worse
+ * than either truncation or wrapping. So the meta group is a wrapping flex
+ * row: one line when it fits, growing to at most three when it does not, each
+ * field truncating individually rather than shoving its neighbour. Past three
+ * lines the row clips, because a prompt-stack card that grows without bound
+ * stops being chrome and starts being content.
+ *
+ * The status pill, the timer and the controls never wrap — they are the row's
+ * fixed skeleton, and the wrapping happens between them.
+ *
+ * The host has five row states, Xcode has seven; the mapping is the one
+ * judgement call here:
  *
  *   running   → active     the row that earns its weight
  *   finishing → pending    process gone, verdict not in yet
@@ -43,26 +51,31 @@ import {
   kindLabel,
   runStatusLabel,
   runTitle,
-  statusIcon,
 } from "./format";
-import { isLive, statusClass, type RunDto } from "./status-types";
+import { isLive, type RunDto } from "./status-types";
 
-/** Native header-row geometry, matched exactly. */
-const ROW_CLASS =
-  "flex min-h-8 w-full min-w-0 items-center gap-2 px-3 py-1.5 text-xs";
+/**
+ * Three lines of meta at ~17px. The cap is a clip, not a scroll: whatever
+ * falls past it is by definition the least important field, and the
+ * disclosure holds the complete picture anyway.
+ */
+const META_MAX_HEIGHT = 54;
 
 export function XcodeActivityRow({
   run,
   children,
   defaultExpanded,
   trailing,
+  onDismiss,
 }: {
   run: RunDto;
   /** Disclosed body. Omit for a row that does not open. */
   children?: ReactNode;
   defaultExpanded?: boolean;
-  /** Extra meta rendered just before the chevron, e.g. "+2 more". */
+  /** Extra meta rendered just before the controls, e.g. "+2 more". */
   trailing?: ReactNode;
+  /** Present only on a settled run the user is allowed to clear. */
+  onDismiss?: () => void;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded ?? false);
   const bodyId = useId();
@@ -73,9 +86,8 @@ export function XcodeActivityRow({
   const elapsed = live ? Date.now() - run.startedAt : run.durationMs;
   const collapsible = Boolean(children);
 
-  // One trailing fact, chosen for what the state actually leaves unanswered:
-  // a live build is "how hard is it working", a finished one is "what did it
-  // leave behind". Never both — this is a single line.
+  // One trailing fact, chosen for what the state leaves unanswered: a live
+  // build is "how hard is it working", a settled one "what did it leave".
   const tail = live
     ? run.workerCount
       ? `${run.workerCount} compiler${run.workerCount === 1 ? "" : "s"}`
@@ -94,34 +106,42 @@ export function XcodeActivityRow({
 
   const header = (
     <>
-      <StatusMark status={run.status} />
-      <span className="flex min-w-0 flex-1 items-center gap-2">
-        <span className="shrink-0 font-semibold text-foreground">
+      <StatusPill run={run} />
+      {/* min-w-0 is what lets the children truncate instead of forcing the
+          row wider than the card that holds it. */}
+      <span
+        className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-0.5 overflow-hidden text-left"
+        style={{ maxHeight: META_MAX_HEIGHT }}
+      >
+        <span className="max-w-full truncate font-semibold text-foreground">
           {runTitle(run)}
         </span>
-        <span className="bbx-chip shrink-0 rounded-full border px-1.5 py-0 text-[10px] font-medium capitalize leading-[15px]">
+        <span className={activityMetaClass(state, "max-w-full truncate")}>
           {kindLabel(run.kind)}
         </span>
-        <span className="bbx-text shrink-0 font-medium">
-          {runStatusLabel(run)}
-        </span>
         {run.destinationLabel ? (
-          <span className={activityMetaClass(state, "shrink-0 truncate")}>
+          <span
+            className={activityMetaClass(state, "max-w-full truncate")}
+            title={run.destinationLabel}
+          >
             {run.destinationLabel}
           </span>
         ) : null}
         {run.branch ? (
-          <span className={activityMetaClass(state, "flex min-w-0 items-center gap-0.5")}>
+          <span
+            className={activityMetaClass(state, "flex max-w-full items-center gap-0.5")}
+            title={run.branch}
+          >
             <Icon name="GitBranch" className="size-3 shrink-0 opacity-70" aria-hidden />
-            <span className="truncate" title={run.branch}>
-              {run.branch}
-            </span>
+            <span className="truncate">{run.branch}</span>
+          </span>
+        ) : null}
+        {tail ? (
+          <span className={activityMetaClass(state, "max-w-full truncate tabular-nums")}>
+            {tail}
           </span>
         ) : null}
       </span>
-      {tail ? (
-        <span className={activityMetaClass(state, "shrink-0 tabular-nums")}>{tail}</span>
-      ) : null}
       <span
         className={cn(
           "shrink-0 font-medium tabular-nums",
@@ -148,21 +168,39 @@ export function XcodeActivityRow({
 
   return (
     <>
-      {collapsible ? (
-        <button
-          type="button"
-          id={toggleId}
-          aria-expanded={expanded}
-          aria-controls={bodyId}
-          aria-label={`${kindLabel(run.kind)}: ${runTitle(run)}`}
-          onClick={() => setExpanded((value) => !value)}
-          className={cn(ROW_CLASS, "cursor-pointer text-left transition-colors hover:bg-background/80")}
-        >
-          {header}
-        </button>
-      ) : (
-        <div className={ROW_CLASS}>{header}</div>
-      )}
+      {/* The dismiss control sits OUTSIDE the disclosure button: a button
+          inside a button is invalid markup, and clearing a row must never
+          also toggle its panel open. */}
+      <div className="flex items-stretch">
+        {collapsible ? (
+          <button
+            type="button"
+            id={toggleId}
+            aria-expanded={expanded}
+            aria-controls={bodyId}
+            aria-label={`${kindLabel(run.kind)}: ${runTitle(run)}`}
+            onClick={() => setExpanded((value) => !value)}
+            className="flex min-h-8 min-w-0 flex-1 cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors hover:bg-background/80"
+          >
+            {header}
+          </button>
+        ) : (
+          <div className="flex min-h-8 min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-xs">
+            {header}
+          </div>
+        )}
+        {onDismiss ? (
+          <button
+            type="button"
+            aria-label={`Dismiss ${runTitle(run)}`}
+            title="Dismiss"
+            onClick={onDismiss}
+            className="flex w-8 shrink-0 cursor-pointer items-center justify-center border-l border-border/40 text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <Icon name="X" className="size-3.5" aria-hidden />
+          </button>
+        ) : null}
+      </div>
 
       {/* A live run keeps a hairline of motion even while collapsed, so the
           row reads as working rather than merely present. */}
@@ -190,9 +228,7 @@ export function XcodeActivityRow({
               : "pointer-events-none grid-rows-[0fr] opacity-0",
           )}
         >
-          <div className={cn("overflow-hidden bg-popover", statusClass(run.status))}>
-            {children}
-          </div>
+          <div className="overflow-hidden bg-popover">{children}</div>
         </section>
       ) : null}
     </>
@@ -200,37 +236,17 @@ export function XcodeActivityRow({
 }
 
 /**
- * The status mark: a pulsing dot while live (Xcode-blue blended with the theme
- * accent), a static verdict icon once resolved. Colours flow from the enclosing
- * `.bbx-status-*` scope, and the icon's `transition-colors` makes a verdict
- * landing read as the row settling rather than swapping.
+ * The state, as a filled pill.
+ *
+ * Solid fill rather than tinted text because this is the row's anchor: it
+ * never wraps and never truncates, holding its position while everything to
+ * its right reflows. The label is kind-aware while in flight (Testing,
+ * Archiving), since a test run reading "Building" is simply wrong.
  */
-function StatusMark({ status }: { status: RunDto["status"] }) {
-  if (status === "running" || status === "finishing") {
-    return (
-      <span
-        className="bbx-dot relative flex size-3.5 shrink-0 items-center justify-center"
-        aria-hidden
-      >
-        <span className="bb-xcode-ping absolute size-2.5 rounded-full opacity-60" />
-        <span
-          className={cn(
-            "relative size-2.5 rounded-full",
-            status === "finishing" && "opacity-60",
-          )}
-        />
-      </span>
-    );
-  }
+function StatusPill({ run }: { run: RunDto }) {
   return (
-    <span
-      className="bbx-text flex size-3.5 shrink-0 items-center justify-center"
-      aria-hidden
-    >
-      <Icon
-        name={statusIcon(status)}
-        className="bbx-verdict-in size-3.5 transition-colors duration-200"
-      />
+    <span className="bbx-pill shrink-0 rounded-full px-2 text-[10px] font-semibold uppercase leading-[17px] tracking-wide">
+      {runStatusLabel(run)}
     </span>
   );
 }

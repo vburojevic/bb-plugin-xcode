@@ -35,10 +35,16 @@ export type RunDto = {
   startedAt: number;
   endedAt: number | null;
   durationMs: number | null;
+  configuration: string | null;
+  cwd: string | null;
+  pid: number | null;
+  bundlePath: string | null;
   errorCount: number;
   warningCount: number;
+  analyzerCount: number;
   testTotal: number | null;
   testFailed: number | null;
+  testSkipped: number | null;
   branch: string | null;
   worktree: string | null;
   workerCount: number | null;
@@ -49,6 +55,8 @@ export type ChatStatus = {
   run: RunDto | null;
   active: RunDto[];
   recent: RunDto[];
+  /** Newest settled, undismissed run — what the banner shows when idle. */
+  lastSettled: RunDto | null;
   scope: {
     threadId: string;
     path: string;

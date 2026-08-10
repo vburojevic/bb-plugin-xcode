@@ -168,6 +168,15 @@ export const rpcContract = defineRpcContract({
   },
 
   /**
+   * Dismiss one settled run from the activity banner. Persisted, so it stays
+   * dismissed across reloads and restarts; a newer run still appears normally.
+   */
+  dismissRun: {
+    input: z.object({ runId: z.string() }).strict(),
+    output: z.object({ ok: z.boolean() }),
+  },
+
+  /**
    * Everything the live activity banner needs in one call. With `runId`
    * the card pins that run; otherwise it shows the thread's own activity
    * (scope resolved server-side from `threadId`), falling back to
@@ -187,6 +196,16 @@ export const rpcContract = defineRpcContract({
       active: z.array(runSchema),
       /** Recent finished runs in the same scope (newest first). */
       recent: z.array(runSchema),
+      /**
+       * The newest settled run in scope, or null once dismissed.
+       *
+       * The banner shows this when nothing is building, so the answer to "how
+       * did that go" survives the build it describes. Dismissing clears the
+       * card outright rather than revealing the run before it — older news is
+       * not what someone who just said "seen it" is asking for. A newer run
+       * settling replaces it and makes the card reappear.
+       */
+      lastSettled: runSchema.nullable(),
       /** Resolved thread scope; null means the card is machine-wide. */
       scope: z
         .object({

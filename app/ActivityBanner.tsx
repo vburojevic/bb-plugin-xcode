@@ -19,7 +19,6 @@
  * building. Zero, one, or five builds all render correctly without the model
  * being involved or even aware. The directive is gone entirely, renderer
  * included — nothing this plugin shows can be changed by what a model says.
- * Finished runs live in the nav panel and `bb xcode status`, not in chat.
  *
  * The frame is `.bbx-stack-card` — a copy of the host's PromptStackCard driven
  * by the host's own CSS variables. We draw it ourselves rather than take
@@ -44,11 +43,23 @@
  *    the only question left is "how many";
  *  - detail is fetched per row, on expand, so N collapsed rows still cost the
  *    single banner-wide request they always did.
+ *
+ * ## What it shows when nothing is building
+ *
+ * The last settled run, until a newer one replaces it or the user dismisses
+ * it. A card that vanished the instant a build finished threw away the one
+ * thing anybody was waiting for — the outcome — and left nowhere to see
+ * whether it passed. Dismissal goes through `dismissRun` and is persisted
+ * server-side, because a "seen it" that came back on the next window reload
+ * is worse than no dismissal at all.
  */
 
-import { useComposerView } from "@bb/plugin-sdk/app";
+import { useCallback } from "react";
+import { useComposerView, useRpc } from "@bb/plugin-sdk/app";
 
 import { cn } from "@/lib/utils";
+
+import type { rpcContract } from "../src/contract";
 
 import { XcodeActivityRow } from "./ActivityRow";
 import { activityMetaClass, runActivityState } from "./activity-styles";
@@ -72,14 +83,30 @@ export function XcodeActivityBanner() {
 }
 
 function XcodeActivityBannerLoaded({ threadId }: { threadId: string }) {
+  const rpc = useRpc<typeof rpcContract>();
   const { data } = useChatStatus(threadId, null);
-  const runs = liveRuns(data?.run ?? null, data?.active ?? []);
-  useLiveTick(runs.length > 0);
+  const live = liveRuns(data?.run ?? null, data?.active ?? []);
+  useLiveTick(live.length > 0);
 
-  // Nothing live renders nothing at all — frame included, so the stack closes
-  // up rather than keeping an empty card above the composer.
+  const dismiss = useCallback(
+    (runId: string) => {
+      void rpc.call("dismissRun", { runId });
+    },
+    [rpc],
+  );
+
+  // While anything is building the card is about the work in progress. Only
+  // once everything goes quiet does it fall back to the last result — so the
+  // answer to "how did that go" outlives the build, without the card growing
+  // a history section during a busy stretch.
+  const settled = data?.lastSettled ?? null;
+  const runs = live.length > 0 ? live : settled && !isNoise(settled) ? [settled] : [];
+
+  // Nothing to report renders nothing at all — frame included, so the stack
+  // closes up rather than keeping an empty card above the composer.
   if (runs.length === 0) return null;
 
+  const showingSettled = live.length === 0;
   const shown = runs.slice(0, MAX_ROWS);
   const overflow = runs.length - shown.length;
 
@@ -93,7 +120,10 @@ function XcodeActivityBannerLoaded({ threadId }: { threadId: string }) {
         // A hairline between rows, never above the first — the card's own
         // border already closes that edge.
         <div key={run.id} className={cn(index > 0 && "border-t border-border/60")}>
-          <XcodeActivityRow run={run}>
+          <XcodeActivityRow
+            run={run}
+            onDismiss={showingSettled ? () => dismiss(run.id) : undefined}
+          >
             <RunDetailForRun threadId={threadId} run={run} />
           </XcodeActivityRow>
         </div>
