@@ -244,6 +244,29 @@ function flagValue(tokens: string[], flag: string): string | null {
 }
 
 /**
+ * A flag value that may span several tokens. `ps` strips shell quoting, so
+ * `-destination 'generic/platform=iOS Simulator'` arrives as two tokens;
+ * rejoin until the next flag or action verb (`build`, `test`, …), bounded.
+ */
+function flagValuePhrase(tokens: string[], flag: string): string | null {
+  const index = tokens.indexOf(flag);
+  if (index === -1 || index + 1 >= tokens.length) return null;
+  const first = tokens[index + 1]!;
+  if (first.startsWith("-")) return null;
+  const parts = [first];
+  for (
+    let cursor = index + 2;
+    cursor < tokens.length && parts.length < 5;
+    cursor++
+  ) {
+    const token = tokens[cursor]!;
+    if (token.startsWith("-") || token in ACTION_VERBS) break;
+    parts.push(token);
+  }
+  return parts.join(" ");
+}
+
+/**
  * Pull everything we can out of an `xcodebuild` command line.
  *
  * Also handles wrappers (xcodebuildmcp and friends) that embed a JSON blob
@@ -268,7 +291,7 @@ export function parseXcodebuildArgs(args: string): ActivityAttribution {
     scheme: flagValue(tokens, "-scheme"),
     container,
     configuration: flagValue(tokens, "-configuration"),
-    destination: flagValue(tokens, "-destination"),
+    destination: flagValuePhrase(tokens, "-destination"),
     derivedDataPath: flagValue(tokens, "-derivedDataPath"),
     resultBundlePath: flagValue(tokens, "-resultBundlePath"),
     cwd: null,

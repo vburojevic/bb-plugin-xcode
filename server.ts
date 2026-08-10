@@ -507,8 +507,14 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       { name: "rescan", summary: "Force a discovery + sweep", usage: "bb xcode rescan" },
       {
         name: "run",
-        summary: "Run xcodebuild with live tracking (adds result bundle + stream)",
+        summary:
+          "Start xcodebuild with live tracking, detached from this command (returns a run id + chat directive)",
         usage: "bb xcode run -- xcodebuild -scheme App build",
+      },
+      {
+        name: "stop",
+        summary: "Stop a running tracked build",
+        usage: "bb xcode stop <run-id>",
       },
       {
         name: "shim",
@@ -583,12 +589,14 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         }
         case "run":
           return cliRun(rest, ctx);
+        case "stop":
+          return cliStop(rest[0]);
         case "shim":
           return cliShim(rest[0] ?? "status");
         default:
           return {
             exitCode: 1,
-            stderr: `Unknown command '${command}'. Try: status, runs, show, roots, rescan, run, shim\n`,
+            stderr: `Unknown command '${command}'. Try: status, runs, show, roots, rescan, run, stop, shim\n`,
           };
       }
     },
@@ -649,9 +657,18 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   }
 
   let lastLivePublishAt = 0;
+
+  /**
+   * Start a wrapped xcodebuild and return as soon as the tracker has adopted
+   * it. DELIBERATELY DETACHED from the CLI request: holding the request open
+   * for a whole build meant bb's CLI proxy timeout (~5 min, measured live on
+   * a Packerly build) aborted ctx.signal, which SIGTERM'd xcodebuild mid-
+   * build and left an unfinalized result bundle. A build's lifetime belongs
+   * to the build; `bb xcode stop <id>` is the cancellation path.
+   */
   async function cliRun(
     args: string[],
-    ctx: { cwd?: string; signal?: AbortSignal },
+    ctx: { cwd?: string },
   ): Promise<{ exitCode: number; stdout?: string; stderr?: string }> {
     const separator = args.indexOf("--");
     const commandArgs = separator === -1 ? args : args.slice(separator + 1);
@@ -666,49 +683,101 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         ? ["/usr/bin/xcodebuild", ...commandArgs.slice(1)]
         : commandArgs;
 
-    const result = await runWrapped({
-      argv,
-      cwd: ctx.cwd,
-      signal: ctx.signal,
-      onEvent: (_event, progress) => {
-        // Throttled: xcodebuild can emit hundreds of events per build, and
-        // every publish makes each open panel refetch the full overview —
-        // N events × M panels of amplification.
-        const at = Date.now();
-        if (at - lastLivePublishAt < 500) return;
-        lastLivePublishAt = at;
-        bb.realtime.publish(XCODE_CHANNEL, {
-          at,
-          live: {
-            section: progress.currentSection,
-            opened: progress.sectionsOpened,
-            closed: progress.sectionsClosed,
-            errors: progress.errors,
-            warnings: progress.warnings,
-          },
+    let bundlePath: string | null = null;
+    const started = new Promise<void>((resolve) => {
+      void runWrapped({
+        argv,
+        cwd: ctx.cwd,
+        onStart: (info) => {
+          bundlePath = info.bundlePath;
+          resolve();
+        },
+        onEvent: (_event, progress) => {
+          // Throttled: xcodebuild can emit hundreds of events per build, and
+          // every publish makes each open panel refetch the full overview —
+          // N events × M panels of amplification.
+          const at = Date.now();
+          if (at - lastLivePublishAt < 500) return;
+          lastLivePublishAt = at;
+          bb.realtime.publish(XCODE_CHANNEL, {
+            at,
+            live: {
+              section: progress.currentSection,
+              opened: progress.sectionsOpened,
+              closed: progress.sectionsClosed,
+              errors: progress.errors,
+              warnings: progress.warnings,
+            },
+          });
+        },
+      })
+        .then(async (result) => {
+          engine.foldWrappedExit(
+            result.bundlePath,
+            {
+              exitCode: result.exitCode,
+              signal: result.signal,
+              errors: result.progress.errors,
+              warnings: result.progress.warnings,
+            },
+            Date.now(),
+          );
+          await collector.fullScan();
+          publish();
+          bb.log.info(
+            `wrapped build ${describeExit(result.exitCode, result.signal)}: ${result.bundlePath}`,
+          );
+        })
+        .catch((error: unknown) => {
+          resolve();
+          bb.log.warn(`wrapped build failed to run: ${String(error)}`);
         });
-      },
     });
+    await started;
+    if (!bundlePath) {
+      return { exitCode: 1, stderr: "Failed to start the build.\n" };
+    }
 
-    await collector.fullScan();
+    // Give the probe a moment to adopt the process so we can hand back a
+    // run id (and thus a chat card) instead of just a bundle path.
+    let tracked: Run | undefined;
+    for (let attempt = 0; attempt < 8 && !tracked; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await collector.probeTick().catch(() => false);
+      tracked = store
+        .listRuns({ limit: 25 })
+        .find((run) => run.bundlePath === bundlePath);
+    }
     publish();
 
-    const tracked = store
-      .listRuns({ limit: 25 })
-      .find((run) => run.bundlePath === result.bundlePath);
-    const summary =
-      `${describeExit(result.exitCode)} — ${result.progress.sectionsOpened} sections, ` +
-      `${result.progress.errors} error(s), ${result.progress.warnings} warning(s)\n` +
-      `result bundle: ${result.bundlePath}\n` +
-      (tracked
-        ? `\nStatus card for chat (emit on its own line, not in a code fence): ::xcode{run="${tracked.id}"}\n`
-        : "");
-    return {
-      exitCode: result.exitCode,
-      stdout: capOutput(summary),
-      stderr:
-        result.exitCode === 0 ? undefined : result.stderrTail.slice(-4000) || undefined,
-    };
+    const lines = [
+      `Build started${tracked ? ` and tracked as ${tracked.id}` : ""}.`,
+      `It keeps running if this command disconnects; stop it with: bb xcode stop ${tracked?.id ?? "<run-id>"}`,
+      `Watch it: bb xcode status, or emit this directive on its own line in chat (not in a code fence):`,
+      tracked ? `::xcode{run="${tracked.id}"}` : "::xcode{}",
+      "",
+      `result bundle: ${bundlePath}`,
+    ];
+    return { exitCode: 0, stdout: capOutput(`${lines.join("\n")}\n`) };
+  }
+
+  function cliStop(id: string | undefined): {
+    exitCode: number;
+    stdout?: string;
+    stderr?: string;
+  } {
+    if (!id) return { exitCode: 1, stderr: "Usage: bb xcode stop <run-id>\n" };
+    const run = store.getRun(id);
+    if (!run) return { exitCode: 1, stderr: `No run with id '${id}'.\n` };
+    if (run.status !== "running" || run.pid === null) {
+      return { exitCode: 1, stderr: `Run ${id} is not running.\n` };
+    }
+    try {
+      process.kill(run.pid, "SIGTERM");
+    } catch {
+      return { exitCode: 1, stderr: `Process ${run.pid} is already gone.\n` };
+    }
+    return { exitCode: 0, stdout: `Sent SIGTERM to ${run.pid} (${id}).\n` };
   }
 
   async function cliShim(

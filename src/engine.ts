@@ -193,6 +193,63 @@ export class Engine {
     return changed;
   }
 
+  // ------------------------------------------------------ wrapped-exit fold
+
+  /**
+   * Fold the exit of a build the plugin itself spawned (`bb xcode run`).
+   *
+   * The exit status plus the live stream's tallies are an honest RANK.logged
+   * verdict the moment the process dies — a `.xcresult` parse can still
+   * upgrade it to verified later, but a killed or bundle-less build no longer
+   * dangles in "finishing" (or worse, reads as passed: a signaled child's
+   * `code` is null, which once mapped to 0).
+   */
+  foldWrappedExit(
+    bundlePath: string,
+    outcome: {
+      exitCode: number | null;
+      signal: string | null;
+      errors: number;
+      warnings: number;
+    },
+    now: number,
+  ): boolean {
+    const target = this.store
+      .listRuns({ limit: 50 })
+      .find((run) => run.bundlePath === bundlePath);
+    if (!target) return false;
+
+    const verdict: RunStatus =
+      outcome.signal !== null || outcome.exitCode === null
+        ? "cancelled"
+        : outcome.exitCode === 0
+          ? outcome.warnings > 0
+            ? "warnings"
+            : "passed"
+          : "failed";
+
+    target.errorCount = Math.max(target.errorCount, outcome.errors);
+    target.warningCount = Math.max(target.warningCount, outcome.warnings);
+    if (
+      !statusTransitionAllowed(
+        { status: target.status, rank: target.statusRank },
+        { status: verdict, rank: RANK.logged },
+      )
+    ) {
+      this.store.updateRun(target);
+      return false;
+    }
+    target.status = verdict;
+    target.statusRank = RANK.logged;
+    target.endedAt ??= now;
+    for (const [pid, live] of this.live) {
+      if (live.runId === target.id) this.live.delete(pid);
+    }
+    this.store.updateRun(target);
+    this.hooks.log(`verdict from wrapped exit: ${verdict} (${target.id})`);
+    return true;
+  }
+
   // ---------------------------------------------------------- manifest fold
 
   /**

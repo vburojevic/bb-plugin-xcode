@@ -26,13 +26,18 @@ export interface RunnerOptions {
   cwd?: string;
   /** Called on every parsed event; keep it cheap, it runs on the tail loop. */
   onEvent?: (event: StreamEvent, progress: StreamProgress) => void;
+  /** Called once the child is spawned, with the paths it will write. */
+  onStart?: (info: { bundlePath: string; streamPath: string; pid: number | null }) => void;
   /** Poll interval for the stream file tail. */
   pollMs?: number;
   signal?: AbortSignal;
 }
 
 export interface RunnerResult {
-  exitCode: number;
+  /** Process exit code; null when the process died to a signal. */
+  exitCode: number | null;
+  /** Termination signal (e.g. "SIGTERM"), null on a normal exit. */
+  signal: string | null;
   bundlePath: string;
   progress: StreamProgress;
   stdoutTail: string;
@@ -71,6 +76,11 @@ export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> 
     cwd: options.cwd,
     env: process.env,
     stdio: ["ignore", "pipe", "pipe"],
+  });
+  options.onStart?.({
+    bundlePath: injected.bundlePath,
+    streamPath: injected.streamPath,
+    pid: child.pid ?? null,
   });
 
   child.stdout?.on("data", (chunk: Buffer) => {
@@ -119,10 +129,14 @@ export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> 
     }
   })();
 
-  const exitCode = await new Promise<number>((resolve) => {
-    child.on("error", () => resolve(127));
-    child.on("close", (code) => resolve(code ?? 0));
-  });
+  // A signaled child reports `code null`; that must never read as success —
+  // it is exactly how a killed build looked "passed" before.
+  const exit = await new Promise<{ code: number | null; signal: string | null }>(
+    (resolve) => {
+      child.on("error", () => resolve({ code: 127, signal: null }));
+      child.on("close", (code, signal) => resolve({ code, signal }));
+    },
+  );
 
   // Let the tail drain whatever xcodebuild flushed as it exited.
   await delay(400);
@@ -131,7 +145,8 @@ export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> 
   options.signal?.removeEventListener("abort", onAbort);
 
   return {
-    exitCode,
+    exitCode: exit.code,
+    signal: exit.signal,
     bundlePath: injected.bundlePath,
     progress,
     stdoutTail: stdout,
@@ -149,7 +164,8 @@ function delay(ms: number): Promise<void> {
  * 65 is the one that matters in practice: it means the build succeeded but
  * tests failed, which is a very different outcome from a compile failure.
  */
-export function describeExit(code: number): string {
+export function describeExit(code: number | null, signal?: string | null): string {
+  if (code === null) return signal ? `killed (${signal})` : "killed";
   switch (code) {
     case 0:
       return "succeeded";

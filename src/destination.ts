@@ -48,6 +48,15 @@ export function destinationLabel(
     return `device ${id.slice(0, 8)}`;
   }
 
+  // Generic destinations ("build for any device of this platform") — render
+  // them the way Xcode's own destination picker does.
+  const generic = fields["generic/platform"];
+  if (generic) {
+    return generic.endsWith("Simulator")
+      ? `Any ${generic}`
+      : `Any ${generic} Device`;
+  }
+
   const platform = fields["platform"];
   const name = fields["name"];
   const os = fields["os"];

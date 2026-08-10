@@ -368,3 +368,62 @@ describe("shim-wrapped runs (regression)", () => {
     expect(runs[0]!.bundlePath).toBe("/bundles/x.xcresult");
   });
 });
+
+describe("foldWrappedExit", () => {
+  const BUNDLE = "/tmp/wrap/result.xcresult";
+
+  function startWrapped(): string {
+    engine.foldSnapshot([activity({ resultBundlePath: BUNDLE })], 1_000_500);
+    return store.listRuns({ limit: 1 })[0]!.id;
+  }
+
+  it("maps a clean exit to passed", () => {
+    const id = startWrapped();
+    engine.foldWrappedExit(
+      BUNDLE,
+      { exitCode: 0, signal: null, errors: 0, warnings: 0 },
+      1_060_000,
+    );
+    const run = store.getRun(id)!;
+    expect(run.status).toBe("passed");
+    expect(run.endedAt).toBe(1_060_000);
+  });
+
+  it("maps a signaled death to cancelled, never passed", () => {
+    const id = startWrapped();
+    engine.foldWrappedExit(
+      BUNDLE,
+      { exitCode: null, signal: "SIGTERM", errors: 0, warnings: 3 },
+      1_060_000,
+    );
+    const run = store.getRun(id)!;
+    expect(run.status).toBe("cancelled");
+    expect(run.warningCount).toBe(3);
+  });
+
+  it("maps a nonzero exit to failed and keeps stream counts", () => {
+    const id = startWrapped();
+    engine.foldWrappedExit(
+      BUNDLE,
+      { exitCode: 65, signal: null, errors: 2, warnings: 1 },
+      1_060_000,
+    );
+    const run = store.getRun(id)!;
+    expect(run.status).toBe("failed");
+    expect(run.errorCount).toBe(2);
+  });
+
+  it("never downgrades a verified verdict", () => {
+    const id = startWrapped();
+    const run = store.getRun(id)!;
+    run.status = "passed";
+    run.statusRank = RANK.verified;
+    store.updateRun(run);
+    engine.foldWrappedExit(
+      BUNDLE,
+      { exitCode: null, signal: "SIGTERM", errors: 0, warnings: 0 },
+      1_060_000,
+    );
+    expect(store.getRun(id)!.status).toBe("passed");
+  });
+});

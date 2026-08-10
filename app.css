@@ -1,10 +1,55 @@
 /*
  * Plugin stylesheet.
  *
- * Deliberately holds no colors: every color comes from the host theme's CSS
- * variables via Tailwind utilities, so custom palettes keep working. The only
- * thing defined here is an animation Tailwind has no utility for.
+ * Panel surfaces hold no colors — everything comes from the host theme's CSS
+ * variables via Tailwind utilities, so custom palettes keep working.
+ *
+ * The chat card is the one exception, and a controlled one: build verdicts
+ * carry Xcode's own status vocabulary (green build, red failure, yellow
+ * warning, blue activity), so those four hues are declared here — but always
+ * blended with a live theme token via color-mix, never used raw. Mixing with
+ * `--foreground` makes each hue darken on light themes and lighten on dark
+ * ones (contrast tracks the theme for free), and the running state leans on
+ * `--primary` so live activity wears the user's accent.
  */
+
+.bbx-status-pass {
+  --bbx: color-mix(in oklab, #30d158 62%, var(--foreground) 38%);
+}
+.bbx-status-fail {
+  --bbx: color-mix(in oklab, #ff453a 72%, var(--destructive) 28%);
+}
+.bbx-status-warn {
+  --bbx: color-mix(in oklab, #ffd60a 55%, var(--foreground) 45%);
+}
+.bbx-status-run {
+  --bbx: color-mix(in oklab, #0a84ff 55%, var(--primary) 45%);
+}
+.bbx-status-muted {
+  --bbx: var(--muted-foreground);
+}
+
+/* Consumers of the resolved status color. */
+.bbx-text {
+  color: var(--bbx);
+}
+.bbx-chip {
+  color: var(--bbx);
+  background: color-mix(in srgb, var(--bbx) 11%, transparent);
+  border-color: color-mix(in srgb, var(--bbx) 28%, transparent);
+}
+.bbx-edge {
+  border-left: 2px solid color-mix(in srgb, var(--bbx) 55%, transparent);
+}
+span.bbx-dot > span {
+  background-color: var(--bbx);
+}
+.bbx-sweep .bb-xcode-indeterminate-bar {
+  background-color: var(--bbx);
+}
+.bbx-sweep-track {
+  background: color-mix(in srgb, var(--bbx) 14%, transparent);
+}
 
 @keyframes bb-xcode-indeterminate {
   0% {

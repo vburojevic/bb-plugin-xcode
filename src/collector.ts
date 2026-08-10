@@ -6,7 +6,7 @@
  * state; the collector owns none beyond caches.
  */
 
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Engine } from "./engine";
@@ -61,6 +61,8 @@ export class Collector {
   private lastScanAt: number | null = null;
   /** Parse attempts per unparseable bundle; ≥5 marks it permanently seen. */
   private readonly bundleAttempts = new Map<string, number>();
+  /** Bundles whose poisoned seen-marker was already cleared this load. */
+  private readonly reparsedBundles = new Set<string>();
   /** Last upsertRoot per root — throttles per-tick WAL churn. */
   private readonly rootUpsertAt = new Map<string, number>();
 
@@ -319,8 +321,12 @@ export class Collector {
     if (!tool) return false;
 
     const candidates = new Set<string>(await listShimBundles(this.deps.dataDir));
-    for (const run of this.deps.store.listRuns({ limit: 50 })) {
-      if (run.bundlePath && !run.detailed) candidates.add(run.bundlePath);
+    const runs = this.deps.store.listRuns({ limit: 100 });
+    const claimers = new Map<string, (typeof runs)[number]>();
+    for (const run of runs) {
+      if (!run.bundlePath) continue;
+      claimers.set(run.bundlePath, run);
+      if (!run.detailed) candidates.add(run.bundlePath);
     }
     for (const { path: root } of this.deps.store.listRoots()) {
       for (const bundle of await findTestResultBundles(root)) {
@@ -330,8 +336,37 @@ export class Collector {
 
     let changed = false;
     for (const bundle of candidates) {
+      // A bundle whose producing process is still alive cannot be complete;
+      // parsing it wastes a 60s-class xcresulttool spawn AND — the measured
+      // failure — burns through the corrupt-bundle retry budget while the
+      // build is still writing, blacklisting the real bundle before it lands.
+      const claimer = claimers.get(bundle);
+      if (claimer && claimer.status === "running") continue;
+
       // Cheap idempotence pre-check; the engine re-checks per matched run.
-      if (this.deps.store.hasSeen(`bundle-scanned:${bundle}`)) continue;
+      if (this.deps.store.hasSeen(`bundle-scanned:${bundle}`)) {
+        // Poisoned marker: the claimer never got a verified verdict, yet the
+        // bundle is marked scanned (pre-fix data, or a race). One retry per
+        // load — the attempts bound below re-fences genuinely corrupt ones.
+        const poisoned =
+          claimer !== undefined &&
+          !claimer.detailed &&
+          claimer.statusRank < 2 &&
+          !this.reparsedBundles.has(bundle);
+        if (!poisoned) continue;
+        this.reparsedBundles.add(bundle);
+        this.deps.store.clearSeen(`bundle-scanned:${bundle}`);
+      }
+
+      // Root Info.plist only exists once xcodebuild finalizes the bundle
+      // (verified on disk: an in-progress or killed bundle has only Data/).
+      // Missing marker: not an attempt, just not ready — unless the run is
+      // already over, in which case it will never be ready and the bounded
+      // attempts path below applies.
+      const finalized = await stat(join(bundle, "Info.plist"))
+        .then((info) => info.isFile())
+        .catch(() => false);
+      if (!finalized && claimer && claimer.status === "finishing") continue;
 
       const build = parseBuildResults(
         await xcresultJson(tool, ["get", "build-results", "--path", bundle]),

@@ -81,6 +81,7 @@ export function dayLabel(at: number, now: number = Date.now()): string {
   });
 }
 
+/** Xcode's own vocabulary: builds succeed, they don't "pass". */
 export function statusLabel(status: RunStatus): string {
   switch (status) {
     case "running":
@@ -88,28 +89,42 @@ export function statusLabel(status: RunStatus): string {
     case "finishing":
       return "Finishing";
     case "passed":
-      return "Passed";
+      return "Succeeded";
     case "warnings":
-      return "Warnings";
+      return "Succeeded";
     case "failed":
       return "Failed";
     case "cancelled":
       return "Cancelled";
     case "ended":
-      return "Ended";
+      return "Finished";
   }
+}
+
+/**
+ * One-line explanation for states whose label alone reads as ambiguous.
+ * Only the verdict-less "ended" has one: it is the tracker being honest
+ * about not knowing, and the reader deserves to know why and the fix.
+ */
+export function statusHint(status: RunStatus): string | null {
+  return status === "ended"
+    ? "Outcome unknown — no result bundle was recorded. `bb xcode run` or `bb xcode shim install` captures real pass/fail."
+    : null;
 }
 
 export function statusIcon(status: RunStatus): IconName {
   switch (status) {
     case "failed":
       return "CircleX";
+    // A build with warnings SUCCEEDED — the check mark says so; the yellow
+    // warning-count chip carries the caveat. Xcode draws it the same way.
     case "warnings":
-      return "AlertTriangle";
     case "passed":
       return "CircleCheck";
     case "cancelled":
-      return "Circle";
+      return "Square";
+    case "ended":
+      return "CircleQuestion";
     default:
       return "CircleDashed";
   }
@@ -121,7 +136,6 @@ export function statusTone(status: RunStatus): string {
     case "failed":
       return "text-destructive";
     case "warnings":
-      return "text-foreground";
     case "passed":
       return "text-muted-foreground";
     default:

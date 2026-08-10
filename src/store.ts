@@ -582,6 +582,10 @@ export class Store {
     return true;
   }
 
+  clearSeen(key: string): void {
+    this.db.prepare(`DELETE FROM seen_artifact WHERE key = ?`).run(key);
+  }
+
   hasSeen(key: string): boolean {
     return Boolean(
       this.db.prepare(`SELECT 1 FROM seen_artifact WHERE key = ?`).get(key),
