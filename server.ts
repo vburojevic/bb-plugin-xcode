@@ -29,6 +29,10 @@ import { safely, detach } from "./src/safe";
 import { MIGRATIONS, Store, type Db } from "./src/store";
 import { destinationLabel } from "./src/destination";
 import { ThreadScopes, runMatchesScope, type ThreadScope } from "./src/scopes";
+import {
+  backgroundCommandOutcomes,
+  type ThreadEventLike,
+} from "./src/thread-outcome";
 
 export default async function plugin(bb: BbPluginApi): Promise<void> {
   const settings = bb.settings.define({
@@ -135,6 +139,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     (await bb.storage.kv.get<string[]>("injected-card-runs")) ?? [],
   );
   const cardInFlight = new Set<string>();
+  const processedThreadTasks = new Set(
+    (await bb.storage.kv.get<string[]>("processed-thread-tasks")) ?? [],
+  );
 
   const persistInjectedCardRuns = async (): Promise<void> => {
     const retained = [...injectedCardRuns].slice(-500);
@@ -199,6 +206,107 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   );
   collectorRef = collector;
   engine.hydrate(Date.now());
+
+  // ------------------------------------------------ thread command verdicts
+  //
+  // Provider background commands have a launcher completion and a later task
+  // completion. The launcher commonly exits 0 merely because it successfully
+  // backgrounded the command; only the later event contains the real exit.
+  // Fetch complete thread history so a plugin reload between those two events
+  // cannot sever the parentToolCallId link.
+
+  const threadOutcomeInFlight = new Set<string>();
+
+  const persistProcessedThreadTasks = async (): Promise<void> => {
+    const retained = [...processedThreadTasks].slice(-2000);
+    if (retained.length !== processedThreadTasks.size) {
+      processedThreadTasks.clear();
+      for (const id of retained) processedThreadTasks.add(id);
+    }
+    await bb.storage.kv.set("processed-thread-tasks", retained);
+  };
+
+  const reconcileThreadOutcomes = async (threadId: string): Promise<void> => {
+    if (disposed || threadOutcomeInFlight.has(threadId)) return;
+    threadOutcomeInFlight.add(threadId);
+    try {
+      const rows: ThreadEventLike[] = [];
+      let afterSeq: string | undefined;
+      // Histories are chronological and the API has no reverse cursor. Twenty
+      // thousand rows is a generous bound for one coding thread while keeping
+      // a malformed/unbounded history from becoming plugin work forever.
+      for (let page = 0; page < 20; page++) {
+        const batch = await bb.sdk.threads.events.list({
+          threadId,
+          ...(afterSeq ? { afterSeq } : {}),
+          limit: "1000",
+        });
+        const typed = batch as unknown as ThreadEventLike[];
+        rows.push(...typed);
+        if (typed.length < 1000) break;
+        afterSeq = String(typed[typed.length - 1]!.seq);
+      }
+
+      let changed = false;
+      let processed = false;
+      for (const outcome of backgroundCommandOutcomes(rows)) {
+        if (processedThreadTasks.has(outcome.taskId)) continue;
+        if (
+          engine.foldThreadCommandExit(
+            { ...outcome, threadId },
+            Date.now(),
+          )
+        ) {
+          processedThreadTasks.add(outcome.taskId);
+          changed = true;
+          processed = true;
+          log.debug(`thread task verdict consumed: ${outcome.taskId}`);
+        }
+      }
+      if (processed) await persistProcessedThreadTasks();
+      if (changed) publish();
+    } catch (error: unknown) {
+      log.debug(`thread task reconciliation failed (${threadId}): ${String(error)}`);
+    } finally {
+      threadOutcomeInFlight.delete(threadId);
+    }
+  };
+
+  const unsubscribeThreadChanges = bb.sdk.subscribe({
+    event: "thread:changed",
+    callback(event) {
+      if (
+        disposed ||
+        !event.id ||
+        !(
+          event.metadata?.eventTypes?.includes(
+            "item/backgroundTask/completed",
+          ) || event.metadata?.backgroundActivityChanged
+        )
+      ) {
+        return;
+      }
+      detach(() => reconcileThreadOutcomes(event.id!));
+    },
+  });
+
+  // Backfill recent verdict-less runs, including cards already rendered in an
+  // existing thread before this event consumer was installed.
+  const recentOutcomeThreads = new Set(
+    store
+      .listRuns({ limit: 500, includeNoise: true })
+      .filter(
+        (run) =>
+          run.threadId &&
+          !["passed", "warnings", "failed", "cancelled"].includes(run.status) &&
+          run.startedAt >= Date.now() - 24 * 3_600_000,
+      )
+      .map((run) => run.threadId!),
+  );
+  for (const threadId of recentOutcomeThreads) {
+    detach(() => reconcileThreadOutcomes(threadId));
+  }
+
   // Runs survive plugin reloads. Backfill currently open, attributed runs so
   // existing threads receive their card without waiting for another process.
   for (const run of store.listUnresolved()) {
@@ -1048,6 +1156,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     // Order matters: flip the flag before detaching, so anything the tail
     // loop has already queued finds `disposed` true when it lands.
     log.debug("xcode tracker disposed");
+    unsubscribeThreadChanges();
     disposed = true;
     detachRuns.abort();
   });

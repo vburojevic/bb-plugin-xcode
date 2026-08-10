@@ -22,6 +22,7 @@ import {
 import type { Store } from "./store";
 import type { LiveActivity } from "./types";
 import type { BuildResults, TestResults } from "./types";
+import type { BackgroundCommandOutcome } from "./thread-outcome";
 
 /**
  * Consecutive probe misses before a running process is considered gone.
@@ -250,6 +251,66 @@ export class Engine {
     }
     this.store.updateRun(target);
     this.hooks.log(`verdict from wrapped exit: ${verdict} (${target.id})`);
+    return true;
+  }
+
+  /**
+   * Fold BB's terminal background-command exit into the one Xcode child that
+   * ran inside that command. This recovers a real verdict for agent-launched
+   * XcodeBuildMCP and shell-script builds even when they did not create an
+   * `.xcresult` bundle themselves.
+   *
+   * Ambiguity is deliberate: a script that spawned multiple Xcode children
+   * gets no guessed verdict. A result bundle or Xcode log can still resolve
+   * each child independently.
+   */
+  foldThreadCommandExit(
+    outcome: BackgroundCommandOutcome & { threadId: string },
+    now: number,
+  ): boolean {
+    const haystack = `${outcome.cwd}\n${outcome.command}`;
+    const directlyNamesXcode = /\bxcodebuild(?:mcp)?\b/i.test(haystack);
+    const candidates = this.store
+      .listRuns({ limit: 500, includeNoise: true })
+      .filter((run) => run.threadId === outcome.threadId)
+      .filter((run) => !VERDICT_STATUSES.has(run.status))
+      .filter(
+        (run) =>
+          run.startedAt >= outcome.startedAt - MATCH_SLACK_MS &&
+          run.startedAt <= outcome.endedAt + MATCH_SLACK_MS &&
+          (run.endedAt === null || run.endedAt <= outcome.endedAt + MATCH_SLACK_MS),
+      )
+      .filter((run) => {
+        if (directlyNamesXcode) return true;
+        return [run.cwd, run.container, run.root]
+          .filter((path): path is string => Boolean(path))
+          .some((path) => haystack.includes(path));
+      });
+    if (candidates.length !== 1) return false;
+
+    const target = candidates[0]!;
+    const verdict: RunStatus = outcome.interrupted
+      ? "cancelled"
+      : outcome.exitCode === 0
+        ? "passed"
+        : "failed";
+    if (
+      !statusTransitionAllowed(
+        { status: target.status, rank: target.statusRank },
+        { status: verdict, rank: RANK.logged },
+      )
+    ) {
+      return false;
+    }
+
+    target.status = verdict;
+    target.statusRank = RANK.logged;
+    target.endedAt ??= Math.min(outcome.endedAt, now);
+    for (const [pid, live] of this.live) {
+      if (live.runId === target.id) this.live.delete(pid);
+    }
+    this.store.updateRun(target);
+    this.hooks.log(`verdict from thread command exit: ${verdict} (${target.id})`);
     return true;
   }
 

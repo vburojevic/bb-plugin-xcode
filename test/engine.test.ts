@@ -468,6 +468,80 @@ describe("foldWrappedExit", () => {
   });
 });
 
+describe("foldThreadCommandExit", () => {
+  function startThreadRun(): string {
+    engine = new Engine(store, {
+      ...hooks,
+      threadFor: () => "thr_build",
+    });
+    engine.foldSnapshot([activity()], 1_000_000);
+    return store.listRuns({ limit: 1 })[0]!.id;
+  }
+
+  it("promotes the one Xcode child inside a successful background command", () => {
+    const id = startThreadRun();
+    retire(1_002_000);
+
+    expect(
+      engine.foldThreadCommandExit(
+        {
+          threadId: "thr_build",
+          command: "cd /tmp/proj && ./scripts/build_app.sh build",
+          cwd: "",
+          startedAt: 990_000,
+          endedAt: 1_060_000,
+          exitCode: 0,
+          interrupted: false,
+        },
+        1_060_000,
+      ),
+    ).toBe(true);
+    expect(store.getRun(id)!.status).toBe("passed");
+  });
+
+  it("maps a nonzero parent exit to failed", () => {
+    const id = startThreadRun();
+    retire(1_002_000);
+    engine.foldThreadCommandExit(
+      {
+        threadId: "thr_build",
+        command: "xcodebuildmcp simulator build --scheme Demo",
+        cwd: "/tmp/proj",
+        startedAt: 990_000,
+        endedAt: 1_060_000,
+        exitCode: 65,
+        interrupted: false,
+      },
+      1_060_000,
+    );
+    expect(store.getRun(id)!.status).toBe("failed");
+  });
+
+  it("does not guess when two Xcode children fit the same command", () => {
+    startThreadRun();
+    engine.foldSnapshot(
+      [activity({ pid: 101, startedAt: 1_010_000 })],
+      1_010_000,
+    );
+
+    expect(
+      engine.foldThreadCommandExit(
+        {
+          threadId: "thr_build",
+          command: "xcodebuildmcp simulator build --scheme Demo",
+          cwd: "/tmp/proj",
+          startedAt: 990_000,
+          endedAt: 1_060_000,
+          exitCode: 0,
+          interrupted: false,
+        },
+        1_060_000,
+      ),
+    ).toBe(false);
+    expect(store.listRuns({}).every((run) => run.status === "running")).toBe(true);
+  });
+});
+
 describe("premature verdicts (regression)", () => {
   // Observed live: `xcodebuild clean build` classified as a clean, whose own
   // log entry then marked the whole invocation passed 5.7s in — while the
