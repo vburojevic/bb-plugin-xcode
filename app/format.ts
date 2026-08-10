@@ -122,7 +122,7 @@ export function statusIcon(status: RunStatus): IconName {
     case "passed":
       return "CircleCheck";
     case "cancelled":
-      return "Square";
+      return "CircleMinus";
     case "ended":
       return "CircleQuestion";
     default:

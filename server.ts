@@ -79,8 +79,28 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   let current = await readSettings();
 
-  const publish = (): void => {
-    bb.realtime.publish(XCODE_CHANNEL, { at: Date.now() });
+  let disposed = false;
+  /** Aborted on dispose: stops tailing live builds without killing them. */
+  const detachRuns = new AbortController();
+
+  /**
+   * Every publish funnels through here, because most of them fire from work
+   * that outlives this plugin instance: the tail loop of a wrapped build, the
+   * continuation that folds its exit, the collector sweep. Publishing through
+   * a disposed handle throws PluginContextStaleError, and from a detached
+   * continuation Node raises that as an uncaughtException — which takes the
+   * whole bb server down, not just this plugin. The collector loop already
+   * re-checks its own abort signal for this reason; the wrapped-build paths
+   * had no equivalent and crashed the server on 2026-08-10.
+   */
+  const publish = (payload?: Record<string, unknown>): void => {
+    if (disposed) return;
+    try {
+      bb.realtime.publish(XCODE_CHANNEL, payload ?? { at: Date.now() });
+    } catch {
+      // Disposed between the check and the call. The fresh instance owns the
+      // channel now, so there is nothing useful left to report.
+    }
   };
 
   const listProjects = async (): Promise<CollectorProject[]> => {
@@ -688,6 +708,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       void runWrapped({
         argv,
         cwd: ctx.cwd,
+        // Not `signal`: that SIGTERMs the child. A reload must leave the
+        // user's build running and only stop us watching it.
+        detachSignal: detachRuns.signal,
         onStart: (info) => {
           bundlePath = info.bundlePath;
           resolve();
@@ -699,7 +722,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           const at = Date.now();
           if (at - lastLivePublishAt < 500) return;
           lastLivePublishAt = at;
-          bb.realtime.publish(XCODE_CHANNEL, {
+          publish({
             at,
             live: {
               section: progress.currentSection,
@@ -712,6 +735,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         },
       })
         .then(async (result) => {
+          // Lands whenever the build ends, which may be long after a reload.
+          // fullScan and foldWrappedExit both reach for storage on this
+          // instance's handle, so bail before touching any of it.
+          if (disposed) return;
           engine.foldWrappedExit(
             result.bundlePath,
             {
@@ -730,6 +757,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         })
         .catch((error: unknown) => {
           resolve();
+          if (disposed) return;
           bb.log.warn(`wrapped build failed to run: ${String(error)}`);
         });
     });
@@ -848,6 +876,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       "Report Xcode build/test activity: what is running now and how recent runs finished, scoped to this thread's checkout when possible. Use instead of grepping build logs.",
     instructions:
       "Prefer xcode_status over parsing xcodebuild output when the user asks whether a build or test run passed. " +
+      "Start builds/tests with `bb xcode run -- xcodebuild …` instead of raw xcodebuild: it guarantees a result bundle, so the run always gets a real pass/fail verdict, returns immediately with a run id, and `bb xcode stop <id>` cancels it. " +
       'After starting or checking an Xcode build or test run, emit `::xcode{}` (or `::xcode{run="<id>"}` for one specific run) on its own line, never inside a code fence — bb renders it as a live status card that updates as the build progresses.',
     experimental_statusLabels: {
       pending: "Checking Xcode activity",
@@ -928,6 +957,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   });
 
   bb.onDispose(() => {
+    // Order matters: flip the flag before detaching, so anything the tail
+    // loop has already queued finds `disposed` true when it lands.
+    disposed = true;
+    detachRuns.abort();
     bb.log.debug("xcode tracker disposed");
   });
 }

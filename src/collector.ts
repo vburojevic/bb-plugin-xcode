@@ -343,6 +343,28 @@ export class Collector {
       const claimer = claimers.get(bundle);
       if (claimer && claimer.status === "running") continue;
 
+      // Root Info.plist only exists once xcodebuild finalizes the bundle
+      // (verified on disk: an in-progress or killed bundle has only Data/).
+      const finalized = await stat(join(bundle, "Info.plist"))
+        .then((info) => info.isFile())
+        .catch(() => false);
+
+      // Process gone, bundle never finalized: xcodebuild finalizes on every
+      // normal exit including failures, so after a grace period this build
+      // was killed or crashed — resolve it to "cancelled" instead of letting
+      // it expire into the verdict-less "ended".
+      if (!finalized && claimer) {
+        if (claimer.status === "finishing" || claimer.status === "ended") {
+          const since = claimer.endedAt ?? claimer.startedAt;
+          if (now - since > 20_000) {
+            if (this.deps.engine.foldAbandonedBundle(claimer.id, now)) {
+              changed = true;
+            }
+          }
+        }
+        continue; // never parse an unfinalized bundle
+      }
+
       // Cheap idempotence pre-check; the engine re-checks per matched run.
       if (this.deps.store.hasSeen(`bundle-scanned:${bundle}`)) {
         // Poisoned marker: the claimer never got a verified verdict, yet the
@@ -358,15 +380,6 @@ export class Collector {
         this.deps.store.clearSeen(`bundle-scanned:${bundle}`);
       }
 
-      // Root Info.plist only exists once xcodebuild finalizes the bundle
-      // (verified on disk: an in-progress or killed bundle has only Data/).
-      // Missing marker: not an attempt, just not ready — unless the run is
-      // already over, in which case it will never be ready and the bounded
-      // attempts path below applies.
-      const finalized = await stat(join(bundle, "Info.plist"))
-        .then((info) => info.isFile())
-        .catch(() => false);
-      if (!finalized && claimer && claimer.status === "finishing") continue;
 
       const build = parseBuildResults(
         await xcresultJson(tool, ["get", "build-results", "--path", bundle]),

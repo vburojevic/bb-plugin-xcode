@@ -250,6 +250,32 @@ export class Engine {
     return true;
   }
 
+  /**
+   * A run whose process is gone but whose declared result bundle never got a
+   * root Info.plist was killed or crashed: xcodebuild finalizes the bundle on
+   * every normal exit, including failures (verified on disk 2026-08-10 — a
+   * SIGTERM'd build leaves only Data/). "Cancelled" is the honest verdict,
+   * and it replaces the verdict-less "ended" that read as tracker confusion.
+   */
+  foldAbandonedBundle(runId: string, now: number): boolean {
+    const run = this.store.getRun(runId);
+    if (!run) return false;
+    if (
+      !statusTransitionAllowed(
+        { status: run.status, rank: run.statusRank },
+        { status: "cancelled", rank: RANK.observed },
+      )
+    ) {
+      return false;
+    }
+    run.status = "cancelled";
+    run.statusRank = RANK.observed;
+    run.endedAt ??= now;
+    this.store.updateRun(run);
+    this.hooks.log(`verdict from abandoned bundle: cancelled (${run.id})`);
+    return true;
+  }
+
   // ---------------------------------------------------------- manifest fold
 
   /**

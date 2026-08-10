@@ -30,7 +30,15 @@ export interface RunnerOptions {
   onStart?: (info: { bundlePath: string; streamPath: string; pid: number | null }) => void;
   /** Poll interval for the stream file tail. */
   pollMs?: number;
+  /** Aborting this kills the child (SIGTERM). */
   signal?: AbortSignal;
+  /**
+   * Stops tailing the stream file and firing `onEvent`, leaving the child
+   * alone. This is what a plugin reload wants: a wrapped build is detached on
+   * purpose and must survive the reload, but the tail loop belongs to the old
+   * plugin instance and has to stop touching its handles.
+   */
+  detachSignal?: AbortSignal;
 }
 
 export interface RunnerResult {
@@ -98,6 +106,10 @@ export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> 
   // Tail the stream file alongside the process. Reading by offset avoids
   // re-parsing the whole file on every poll.
   let stopTailing = false;
+  const onDetach = (): void => {
+    stopTailing = true;
+  };
+  options.detachSignal?.addEventListener("abort", onDetach, { once: true });
   const tail = (async () => {
     let offset = 0;
     let carry = "";
@@ -143,6 +155,7 @@ export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> 
   stopTailing = true;
   await tail.catch(() => undefined);
   options.signal?.removeEventListener("abort", onAbort);
+  options.detachSignal?.removeEventListener("abort", onDetach);
 
   return {
     exitCode: exit.code,

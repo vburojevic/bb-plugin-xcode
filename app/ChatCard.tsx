@@ -24,6 +24,7 @@ import {
 
 import { Badge } from "@/components/ui/badge";
 import { Icon } from "@/components/ui/icon";
+import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 
@@ -396,17 +397,19 @@ export function XcodeChatCard({
         </div>
       ) : null}
 
-      {/* Live sweep */}
+      {/* Live progress: comet sweep while building, breath while finishing. */}
       {isLive ? (
-        <div className="bbx-sweep px-3.5 pb-3">
-          <div
-            role="progressbar"
+        <div className="px-3.5 pb-3">
+          <Progress
+            indeterminate
             aria-label={`${statusLabel(run.status)} ${runTitle(run)}`}
-            aria-busy="true"
-            className="bbx-sweep-track relative h-1 w-full overflow-hidden rounded-full"
-          >
-            <div className="bb-xcode-indeterminate-bar h-full w-full rounded-full" />
-          </div>
+            className="bbx-progress-track h-1"
+            indicatorClassName={
+              run.status === "running"
+                ? "bbx-progress-comet"
+                : "bbx-progress-breath w-full"
+            }
+          />
         </div>
       ) : null}
 
@@ -509,7 +512,11 @@ export function XcodeChatCard({
   );
 }
 
-/** Card frame: theme card surface with a status-tinted leading edge. */
+/**
+ * Card frame: theme card surface whose 1px border carries a quiet status
+ * tint. The border's eased color transition IS the card's motion moment —
+ * a verdict landing reads as the frame settling from activity to outcome.
+ */
 function Shell({
   className,
   children,
@@ -520,7 +527,7 @@ function Shell({
   return (
     <div
       className={cn(
-        "bbx-edge my-1.5 max-w-xl overflow-hidden rounded-lg border border-border bg-card shadow-xs",
+        "bbx-frame my-1.5 max-w-xl overflow-hidden rounded-lg border bg-card shadow-xs",
         className,
       )}
     >
@@ -574,7 +581,10 @@ function StatusMark({
       )}
       aria-hidden
     >
-      <Icon name={statusIcon(status)} className={small ? "size-3.5" : "size-4"} />
+      <Icon
+        name={statusIcon(status)}
+        className={cn(!small && "bbx-verdict-in", small ? "size-3.5" : "size-4")}
+      />
     </span>
   );
 }
