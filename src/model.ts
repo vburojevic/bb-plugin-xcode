@@ -105,6 +105,8 @@ export interface Run {
   branch: string | null;
   /** Human name of the checkout/worktree directory the build ran from. */
   worktree: string | null;
+  /** bb thread whose environment this build ran in, when attributable. */
+  threadId: string | null;
 }
 
 export interface Finding {

@@ -144,6 +144,8 @@ export const MIGRATIONS: readonly string[] = [
    )`,
   `ALTER TABLE run ADD COLUMN branch TEXT`,
   `ALTER TABLE run ADD COLUMN worktree TEXT`,
+  `ALTER TABLE run ADD COLUMN thread_id TEXT`,
+  `CREATE INDEX IF NOT EXISTS run_thread_idx ON run (thread_id) WHERE thread_id IS NOT NULL`,
 ];
 
 /** Minimal structural type for the better-sqlite3 handle the host provides. */
@@ -182,6 +184,7 @@ interface RunRowRaw {
   detailed: number;
   branch: string | null;
   worktree: string | null;
+  thread_id: string | null;
 }
 
 function toRun(raw: RunRowRaw): Run {
@@ -211,6 +214,7 @@ function toRun(raw: RunRowRaw): Run {
     detailed: raw.detailed === 1,
     branch: raw.branch,
     worktree: raw.worktree,
+    threadId: raw.thread_id,
   };
 }
 
@@ -225,8 +229,9 @@ export class Store {
            id, status, status_rank, kind, scheme, container, configuration,
            destination, project_id, root, cwd, pid, cmdline, started_at,
            ended_at, error_count, warning_count, analyzer_count, test_total,
-           test_failed, test_skipped, bundle_path, detailed, branch, worktree
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           test_failed, test_skipped, bundle_path, detailed, branch, worktree,
+           thread_id
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         run.id,
@@ -254,6 +259,7 @@ export class Store {
         run.detailed ? 1 : 0,
         run.branch,
         run.worktree,
+        run.threadId,
       );
   }
 
@@ -273,7 +279,8 @@ export class Store {
            cwd = ?, cmdline = ?, started_at = ?, ended_at = ?, error_count = ?,
            warning_count = ?, analyzer_count = ?, test_total = ?,
            test_failed = ?, test_skipped = ?, bundle_path = ?, detailed = ?,
-           branch = COALESCE(?, branch), worktree = COALESCE(?, worktree)
+           branch = COALESCE(?, branch), worktree = COALESCE(?, worktree),
+           thread_id = COALESCE(?, thread_id)
          WHERE id = ?`,
       )
       .run(
@@ -300,8 +307,28 @@ export class Store {
         run.detailed ? 1 : 0,
         run.branch,
         run.worktree,
+        run.threadId,
         run.id,
       );
+  }
+
+  /**
+   * Backfill thread attribution for runs already recorded under a scope's
+   * path — a build the probe saw before the thread's scope was registered
+   * (the thread.active resolution races the first probe tick).
+   */
+  attributeRunsToThread(threadId: string, path: string, since: number): number {
+    const base = path.endsWith("/") ? path.slice(0, -1) : path;
+    if (!base) return 0;
+    const prefix = `${base}/%`;
+    const result = this.db
+      .prepare(
+        `UPDATE run SET thread_id = ?
+          WHERE thread_id IS NULL AND started_at >= ?
+            AND (cwd = ? OR cwd LIKE ? OR container = ? OR container LIKE ?)`,
+      )
+      .run(threadId, since, base, prefix, base, prefix) as { changes?: number };
+    return result?.changes ?? 0;
   }
 
   listRuns(query: {

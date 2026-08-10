@@ -27,6 +27,7 @@ import {
 } from "./src/shim";
 import { MIGRATIONS, Store, type Db } from "./src/store";
 import { destinationLabel } from "./src/destination";
+import { ThreadScopes, runMatchesScope, type ThreadScope } from "./src/scopes";
 
 export default async function plugin(bb: BbPluginApi): Promise<void> {
   const settings = bb.settings.define({
@@ -97,12 +98,15 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     return out;
   };
 
+  const scopes = new ThreadScopes();
+
   // Engine and collector reference each other (engine asks the collector for
   // project attribution); a late-bound holder breaks the cycle for TS.
   let collectorRef: Collector | null = null;
   const engine: Engine = new Engine(store, {
     projectFor: (signals): string | null =>
       collectorRef ? collectorRef.projectFor(signals) : null,
+    threadFor: (signals): string | null => scopes.threadFor(signals),
     log: (message) => bb.log.debug(message),
   });
   const collector = new Collector(
@@ -115,6 +119,82 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   settings.onChange(async () => {
     current = await readSettings();
     collector.updateSettings(current);
+  });
+
+  // -------------------------------------------------------- thread scopes
+  //
+  // There is no event for "an agent ran xcodebuild"; what bb DOES tell us is
+  // when a thread starts a turn, and its environment names the exact checkout
+  // any build it launches will run from. Registering that path as a scope
+  // lets the probe attribute a new build to its thread on first sighting, and
+  // lets the chat card / agent tools answer for "this thread's build" instead
+  // of the whole machine.
+
+  const scopeResolvedAt = new Map<string, number>();
+
+  const refreshThreadScope = async (
+    threadId: string,
+    active: boolean,
+  ): Promise<ThreadScope | null> => {
+    const now = Date.now();
+    const last = scopeResolvedAt.get(threadId) ?? 0;
+    // Within the throttle window, answer from the registry (null for a thread
+    // that resolved to no checkout — retrying an env-less side chat every
+    // event would be two SDK calls per turn for nothing).
+    if (now - last < 30_000) return scopes.get(threadId);
+    if (scopeResolvedAt.size > 1000) scopeResolvedAt.clear();
+    scopeResolvedAt.set(threadId, now);
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      const environmentId =
+        (thread as { environmentId?: string | null }).environmentId ?? null;
+      if (!environmentId) return null;
+      const env = await bb.sdk.environments.get({ environmentId });
+      if (!env.path) return null;
+      scopes.upsert(
+        {
+          threadId,
+          projectId: env.projectId ?? null,
+          environmentId,
+          path: env.path,
+          branch: env.branchName ?? null,
+          active,
+        },
+        Date.now(),
+      );
+      // A build the probe saw before this scope existed: claim it now.
+      const backfilled = store.attributeRunsToThread(
+        threadId,
+        env.path,
+        Date.now() - 6 * 3_600_000,
+      );
+      if (backfilled > 0) publish();
+      return scopes.get(threadId);
+    } catch (error: unknown) {
+      bb.log.debug(`thread scope resolve failed (${threadId}): ${String(error)}`);
+      return null;
+    }
+  };
+
+  bb.events.on("thread.active", ({ thread }) => {
+    const existing = scopes.get(thread.id);
+    if (existing) {
+      scopes.upsert({ ...existing, active: true }, Date.now());
+    }
+    void refreshThreadScope(thread.id, true);
+    scopes.prune(Date.now());
+  });
+  bb.events.on("thread.idle", ({ thread }) => {
+    scopes.deactivate(thread.id, Date.now());
+  });
+  bb.events.on("thread.failed", ({ thread }) => {
+    scopes.deactivate(thread.id, Date.now());
+  });
+  bb.events.on("thread.archived", ({ thread }) => {
+    scopes.remove(thread.id);
+  });
+  bb.events.on("thread.deleted", ({ thread }) => {
+    scopes.remove(thread.id);
   });
 
   // ------------------------------------------------------------------ DTOs
@@ -156,6 +236,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     detailed: run.detailed,
     branch: run.branch,
     worktree: run.worktree,
+    threadId: run.threadId,
     destinationLabel: destinationLabel(run.destination, collector.getSimulators()),
     workerCount:
       run.status === "running"
@@ -218,6 +299,76 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     trends(input) {
       const since = Date.now() - (input.days ?? 30) * 86_400_000;
       return store.trends(input.projectId ?? null, since);
+    },
+
+    async chatStatus({ threadId, runId }) {
+      refreshProjectNames();
+
+      let scope: ThreadScope | null = null;
+      if (threadId) {
+        scope = scopes.get(threadId) ?? (await refreshThreadScope(threadId, false));
+      }
+      const scopeDto = scope
+        ? {
+            threadId: scope.threadId,
+            path: scope.path,
+            branch: scope.branch,
+            worktree: shortName(scope.path),
+          }
+        : null;
+      const inScope = (run: Run): boolean =>
+        !scope || runMatchesScope(run, scope);
+
+      const unresolved = store.listUnresolved().filter(inScope);
+      const finished = store
+        .listRuns({ limit: 100 })
+        .filter((run) => run.status !== "running" && run.status !== "finishing")
+        .filter(inScope)
+        .slice(0, 5);
+
+      const pinned = runId ? store.getRun(runId) : null;
+      const run = pinned ?? unresolved[0] ?? finished[0] ?? null;
+
+      const problems =
+        run !== null &&
+        (run.status === "failed" ||
+          run.errorCount > 0 ||
+          (run.testFailed ?? 0) > 0);
+      return {
+        run: run ? toDto(run) : null,
+        active: unresolved
+          .filter((entry) => entry.id !== run?.id)
+          .map(toDto),
+        recent: finished.filter((entry) => entry.id !== run?.id).map(toDto),
+        scope: scopeDto,
+        findings: problems
+          ? store
+              .listFindings(run.id)
+              .filter((finding) => finding.severity === "error")
+              .slice(0, 10)
+              .map((finding) => ({
+                severity: finding.severity,
+                message: finding.message,
+                filePath: finding.filePath,
+                line: finding.line,
+                target: finding.target,
+              }))
+          : [],
+        failedTests: problems
+          ? store
+              .listTests(run.id)
+              .filter((test) => test.status === "failed")
+              .slice(0, 10)
+              .map((test) => ({
+                suite: test.suite,
+                name: test.name,
+                status: test.status,
+                durationMs: test.durationMs,
+                failureMessage: test.failureMessage,
+                target: test.target,
+              }))
+          : [],
+      };
     },
 
     async rescan() {
@@ -542,10 +693,16 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     await collector.fullScan();
     publish();
 
+    const tracked = store
+      .listRuns({ limit: 25 })
+      .find((run) => run.bundlePath === result.bundlePath);
     const summary =
       `${describeExit(result.exitCode)} — ${result.progress.sectionsOpened} sections, ` +
       `${result.progress.errors} error(s), ${result.progress.warnings} warning(s)\n` +
-      `result bundle: ${result.bundlePath}\n`;
+      `result bundle: ${result.bundlePath}\n` +
+      (tracked
+        ? `\nStatus card for chat (emit on its own line, not in a code fence): ::xcode{run="${tracked.id}"}\n`
+        : "");
     return {
       exitCode: result.exitCode,
       stdout: capOutput(summary),
@@ -609,32 +766,59 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   // ----------------------------------------------------------- agent tools
 
+  const directiveHint = (runId: string | null): string =>
+    "\n\nTo render a live status card in chat, emit this directive on its own line (never inside a code fence):\n" +
+    (runId ? `::xcode{run="${runId}"}` : "::xcode{}") +
+    (runId
+      ? "\nBare ::xcode{} instead shows this thread's current Xcode activity."
+      : "");
+
   bb.agents.registerTool({
     name: "xcode_status",
     description:
-      "Report Xcode build/test activity on this machine: what is running now and how recent runs finished. Use instead of grepping build logs.",
+      "Report Xcode build/test activity: what is running now and how recent runs finished, scoped to this thread's checkout when possible. Use instead of grepping build logs.",
     instructions:
-      "Prefer xcode_status over parsing xcodebuild output when the user asks whether a build or test run passed.",
+      "Prefer xcode_status over parsing xcodebuild output when the user asks whether a build or test run passed. " +
+      'After starting or checking an Xcode build or test run, emit `::xcode{}` (or `::xcode{run="<id>"}` for one specific run) on its own line, never inside a code fence — bb renders it as a live status card that updates as the build progresses.',
     experimental_statusLabels: {
       pending: "Checking Xcode activity",
       completed: "Checked Xcode activity",
     },
     parameters: z.object({
       limit: z.number().int().min(1).max(25).optional(),
+      machineWide: z
+        .boolean()
+        .optional()
+        .describe("Ignore this thread's checkout scope and report everything."),
     }),
-    execute({ limit }) {
+    async execute({ limit, machineWide }, { threadId }) {
       refreshProjectNames();
-      const open = store.listUnresolved();
-      const recent = store.listRuns({ limit: limit ?? 5 });
+      const scope = machineWide
+        ? null
+        : (scopes.get(threadId) ?? (await refreshThreadScope(threadId, false)));
+      const inScope = (run: Run): boolean =>
+        !scope || runMatchesScope(run, scope);
+
+      const open = store.listUnresolved().filter(inScope);
+      const recent = store.listRuns({ limit: limit ?? 5 }).filter(inScope);
+      const header = scope
+        ? `Scope: this thread's checkout ${scope.path}${scope.branch ? ` @${scope.branch}` : ""}.`
+        : "Scope: whole machine (thread has no resolvable checkout).";
       const parts: string[] = [
+        header,
         open.length
           ? `Active (${open.length}):\n${open.map(describeRun).join("\n")}`
           : "Nothing is building right now.",
       ];
       if (recent.length) {
-        parts.push(`\nRecent:\n${recent.map(describeRun).join("\n")}`);
+        parts.push(`Recent:\n${recent.map(describeRun).join("\n")}`);
+      } else if (scope) {
+        parts.push(
+          "No recorded runs for this checkout yet. Pass machineWide: true to see all Xcode activity.",
+        );
       }
-      return parts.join("\n");
+      const focus = open[0] ?? recent[0] ?? null;
+      return parts.join("\n\n") + directiveHint(focus ? focus.id : null);
     },
   });
 
@@ -648,14 +832,29 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     },
     parameters: z.object({
       projectId: z.string().optional(),
+      machineWide: z
+        .boolean()
+        .optional()
+        .describe("Ignore this thread's checkout scope and search all runs."),
     }),
-    execute({ projectId }) {
+    async execute({ projectId, machineWide }, { threadId }) {
       refreshProjectNames();
+      const scope = machineWide
+        ? null
+        : (scopes.get(threadId) ?? (await refreshThreadScope(threadId, false)));
       const failed = store
-        .listRuns({ projectId: projectId ?? null, onlyProblems: true, limit: 1 })[0];
-      if (!failed) return "No failed Xcode runs recorded.";
+        .listRuns({ projectId: projectId ?? null, onlyProblems: true, limit: 25 })
+        .filter((run) => !scope || runMatchesScope(run, scope))[0];
+      if (!failed) {
+        return scope
+          ? "No failed Xcode runs recorded for this thread's checkout. Pass machineWide: true to search all runs."
+          : "No failed Xcode runs recorded.";
+      }
       const detail = cliShow(failed.id);
-      return detail.stdout ?? detail.stderr ?? "No detail available.";
+      return (
+        (detail.stdout ?? detail.stderr ?? "No detail available.") +
+        directiveHint(failed.id)
+      );
     },
   });
 

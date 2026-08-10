@@ -33,7 +33,11 @@ function activity(overrides: Partial<LiveActivity> = {}): LiveActivity {
   };
 }
 
-const hooks = { projectFor: () => null, log: () => undefined };
+const hooks = {
+  projectFor: () => null,
+  threadFor: () => null,
+  log: () => undefined,
+};
 
 let store: Store;
 let engine: Engine;

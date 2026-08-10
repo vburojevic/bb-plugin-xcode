@@ -39,6 +39,12 @@ export interface EngineHooks {
     cwd?: string | null;
     container?: string | null;
   }): string | null;
+  /** Resolve which bb thread's environment contains a path, if any. */
+  threadFor(signals: {
+    root?: string | null;
+    cwd?: string | null;
+    container?: string | null;
+  }): string | null;
   log(message: string): void;
 }
 
@@ -128,6 +134,11 @@ export class Engine {
         detailed: false,
         branch: activity.branch ?? null,
         worktree: activity.worktree ?? null,
+        threadId: this.hooks.threadFor({
+          root,
+          cwd: activity.cwd,
+          container: activity.container,
+        }),
       };
       this.store.insertRun(run);
       this.live.set(activity.pid, { runId: run.id, misses: 0, lastSeenAt: now });
@@ -285,6 +296,7 @@ export class Engine {
       detailed: false,
       branch: null,
       worktree: null,
+      threadId: null,
     };
     this.store.insertRun(run);
     return true;

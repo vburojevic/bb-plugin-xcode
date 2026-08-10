@@ -61,6 +61,8 @@ const runSchema = z.object({
   detailed: z.boolean(),
   branch: z.string().nullable(),
   worktree: z.string().nullable(),
+  /** bb thread whose environment this build ran in, when attributable. */
+  threadId: z.string().nullable(),
   /** Friendly destination ("iPhone 16 · iOS 26.0"), raw spec preserved above. */
   destinationLabel: z.string().nullable(),
   /** Live compiler processes right now; null unless running. */
@@ -163,5 +165,41 @@ export const rpcContract = defineRpcContract({
   rescan: {
     input: z.null(),
     output: z.object({ ok: z.boolean(), rootCount: z.number() }),
+  },
+
+  /**
+   * Everything the in-chat `::xcode{…}` card needs in one call. With `runId`
+   * the card pins that run; otherwise it shows the thread's own activity
+   * (scope resolved server-side from `threadId`), falling back to
+   * machine-wide when the thread has no resolvable checkout.
+   */
+  chatStatus: {
+    input: z
+      .object({
+        threadId: z.string().nullable().optional(),
+        runId: z.string().nullable().optional(),
+      })
+      .strict(),
+    output: z.object({
+      /** The pinned run, or the most relevant run in scope. */
+      run: runSchema.nullable(),
+      /** Other currently active runs in the same scope. */
+      active: z.array(runSchema),
+      /** Recent finished runs in the same scope (newest first). */
+      recent: z.array(runSchema),
+      /** Resolved thread scope; null means the card is machine-wide. */
+      scope: z
+        .object({
+          threadId: z.string(),
+          path: z.string(),
+          branch: z.string().nullable(),
+          worktree: z.string().nullable(),
+        })
+        .nullable(),
+      /** Error findings for the pinned/relevant run when it has problems. */
+      findings: z.array(findingSchema),
+      /** Failed tests for the pinned/relevant run. */
+      failedTests: z.array(testSchema),
+    }),
   },
 });
