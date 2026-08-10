@@ -135,60 +135,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   const scopes = new ThreadScopes();
 
-  const injectedCardRuns = new Set(
-    (await bb.storage.kv.get<string[]>("injected-card-runs")) ?? [],
-  );
-  const cardInFlight = new Set<string>();
   const processedThreadTasks = new Set(
     (await bb.storage.kv.get<string[]>("processed-thread-tasks")) ?? [],
   );
-
-  const persistInjectedCardRuns = async (): Promise<void> => {
-    const retained = [...injectedCardRuns].slice(-500);
-    if (retained.length !== injectedCardRuns.size) {
-      injectedCardRuns.clear();
-      for (const id of retained) injectedCardRuns.add(id);
-    }
-    await bb.storage.kv.set("injected-card-runs", retained);
-  };
-
-  const injectRunCard = async (run: Run): Promise<void> => {
-    if (
-      disposed ||
-      !run.threadId ||
-      injectedCardRuns.has(run.id) ||
-      cardInFlight.has(run.id)
-    ) {
-      return;
-    }
-
-    cardInFlight.add(run.id);
-    try {
-      await bb.sdk.threads.send({
-        threadId: run.threadId,
-        mode: "auto",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            mentions: [],
-            text:
-              "An Xcode build or test is currently tracked for this thread. " +
-              "Continue the current work without restarting the build, and include the following directive on its own line outside any code fence in your next assistant message:\n" +
-              `::xcode{run="${run.id}"}`,
-          },
-        ],
-      });
-      if (disposed) return;
-      injectedCardRuns.add(run.id);
-      await persistInjectedCardRuns();
-      log.debug(`injected chat card directive: ${run.id} -> ${run.threadId}`);
-    } catch (error: unknown) {
-      log.debug(`chat card injection failed (${run.id}): ${String(error)}`);
-    } finally {
-      cardInFlight.delete(run.id);
-    }
-  };
 
   // Engine and collector reference each other (engine asks the collector for
   // project attribution); a late-bound holder breaks the cycle for TS.
@@ -197,7 +146,6 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     projectFor: (signals): string | null =>
       collectorRef ? collectorRef.projectFor(signals) : null,
     threadFor: (signals): string | null => scopes.threadFor(signals),
-    onRunStarted: (run) => detach(() => injectRunCard(run)),
     log: (message) => log.debug(message),
   });
   const collector = new Collector(
@@ -307,12 +255,6 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     detach(() => reconcileThreadOutcomes(threadId));
   }
 
-  // Runs survive plugin reloads. Backfill currently open, attributed runs so
-  // existing threads receive their card without waiting for another process.
-  for (const run of store.listUnresolved()) {
-    detach(() => injectRunCard(run));
-  }
-
   settings.onChange(async () => {
     current = await readSettings();
     collector.updateSettings(current);
@@ -365,14 +307,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         env.path,
         Date.now() - 6 * 3_600_000,
       );
-      if (backfilled > 0) {
-        publish();
-        for (const run of store
-          .listUnresolved()
-          .filter((candidate) => candidate.threadId === threadId)) {
-          detach(() => injectRunCard(run));
-        }
-      }
+      // The banner reads the thread's runs on every publish, so a late claim
+      // surfaces on its own — no prompt, no turn spent, nothing to retry.
+      if (backfilled > 0) publish();
       return scopes.get(threadId);
     } catch (error: unknown) {
       log.debug(`thread scope resolve failed (${threadId}): ${String(error)}`);
@@ -969,8 +906,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     const lines = [
       `Build started${tracked ? ` and tracked as ${tracked.id}` : ""}.`,
       `It keeps running if this command disconnects; stop it with: bb xcode stop ${tracked?.id ?? "<run-id>"}`,
-      `Watch it: bb xcode status, or emit this directive on its own line in chat (not in a code fence):`,
-      tracked ? `::xcode{run="${tracked.id}"}` : "::xcode{}",
+      `Watch it: bb xcode status, or the live row above the composer.`,
       "",
       `result bundle: ${bundlePath}`,
     ];
@@ -1054,20 +990,13 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   const agentInstructions =
     "When an Xcode build or test is needed, prefer `bb xcode run -- xcodebuild …` so bb can track it with a result bundle and a real pass/fail verdict. " +
     "Use xcode_status instead of parsing build logs when checking whether a run passed. " +
-    'After starting or checking any Xcode build or test, emit `::xcode{}` (or `::xcode{run="<id>"}` for one specific run) on its own line, never inside a code fence, so bb renders the live status card.';
+    "Live builds render themselves in the prompt stack above the composer, so never announce that a build started and never paste build status into chat — the user is already looking at it.";
 
   // Tool instructions only reach sessions where the provider is given that
   // native tool. Builds also arrive through repo scripts, xcodebuildmcp, and
   // provider-native shell tools, so make the card contract part of every
   // ordinary thread's resolved instructions as well.
   bb.agents.contributeInstructions(() => agentInstructions);
-
-  const directiveHint = (runId: string | null): string =>
-    "\n\nTo render a live status card in chat, emit this directive on its own line (never inside a code fence):\n" +
-    (runId ? `::xcode{run="${runId}"}` : "::xcode{}") +
-    (runId
-      ? "\nBare ::xcode{} instead shows this thread's current Xcode activity."
-      : "");
 
   bb.agents.registerTool({
     name: "xcode_status",
@@ -1111,8 +1040,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           "No recorded runs for this checkout yet. Pass machineWide: true to see all Xcode activity.",
         );
       }
-      const focus = open[0] ?? recent[0] ?? null;
-      return parts.join("\n\n") + directiveHint(focus ? focus.id : null);
+      return parts.join("\n\n");
     },
   });
 
@@ -1145,10 +1073,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           : "No failed Xcode runs recorded.";
       }
       const detail = cliShow(failed.id);
-      return (
-        (detail.stdout ?? detail.stderr ?? "No detail available.") +
-        directiveHint(failed.id)
-      );
+      return detail.stdout ?? detail.stderr ?? "No detail available.";
     },
   });
 

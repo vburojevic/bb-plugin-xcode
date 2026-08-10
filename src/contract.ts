@@ -168,7 +168,7 @@ export const rpcContract = defineRpcContract({
   },
 
   /**
-   * Everything the in-chat `::xcode{…}` card needs in one call. With `runId`
+   * Everything the live activity banner needs in one call. With `runId`
    * the card pins that run; otherwise it shows the thread's own activity
    * (scope resolved server-side from `threadId`), falling back to
    * machine-wide when the thread has no resolvable checkout.

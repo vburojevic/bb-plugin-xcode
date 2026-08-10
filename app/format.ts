@@ -101,6 +101,45 @@ export function statusLabel(status: RunStatus): string {
   }
 }
 
+/**
+ * `statusLabel`, but honest about what the process is actually doing.
+ *
+ * Only the in-flight state needs this: once a run resolves, "Succeeded" and
+ * "Failed" read correctly for every kind. While it is alive, though, the verb
+ * is the whole point — a test run labelled "Building" is simply wrong, which
+ * is exactly what a card showing a build and a test side by side made obvious.
+ */
+export function runStatusLabel(run: {
+  status: RunStatus;
+  kind: RunKind;
+}): string {
+  if (run.status !== "running") return statusLabel(run.status);
+  switch (run.kind) {
+    case "test":
+      return "Testing";
+    case "archive":
+      return "Archiving";
+    case "clean":
+      return "Cleaning";
+    case "analyze":
+      return "Analyzing";
+    case "install":
+      return "Installing";
+    case "export":
+      return "Exporting";
+    case "docbuild":
+      return "Documenting";
+    case "package":
+      return "Resolving";
+    case "index":
+      return "Indexing";
+    case "unknown":
+      return "Running";
+    default:
+      return "Building";
+  }
+}
+
 /** Optional explanation for states whose label alone needs clarification. */
 export function statusHint(_status: RunStatus): string | null {
   return null;

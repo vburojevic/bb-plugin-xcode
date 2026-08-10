@@ -194,8 +194,8 @@ export class Collector {
    * services and waits a bounded time for them; a tick that ignores the
    * signal can sit inside `ps` + `lsof` + a full sweep for far longer than
    * that window, which puts the whole plugin in `degraded` — and a degraded
-   * plugin's frontend generation is deactivated, so every `::xcode` card in
-   * chat silently falls back to literal directive text.
+   * plugin's frontend generation is deactivated, so the live build row above
+   * the composer silently stops rendering.
    */
   async probeTick(now = Date.now(), signal?: AbortSignal): Promise<boolean> {
     const stdout = await psSnapshot();

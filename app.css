@@ -13,6 +13,46 @@
  * `--primary` so live activity wears the user's accent.
  */
 
+/*
+ * The host's prompt-stack card, reproduced exactly.
+ *
+ * `PromptStackCard` (apps/app/src/components/promptbox/banner/PromptStackCard.tsx)
+ * is `rounded-lg border border-border bg-surface-raised-solid`. This plugin's
+ * Tailwind build cannot generate `bg-surface-raised-solid` — the token is not
+ * in our theme — but the host defines it as a live CSS variable on :root, so
+ * we consume the variable itself and inherit any theme that redefines it.
+ * `--card` is the documented fallback (identical in the stock themes).
+ *
+ * `margin-bottom` is ours to own and is NOT a style choice. Measured in the
+ * running app, a native stack card computes `margin-top: 0; margin-bottom:
+ * 8px` — the stack spaces itself downward. The host applies that same 8px to
+ * the plugin slot's `display: contents` wrapper, which generates no box, so
+ * it is discarded and the banner sits flush against the card below it.
+ * Reproducing it here is what closes that gap; `margin-top` would put the
+ * space on the wrong side, which is exactly the bug this replaced.
+ */
+.bbx-stack-card {
+  margin-bottom: 0.5rem;
+  overflow: hidden;
+  border-radius: var(--radius-lg, 0.5rem);
+  border: 1px solid var(--border);
+  background: var(--surface-raised-solid, var(--card));
+}
+
+/*
+ * The one place the row departs from host chrome, and deliberately: the border
+ * carries a quiet tint of the run's own status. A shell command has no state
+ * worth colouring; a build does, and this is what makes a red frame findable
+ * from across the room without the row ever raising its voice. The mix stays
+ * low (30%) so it reads as a tint on the host border rather than a highlight,
+ * and the eased transition IS the card's motion moment — a verdict landing
+ * shows up as the frame settling from activity to outcome.
+ */
+.bbx-stack-card.bbx-tinted {
+  border-color: color-mix(in srgb, var(--bbx) 30%, var(--border));
+  transition: border-color 0.35s ease;
+}
+
 .bbx-status-pass {
   --bbx: color-mix(in oklab, #30d158 62%, var(--foreground) 38%);
 }
