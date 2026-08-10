@@ -60,6 +60,7 @@ import { useComposerView, useRpc } from "@bb/plugin-sdk/app";
 import { cn } from "@/lib/utils";
 
 import type { rpcContract } from "../src/contract";
+import { isNoiseRun } from "../src/model";
 
 import { XcodeActivityRow } from "./ActivityRow";
 import { activityMetaClass, runActivityState } from "./activity-styles";
@@ -100,7 +101,7 @@ function XcodeActivityBannerLoaded({ threadId }: { threadId: string }) {
   // answer to "how did that go" outlives the build, without the card growing
   // a history section during a busy stretch.
   const settled = data?.lastSettled ?? null;
-  const runs = live.length > 0 ? live : settled && !isNoise(settled) ? [settled] : [];
+  const runs = live.length > 0 ? live : settled && !isNoiseRun(settled) ? [settled] : [];
 
   // Nothing to report renders nothing at all — frame included, so the stack
   // closes up rather than keeping an empty card above the composer.
@@ -178,23 +179,6 @@ function dominant(runs: readonly RunDto[]): RunDto {
 }
 
 /**
- * Not everything xcodebuild does is a build worth a row.
- *
- * `xcodebuild -find <tool>` and `-version` are toolchain lookups the SDK fires
- * constantly — measured on this machine, a third of all attributed runs, in
- * bursts of ten, several of them 0ms. They are real xcodebuild processes, so
- * the tracker is right to record them; they are not work anyone is waiting on,
- * so the banner is right to ignore them. They are recognisable by having no
- * scheme and no derived-data root — a real build always resolves at least one.
- *
- * `package` and `index` match the store's own noise definition (store.ts).
- */
-function isNoise(run: RunDto): boolean {
-  if (run.kind === "package" || run.kind === "index") return true;
-  return run.kind === "unknown" && run.scheme === null && run.root === null;
-}
-
-/**
  * `chatStatus` returns a focused run plus the rest of the scope's unresolved
  * runs, and the focused one may be a finished run when nothing is live. The
  * banner shows in-flight work only — a finished build belongs in the history
@@ -204,7 +188,7 @@ function liveRuns(focus: RunDto | null, active: readonly RunDto[]): RunDto[] {
   const out: RunDto[] = [];
   const seen = new Set<string>();
   for (const run of [focus, ...active]) {
-    if (!run || seen.has(run.id) || !isLive(run) || isNoise(run)) continue;
+    if (!run || seen.has(run.id) || !isLive(run) || isNoiseRun(run)) continue;
     seen.add(run.id);
     out.push(run);
   }

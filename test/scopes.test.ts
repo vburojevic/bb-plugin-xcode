@@ -3,10 +3,11 @@ import { describe, expect, it } from "vitest";
 
 import { RANK, type Run } from "../src/model";
 import {
-  SCOPE_IDLE_TTL_MS,
-  ThreadScopes,
   pathIsUnder,
   runMatchesScope,
+  SCOPE_IDLE_TTL_MS,
+  scopeFilter,
+  ThreadScopes,
 } from "../src/scopes";
 import { MIGRATIONS, Store, type Db } from "../src/store";
 
@@ -196,5 +197,46 @@ describe("Store.attributeRunsToThread", () => {
     expect(store.getRun("r3")?.threadId).toBe(null);
     expect(store.getRun("r4")?.threadId).toBe("th_other");
     expect(store.getRun("r5")?.threadId).toBe(null);
+  });
+});
+
+
+describe("scopeFilter", () => {
+  const scope = {
+    threadId: "thr_mine",
+    path: "/Users/v/.bb/worktrees/env_mine/indexed",
+    branch: "feature",
+  };
+  const foreign = {
+    threadId: "thr_other",
+    cwd: "/Users/v/.bb/worktrees/env_other/indexed",
+    container: null,
+    root: "/Users/v/.bb/worktrees/env_other/indexed/ios/App/.build/DerivedData",
+    branch: "bb/other-branch",
+    worktree: "indexed",
+  };
+  const mine = { ...foreign, threadId: "thr_mine" };
+
+  /**
+   * Observed in production: a brand-new thread whose environment had not been
+   * attached yet resolved to a null scope, the filter widened to the whole
+   * machine, and the banner presented a finished build from a DIFFERENT and
+   * since-archived worktree as that thread's last activity.
+   */
+  it("matches nothing when the thread's checkout is unresolved", () => {
+    const filter = scopeFilter(null);
+    expect(filter(foreign)).toBe(false);
+    expect(filter(mine)).toBe(false);
+  });
+
+  it("opens up only when the caller explicitly asked for machine-wide", () => {
+    expect(scopeFilter(null, true)(foreign)).toBe(true);
+    expect(scopeFilter(scope, true)(foreign)).toBe(true);
+  });
+
+  it("keeps a resolved scope to its own checkout", () => {
+    const filter = scopeFilter(scope);
+    expect(filter(mine)).toBe(true);
+    expect(filter(foreign)).toBe(false);
   });
 });

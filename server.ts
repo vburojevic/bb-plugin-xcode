@@ -15,7 +15,7 @@ import { XCODE_CHANNEL } from "./src/channel";
 import { rpcContract } from "./src/contract";
 import { Collector, type CollectorProject } from "./src/collector";
 import { Engine } from "./src/engine";
-import { durationMs, type Run } from "./src/model";
+import { durationMs, isNoiseRun, type Run } from "./src/model";
 import { describeExit, runWrapped } from "./src/runner";
 import {
   installShim,
@@ -28,7 +28,12 @@ import {
 import { safely, detach } from "./src/safe";
 import { MIGRATIONS, Store, type Db } from "./src/store";
 import { destinationLabel } from "./src/destination";
-import { ThreadScopes, runMatchesScope, type ThreadScope } from "./src/scopes";
+import {
+  ThreadScopes,
+  runMatchesScope,
+  scopeFilter,
+  type ThreadScope,
+} from "./src/scopes";
 import {
   backgroundCommandOutcomes,
   type ThreadEventLike,
@@ -301,16 +306,34 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   const scopeResolvedAt = new Map<string, number>();
 
+  /**
+   * How long a resolved scope is trusted before we ask the SDK again, and how
+   * long a FAILED resolve is remembered.
+   *
+   * These have to differ. A brand-new thread is momentarily env-less — the
+   * thread row exists before its environment is attached — and the miss was
+   * being cached for the full 30s alongside genuine successes. Combined with
+   * the old `!scope` filter widening to machine-wide, that gave a fresh thread
+   * a half-minute window in which it confidently showed another worktree's
+   * build. The filter fix makes that window merely empty instead of wrong;
+   * this makes the window short.
+   */
+  const SCOPE_TTL_MS = 30_000;
+  const SCOPE_MISS_TTL_MS = 4_000;
+
   const refreshThreadScope = async (
     threadId: string,
     active: boolean,
   ): Promise<ThreadScope | null> => {
     const now = Date.now();
     const last = scopeResolvedAt.get(threadId) ?? 0;
-    // Within the throttle window, answer from the registry (null for a thread
-    // that resolved to no checkout — retrying an env-less side chat every
-    // event would be two SDK calls per turn for nothing).
-    if (now - last < 30_000) return scopes.get(threadId);
+    const known = scopes.get(threadId);
+    // Within the throttle window, answer from the registry. A hit is trusted
+    // for the full TTL; a miss is retried far sooner, because "no checkout
+    // yet" and "no checkout ever" look identical here and only one of them
+    // stays true. The long TTL exists so an env-less side chat does not cost
+    // two SDK calls per event.
+    if (now - last < (known ? SCOPE_TTL_MS : SCOPE_MISS_TTL_MS)) return known;
     if (scopeResolvedAt.size > 1000) scopeResolvedAt.clear();
     scopeResolvedAt.set(threadId, now);
     try {
@@ -487,8 +510,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
             worktree: shortName(scope.path),
           }
         : null;
-      const inScope = (run: Run): boolean =>
-        !scope || runMatchesScope(run, scope);
+      // Thread-scoped, never machine-wide: an unresolved checkout must show
+      // nothing rather than another thread's build. See `scopeFilter`.
+      const inScope = scopeFilter<Run>(scope);
 
       const unresolved = store.listUnresolved().filter(inScope);
       const settled = store
@@ -500,7 +524,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       // back to the one before would answer a question nobody asked: a run
       // older than the one you just cleared is, by definition, staler news,
       // and it would take a dozen clicks to get an empty card.
-      const newest = settled[0] ?? null;
+      // Noise excluded here, not just in the UI: a `-find` lookup taking this
+      // slot would suppress the real result rather than merely appear.
+      const newest = settled.find((run) => !isNoiseRun(run)) ?? null;
       const lastSettled =
         newest && !dismissedRuns.has(newest.id) ? newest : null;
 
@@ -1064,8 +1090,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       const scope = machineWide
         ? null
         : (scopes.get(threadId) ?? (await refreshThreadScope(threadId, false)));
-      const inScope = (run: Run): boolean =>
-        !scope || runMatchesScope(run, scope);
+      // `machineWide` is the caller's explicit request; an unresolvable thread
+      // scope is not a licence to answer for the whole machine.
+      const inScope = scopeFilter<Run>(scope, machineWide);
 
       const open = store.listUnresolved().filter(inScope);
       const recent = store.listRuns({ limit: limit ?? 5 }).filter(inScope);

@@ -110,6 +110,34 @@ export function pathIsUnder(path: string, base: string): boolean {
  * runs recorded before the scope existed (or by other tools entirely) still
  * show up on the thread's card.
  */
+/**
+ * The predicate a thread-scoped surface must filter runs through.
+ *
+ * This exists as its own function because the obvious inline form was wrong in
+ * a way that only showed up on a brand-new thread:
+ *
+ *     const inScope = (run) => !scope || runMatchesScope(run, scope);
+ *
+ * A null scope meant "no filter", so a thread whose checkout had not resolved
+ * yet silently widened to the whole machine and the banner showed somebody
+ * else's build — in the observed case a finished run from a DIFFERENT, since
+ * archived worktree, presented as this thread's last activity.
+ *
+ * An unresolved scope is an absence of knowledge, not permission to answer
+ * with everything. `machineWide` is the only thing that opens the filter, and
+ * only a caller that explicitly asked for it can pass it.
+ */
+export function scopeFilter<
+  T extends Parameters<typeof runMatchesScope>[0],
+>(
+  scope: { threadId: string; path: string; branch: string | null } | null,
+  machineWide = false,
+): (run: T) => boolean {
+  if (machineWide) return () => true;
+  if (!scope) return () => false;
+  return (run) => runMatchesScope(run, scope);
+}
+
 export function runMatchesScope(
   run: {
     threadId?: string | null;

@@ -54,6 +54,30 @@ export const TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set([
   "ended",
 ]);
 
+/**
+ * Activity the tracker is right to record and a surface is right to ignore.
+ *
+ * `xcodebuild -find <tool>` and `-version` are toolchain lookups the SDK fires
+ * constantly — measured on this machine, a third of all attributed runs, in
+ * bursts of ten, several of them 0ms. They are real xcodebuild processes, so
+ * the store keeps them; nobody is waiting on one, so nothing user-facing
+ * should lead with one. They are recognisable by resolving neither a scheme
+ * nor a derived-data root, which a real build always does at least one of.
+ *
+ * This lives in the model rather than in a component because both ends need
+ * the same answer: when the frontend alone knew the rule, a `-find` lookup
+ * took the "last settled run" slot server-side and the banner then filtered it
+ * out client-side — so the real result it was hiding never appeared at all.
+ */
+export function isNoiseRun(run: {
+  kind: RunKind;
+  scheme: string | null;
+  root: string | null;
+}): boolean {
+  if (run.kind === "package" || run.kind === "index") return true;
+  return run.kind === "unknown" && run.scheme === null && run.root === null;
+}
+
 /** A verdict is a terminal status that states an actual outcome. */
 export const VERDICT_STATUSES: ReadonlySet<RunStatus> = new Set([
   "passed",
