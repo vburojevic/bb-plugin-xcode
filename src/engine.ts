@@ -327,11 +327,18 @@ export class Engine {
       target.scheme ??= entry.scheme;
       target.root ??= root;
 
-      const verdict: RunStatus | null = isCompilePhaseOfTest
-        ? entry.status === "failed"
-          ? "failed"
-          : null
-        : entry.status;
+      // A live process has not finished, whatever a log entry claims. One
+      // invocation writes an entry per action, so the clean phase of
+      // `clean build` — or the compile phase of a test run — would otherwise
+      // finalize the whole run as passed while it is still compiling.
+      // A failure is different: a phase that failed sinks the run for real.
+      const stillAlive = target.status === "running";
+      const verdict: RunStatus | null =
+        isCompilePhaseOfTest || stillAlive
+          ? entry.status === "failed"
+            ? "failed"
+            : null
+          : entry.status;
 
       if (
         verdict &&
@@ -464,6 +471,13 @@ export class Engine {
         testCases.map((test) => ({ ...test, runId: target.id })),
       );
       target.detailed = true;
+    }
+
+    // Same rule as the manifest fold: a bundle written by one action of a
+    // still-running invocation describes that action, not the whole run.
+    // Only a failure is allowed to speak early.
+    if (target.status === "running" && verdict !== "failed") {
+      verdict = null;
     }
 
     if (

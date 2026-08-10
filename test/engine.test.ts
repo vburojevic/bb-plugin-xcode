@@ -42,6 +42,19 @@ const hooks = {
 let store: Store;
 let engine: Engine;
 
+/**
+ * Retire the observed process. A verdict may only land once the process is
+ * gone — a live invocation writes a log entry per action (`clean build`), and
+ * honoring those early once marked a still-compiling build as passed.
+ */
+function retire(from: number): number {
+  let at = from;
+  for (let i = 0; i < MISSES_BEFORE_FINISHING; i++) {
+    engine.foldSnapshot([], (at += 2_000));
+  }
+  return at;
+}
+
 beforeEach(() => {
   store = makeStore();
   engine = new Engine(store, hooks);
@@ -144,7 +157,8 @@ describe("manifest folding", () => {
 
   it("enriches the overlapping run rather than creating a second row", () => {
     engine.foldSnapshot([activity()], 1_000_000);
-    engine.foldManifestEntry("/tmp/dd", "build", manifestEntry(), 1_006_000);
+    retire(1_000_000);
+    engine.foldManifestEntry("/tmp/dd", "build", manifestEntry(), 1_010_000);
     const runs = store.listRuns({});
     expect(runs).toHaveLength(1);
     expect(runs[0]!.status).toBe("passed");
@@ -166,11 +180,15 @@ describe("manifest folding", () => {
 
   it("keeps duration from the run's own start, not the log span", () => {
     engine.foldSnapshot([activity({ startedAt: 1_000_000 })], 1_000_000);
+    // Alive across the whole logged window, then gone: end time comes from
+    // the last sighting, never from the log's own short span.
+    engine.foldSnapshot([activity({ startedAt: 1_000_000 })], 1_004_100);
+    retire(1_004_100);
     engine.foldManifestEntry(
       "/tmp/dd",
       "build",
       { ...manifestEntry(), startedAt: 1_004_000, endedAt: 1_004_070 },
-      1_006_000,
+      1_010_000,
     );
     const run = store.listRuns({})[0]!;
     // v1 regression: a 70ms log span must not shrink a 4s+ run.
@@ -249,7 +267,8 @@ describe("bundle folding (verified rank)", () => {
 
   it("sets the verdict, findings and destination on the overlapping run", () => {
     engine.foldSnapshot([activity()], 1_000_000);
-    engine.foldBundle("/b/r.xcresult", build, null, [], 1_006_000);
+    retire(1_000_000);
+    engine.foldBundle("/b/r.xcresult", build, null, [], 1_010_000);
     const run = store.listRuns({})[0]!;
     expect(run.status).toBe("warnings");
     expect(run.destination).toBe("platform=macOS"); // observed wins; already set
@@ -261,6 +280,7 @@ describe("bundle folding (verified rank)", () => {
       [activity({ kind: "test", args: "xcodebuild -scheme Demo test" })],
       1_000_000,
     );
+    retire(1_000_000);
     engine.foldBundle(
       "/b/t.xcresult",
       { ...build, status: "passed" },
@@ -285,6 +305,7 @@ describe("bundle folding (verified rank)", () => {
 
   it("a verified verdict can overwrite a logged one, never vice versa", () => {
     engine.foldSnapshot([activity()], 1_000_000);
+    retire(1_000_000);
     engine.foldManifestEntry(
       "/tmp/dd",
       "build",
@@ -345,6 +366,7 @@ describe("shim-wrapped runs (regression)", () => {
       [activity({ resultBundlePath: "/bundles/x.xcresult" })],
       1_000_000,
     );
+    retire(1_000_000);
     engine.foldManifestEntry(
       "/tmp/dd",
       "build",
@@ -425,5 +447,73 @@ describe("foldWrappedExit", () => {
       1_060_000,
     );
     expect(store.getRun(id)!.status).toBe("passed");
+  });
+});
+
+describe("premature verdicts (regression)", () => {
+  // Observed live: `xcodebuild clean build` classified as a clean, whose own
+  // log entry then marked the whole invocation passed 5.7s in — while the
+  // build phase was still compiling.
+  const cleanEntry = {
+    uniqueIdentifier: "uuid-clean",
+    title: "Clean workspace Demo",
+    scheme: "Demo",
+    startedAt: 1_000_500,
+    endedAt: 1_001_000,
+    status: "passed" as const,
+    errorCount: 0,
+    warningCount: 0,
+    analyzerCount: 0,
+    testFailureCount: 0,
+  };
+
+  it("never lets a phase log finalize a run whose process is still alive", () => {
+    engine.foldSnapshot([activity()], 1_000_000);
+    engine.foldManifestEntry("/tmp/dd", "build", cleanEntry, 1_002_000);
+    const run = store.listRuns({})[0]!;
+    expect(run.status).toBe("running");
+  });
+
+  it("still lets a failed phase sink a live run immediately", () => {
+    engine.foldSnapshot([activity()], 1_000_000);
+    engine.foldManifestEntry(
+      "/tmp/dd",
+      "build",
+      { ...cleanEntry, status: "failed", errorCount: 2 },
+      1_002_000,
+    );
+    expect(store.listRuns({})[0]!.status).toBe("failed");
+  });
+
+  it("applies the verdict once the process is gone", () => {
+    engine.foldSnapshot([activity()], 1_000_000);
+    let at = 1_002_000;
+    for (let i = 0; i < MISSES_BEFORE_FINISHING; i++) {
+      engine.foldSnapshot([], (at += 2_000));
+    }
+    engine.foldManifestEntry("/tmp/dd", "build", cleanEntry, at + 1_000);
+    expect(store.listRuns({})[0]!.status).toBe("passed");
+  });
+
+  it("does not let a bundle finalize a still-running invocation", () => {
+    engine.foldSnapshot([activity({ resultBundlePath: "/tmp/b.xcresult" })], 1_000_000);
+    engine.foldBundle(
+      "/tmp/b.xcresult",
+      {
+        status: "passed",
+        startedAt: 1_000_500,
+        endedAt: 1_001_000,
+        errorCount: 0,
+        warningCount: 0,
+        analyzerCount: 0,
+        actionTitle: null,
+        destination: null,
+        issues: [],
+      },
+      null,
+      [],
+      1_002_000,
+    );
+    expect(store.listRuns({})[0]!.status).toBe("running");
   });
 });

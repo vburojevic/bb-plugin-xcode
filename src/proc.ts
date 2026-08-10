@@ -84,6 +84,33 @@ const WORKER_BINARIES = new Set([
   "swift-symbolgraph-extract",
 ]);
 
+/**
+ * Which action speaks for a multi-action invocation. A test outranks a build,
+ * a build outranks the clean or package-resolve that precedes it, and
+ * anything outranks "unknown".
+ */
+function actionRank(kind: RunKind): number {
+  switch (kind) {
+    case "test":
+      return 5;
+    case "archive":
+      return 4;
+    case "build":
+    case "analyze":
+    case "docbuild":
+    case "install":
+    case "export":
+      return 3;
+    case "clean":
+      return 2;
+    case "package":
+    case "index":
+      return 1;
+    case "unknown":
+      return 0;
+  }
+}
+
 /** xcodebuild action verbs, used to classify a run and to spot the action in argv. */
 const ACTION_VERBS: Record<string, RunKind> = {
   build: "build",
@@ -275,12 +302,15 @@ function flagValuePhrase(tokens: string[], flag: string): string | null {
 export function parseXcodebuildArgs(args: string): ActivityAttribution {
   const tokens = tokenize(args);
 
+  // One invocation can carry several actions (`clean build`, `build test`).
+  // Report the one whose outcome the developer cares about, by precedence —
+  // NOT the first seen. `clean build` classified as a clean, which then let
+  // the clean phase's own log entry deliver a "passed" verdict while the
+  // build was still compiling (observed live on 2026-08-10).
   let kind: RunKind = "unknown";
   for (const token of tokens) {
     const verb = ACTION_VERBS[token];
-    // Later verbs win: `xcodebuild build test` runs both, and the test result
-    // is the more interesting one to report.
-    if (verb && (kind === "unknown" || verb === "test")) kind = verb;
+    if (verb && actionRank(verb) > actionRank(kind)) kind = verb;
   }
 
   const container =
