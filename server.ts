@@ -410,7 +410,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   bb.background.service("probe", {
     async start(signal) {
       await collector.isXcodeAvailable().catch(() => false);
-      await collector.fullScan().catch((error: unknown) => {
+      await collector.fullScan(Date.now(), signal).catch((error: unknown) => {
         bb.log.warn(`initial scan failed: ${String(error)}`);
       });
       publish();
@@ -423,7 +423,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       let failures = 0;
       while (!signal.aborted) {
         try {
-          const changed = await collector.probeTick();
+          const changed = await collector.probeTick(Date.now(), signal);
           // A sweep can run for a minute; without these re-checks a reload
           // mid-sweep lets the publish below fire on a disposed handle.
           if (signal.aborted) break;
@@ -436,7 +436,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
             : sinceSweep >= 30_000;
           if (due) {
             sinceSweep = 0;
-            const swept = await collector.fullScan();
+            const swept = await collector.fullScan(Date.now(), signal);
             if (signal.aborted) break;
             if (swept) publish();
             pendingVerdicts = engine.hasOpenRuns();

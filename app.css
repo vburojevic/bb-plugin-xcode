@@ -111,116 +111,29 @@ span.bbx-dot > span {
   }
 }
 
-/* ---------------------------------------------------------------- variants
- *
- * Ten candidate treatments for the live (building / finishing) state, so the
- * expression can be chosen against the real product rather than argued about.
- * Everything below is scoped to `::xcode{variant="…"}` and shares the same
- * `--bbx` status hue, so whichever wins inherits the theme blending intact.
+/*
+ * The compiler swarm. A lit dot is one live compiler process; an idle slot is
+ * capacity this run has used before and will use again. The pulse is slow and
+ * staggered per dot — at twelve dots a unison blink reads as an alarm.
  */
-
-/* 2 — segments: build phases as discrete cells, the active one breathing. */
-.bbx-seg {
-  background: color-mix(in srgb, var(--bbx) 14%, transparent);
-}
-.bbx-seg-done {
-  background: var(--bbx);
-}
-.bbx-seg-active {
-  background: var(--bbx);
-  animation: bbx-breath 1.4s ease-in-out infinite;
-}
-
-/* 3 — ambient: no bar at all; the card's own border carries a slow travelling
- * highlight. The quietest option for a card that sits open for hours. */
-.bbx-ambient {
-  position: relative;
-}
-.bbx-ambient::after {
-  content: "";
-  position: absolute;
-  inset: -1px;
-  border-radius: inherit;
-  padding: 1px;
-  background: linear-gradient(
-    115deg,
-    transparent 30%,
-    color-mix(in srgb, var(--bbx) 70%, transparent) 50%,
-    transparent 70%
-  );
-  background-size: 300% 100%;
-  animation: bbx-ambient-travel 3.2s ease-in-out infinite;
-  -webkit-mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask-composite: exclude;
-  pointer-events: none;
-}
-@keyframes bbx-ambient-travel {
-  from {
-    background-position: 150% 0;
-  }
-  to {
-    background-position: -50% 0;
-  }
-}
-
-/* 4 — workers: one dot per live compiler process; parallelism made visible. */
 .bbx-worker {
   background: var(--bbx);
-  animation: bbx-worker-pulse 1.5s ease-in-out infinite;
+  animation: bbx-worker-pulse 1.6s ease-in-out infinite;
+}
+.bbx-worker-idle {
+  background: color-mix(in srgb, var(--bbx) 20%, transparent);
+  transform: scale(0.72);
 }
 @keyframes bbx-worker-pulse {
   0%,
   100% {
-    opacity: 0.25;
-    transform: scale(0.8);
+    opacity: 0.42;
+    transform: scale(0.82);
   }
   50% {
     opacity: 1;
     transform: scale(1);
   }
-}
-
-/* 5 — stripes: the barber pole, Xcode's own indeterminate idiom. */
-.bbx-stripes {
-  background-image: repeating-linear-gradient(
-    -45deg,
-    color-mix(in srgb, var(--bbx) 62%, transparent) 0 6px,
-    transparent 6px 12px
-  );
-  background-size: 17px 100%;
-  animation: bbx-stripes-march 700ms linear infinite;
-}
-@keyframes bbx-stripes-march {
-  to {
-    background-position: 17px 0;
-  }
-}
-
-/* 6 — halo: the status glyph is the only signal; a single expanding ring. */
-.bbx-halo {
-  border: 1.5px solid var(--bbx);
-  animation: bbx-halo-out 2s cubic-bezier(0, 0, 0.2, 1) infinite;
-}
-@keyframes bbx-halo-out {
-  0% {
-    transform: scale(0.6);
-    opacity: 0.9;
-  }
-  100% {
-    transform: scale(2.1);
-    opacity: 0;
-  }
-}
-
-/* 9 — history: past durations as bars, with the live run advancing among them. */
-.bbx-hist-bar {
-  background: color-mix(in srgb, var(--bbx) 22%, transparent);
-}
-.bbx-hist-now {
-  background: var(--bbx);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -230,20 +143,18 @@ span.bbx-dot > span {
     width: 100%;
     opacity: 0.4;
   }
-  .bbx-progress-breath,
-  .bbx-seg-active,
+  .bbx-progress-breath {
+    animation: none;
+    opacity: 0.5;
+  }
+  /* Lit dots stay fully lit, idle ones stay dim: the count still reads. */
   .bbx-worker {
     animation: none;
-    opacity: 0.6;
+    opacity: 1;
+    transform: none;
   }
-  .bbx-verdict-in,
-  .bbx-ambient::after,
-  .bbx-stripes,
-  .bbx-halo {
+  .bbx-verdict-in {
     animation: none;
-  }
-  .bbx-halo {
-    opacity: 0.35;
   }
 }
 

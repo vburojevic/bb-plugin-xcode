@@ -113,35 +113,10 @@ type RunDto = {
 const LIVE = new Set(["running", "finishing"]);
 
 /**
- * Candidate expressions of the live state. The card is identical across all
- * of them — only how "work is happening" is voiced changes, so they can be
- * compared honestly. `::xcode{variant="workers"}`.
+ * Most compiler dots we will draw. Beyond this the row stops being countable
+ * at a glance and becomes texture, so the surplus goes to the label instead.
  */
-const VARIANTS = [
-  "comet",
-  "segments",
-  "ambient",
-  "workers",
-  "stripes",
-  "halo",
-  "eta",
-  "ticker",
-  "history",
-  "spinner",
-] as const;
-type Variant = (typeof VARIANTS)[number];
-
-/** Live-state extras a variant may need; null where a run cannot supply them. */
-interface LiveExtras {
-  /** Build phases opened / closed, from the live result stream. */
-  sections: { done: number; total: number } | null;
-  /** Current phase description, from the live result stream. */
-  section: string | null;
-  /** Median duration of recent runs of the same scheme+kind. */
-  typicalMs: number | null;
-  /** Durations of recent comparable runs, oldest first. */
-  historyMs: number[] | null;
-}
+const MAX_WORKER_DOTS = 24;
 
 const DEMO_STATUSES = new Set<RunDto["status"]>([
   "running",
@@ -261,9 +236,6 @@ export function XcodeChatCard({
     demoRaw && DEMO_STATUSES.has(demoRaw as RunDto["status"])
       ? (demoRaw as RunDto["status"])
       : null;
-  const variantRaw = attributes.variant?.trim() as Variant | undefined;
-  const variant: Variant =
-    variantRaw && VARIANTS.includes(variantRaw) ? variantRaw : "comet";
 
   const [data, setData] = useState<ChatStatus | null>(null);
   const [error, setError] = useState(false);
@@ -341,9 +313,6 @@ export function XcodeChatCard({
 
   const isLive = LIVE.has(run.status);
   const elapsed = isLive ? Date.now() - run.startedAt : run.durationMs;
-  const extras: LiveExtras = demo
-    ? demoExtras(run)
-    : { sections: null, section: null, typicalMs: null, historyMs: null };
   const testsBadge =
     run.testTotal !== null
       ? (run.testFailed ?? 0) > 0
@@ -356,15 +325,10 @@ export function XcodeChatCard({
   const problems = findings.length > 0 || failedTests.length > 0;
 
   return (
-    <Shell
-      className={cn(
-        statusClass(run.status),
-        isLive && variant === "ambient" && "bbx-ambient",
-      )}
-    >
+    <Shell className={statusClass(run.status)}>
       {/* Header */}
       <div className="flex items-start gap-2.5 px-3.5 pt-3 pb-2.5">
-        <StatusMark status={run.status} variant={variant} />
+        <StatusMark status={run.status} />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="truncate text-sm font-semibold leading-tight text-foreground">
@@ -425,7 +389,7 @@ export function XcodeChatCard({
           </span>
           {demo ? (
             <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60">
-              {isLive && variantRaw ? variant : "demo"}
+              demo
             </span>
           ) : null}
         </span>
@@ -439,15 +403,8 @@ export function XcodeChatCard({
         </div>
       ) : null}
 
-      {/* Live state, voiced by the chosen variant. */}
-      {isLive ? (
-        <LiveIndicator
-          run={run}
-          variant={variant}
-          extras={extras}
-          elapsedMs={elapsed ?? 0}
-        />
-      ) : null}
+      {/* Live state: the compiler swarm. */}
+      {isLive ? <WorkerSwarm run={run} /> : null}
 
       {/* Counts */}
       {run.errorCount > 0 || run.warningCount > 0 || testsBadge ? (
@@ -548,223 +505,100 @@ export function XcodeChatCard({
   );
 }
 
-/** Plausible live-stream/history values so variants can be judged fairly. */
-function demoExtras(run: RunDto): LiveExtras {
-  return {
-    sections: { done: run.status === "finishing" ? 9 : 6, total: 9 },
-    section:
-      run.status === "finishing"
-        ? "Signing Packerly.app"
-        : "Compiling TripPlanner.swift",
-    typicalMs: 292_000,
-    historyMs: [268_000, 301_000, 254_000, 292_000, 279_000, 318_000],
-  };
-}
-
 /**
- * The live state, ten ways.
+ * The compiler swarm: one dot per Swift/clang process this build has alive
+ * right now, so a glance answers "is it actually working, and how hard".
  *
- * Every variant answers the same two questions — is it moving, and how long
- * has it been — and differs only in what else it volunteers: phase, worker
- * parallelism, comparison with previous runs, or deliberately nothing.
+ * Two things make this honest and stable:
+ *
+ *  - the row is sized to the PEAK concurrency observed for this run, not the
+ *    current count. `workerCount` swings every 2s tick (12 → 3 → 9 as the
+ *    build moves between compiling, linking and signing), and a row that
+ *    resized with it would reflow the card every tick — the exact churn
+ *    PRODUCT.md calls worse than no live view. Slots only ever grow, lit
+ *    dots track the live count, and the rest sit dim: utilization against
+ *    the run's own observed capacity.
+ *  - nothing is invented. Before any compiler is seen (planning, package
+ *    resolution) and after they are all gone, the row falls back to the
+ *    sweep bar rather than drawing dots that stand for nothing.
  */
-function LiveIndicator({
-  run,
-  variant,
-  extras,
-  elapsedMs,
-}: {
-  run: RunDto;
-  variant: Variant;
-  extras: LiveExtras;
-  elapsedMs: number;
-}) {
-  const finishing = run.status === "finishing";
-  const label = `${statusLabel(run.status)} ${runTitle(run)}`;
+function WorkerSwarm({ run }: { run: RunDto }) {
+  const live = run.workerCount ?? 0;
+  const [peak, setPeak] = useState(live);
 
-  // These voice themselves entirely through the status glyph or the frame.
-  if (variant === "halo" || variant === "spinner" || variant === "ambient") {
-    return null;
-  }
+  useEffect(() => {
+    setPeak((current) => (live > current ? live : current));
+  }, [live]);
+  useEffect(() => {
+    setPeak(0); // a pinned card can switch runs; capacity is per run
+  }, [run.id]);
 
-  if (variant === "segments") {
-    const total = extras.sections?.total ?? 8;
-    const done = extras.sections?.done ?? 0;
-    return (
-      <Slot>
-        <div
-          className="flex gap-1"
-          role="progressbar"
-          aria-label={label}
-          aria-valuenow={done}
-          aria-valuemax={total}
-        >
-          {Array.from({ length: total }, (_, index) => (
-            <span
-              key={index}
-              className={cn(
-                "h-1 flex-1 rounded-full",
-                index < done
-                  ? "bbx-seg-done"
-                  : index === done && !finishing
-                    ? "bbx-seg-active"
-                    : "bbx-seg",
-              )}
-            />
-          ))}
-        </div>
-        <Caption>
-          {finishing
-            ? "All phases complete — awaiting result"
-            : `Phase ${done + 1} of ${total}`}
-        </Caption>
-      </Slot>
-    );
-  }
+  const slots = Math.min(Math.max(peak, live), MAX_WORKER_DOTS);
+  const label =
+    live > 0
+      ? `${live} compiler${live === 1 ? "" : "s"} running`
+      : run.status === "finishing"
+        ? "awaiting result"
+        : "no compilers running";
 
-  if (variant === "workers") {
-    const count = Math.min(run.workerCount ?? 0, 24);
-    if (count === 0 && !finishing) return null;
-    return (
-      <Slot>
-        <div className="flex flex-wrap items-center gap-1" aria-label={label}>
-          {Array.from({ length: finishing ? 3 : count }, (_, index) => (
-            <span
-              key={index}
-              className={cn("size-1.5 rounded-full", "bbx-worker")}
-              style={{ animationDelay: `${(index % 8) * 120}ms` }}
-            />
-          ))}
-          <span className="ml-1 text-xs text-muted-foreground">
-            {finishing
-              ? "winding down"
-              : `${count} compiler${count === 1 ? "" : "s"}`}
-          </span>
-        </div>
-      </Slot>
-    );
-  }
-
-  if (variant === "stripes") {
+  // Nothing observed yet, and nothing to remember: say "moving" without
+  // claiming a number.
+  if (slots === 0) {
     return (
       <Slot>
         <Progress
           indeterminate
-          aria-label={label}
-          className="bbx-progress-track h-1.5"
-          indicatorClassName={cn(
-            "w-full",
-            finishing ? "bbx-progress-breath" : "bbx-stripes",
-          )}
+          aria-label={`${statusLabel(run.status)} ${runTitle(run)}`}
+          className="bbx-progress-track h-1"
+          indicatorClassName={
+            run.status === "finishing"
+              ? "bbx-progress-breath w-full"
+              : "bbx-progress-comet"
+          }
         />
       </Slot>
     );
   }
 
-  if (variant === "eta") {
-    const typical = extras.typicalMs;
-    if (!typical) {
-      return (
-        <Slot>
-          <Progress
-            indeterminate
-            aria-label={label}
-            className="bbx-progress-track h-1"
-            indicatorClassName="bbx-progress-comet"
-          />
-        </Slot>
-      );
-    }
-    const ratio = Math.min(elapsedMs / typical, 1);
-    const over = elapsedMs > typical;
-    return (
-      <Slot>
-        <Progress
-          value={Math.round(ratio * 100)}
-          aria-label={label}
-          className="bbx-progress-track h-1.5"
-          indicatorClassName={cn(
-            "bg-[var(--bbx)]",
-            over && "bbx-progress-breath",
-          )}
-        />
-        <Caption>
-          {over
-            ? `${formatDuration(elapsedMs - typical)} over the usual ${formatDuration(typical)}`
-            : `usually ${formatDuration(typical)} · ~${formatDuration(typical - elapsedMs)} left`}
-        </Caption>
-      </Slot>
-    );
-  }
-
-  if (variant === "ticker") {
-    return (
-      <Slot>
-        <div className="flex items-center gap-2">
-          <Icon
-            name="Spinner"
-            className="bbx-text size-3 shrink-0 animate-spin"
-            aria-hidden
-          />
-          <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">
-            {extras.section ?? (finishing ? "awaiting result" : "building…")}
-          </span>
-        </div>
-      </Slot>
-    );
-  }
-
-  if (variant === "history") {
-    const history = extras.historyMs ?? [];
-    const peak = Math.max(elapsedMs, ...history, 1);
-    return (
-      <Slot>
-        <div
-          className="flex h-6 items-end gap-1"
-          aria-label={`${label}; ${formatDuration(elapsedMs)} elapsed`}
-        >
-          {history.map((duration, index) => (
-            <span
-              key={index}
-              className="bbx-hist-bar w-2 rounded-sm"
-              style={{ height: `${Math.max((duration / peak) * 100, 8)}%` }}
-            />
-          ))}
-          <span
-            className="bbx-hist-now w-2 rounded-sm transition-[height] duration-1000 ease-linear"
-            style={{ height: `${Math.max((elapsedMs / peak) * 100, 8)}%` }}
-          />
-        </div>
-        <Caption>
-          {history.length
-            ? `this run vs. the last ${history.length}`
-            : "first run of this scheme"}
-        </Caption>
-      </Slot>
-    );
-  }
-
-  // comet (default)
   return (
     <Slot>
-      <Progress
-        indeterminate
-        aria-label={label}
-        className="bbx-progress-track h-1"
-        indicatorClassName={
-          finishing ? "bbx-progress-breath w-full" : "bbx-progress-comet"
-        }
-      />
+      <div
+        className="flex items-center gap-2"
+        role="progressbar"
+        aria-label={`${statusLabel(run.status)} ${runTitle(run)}`}
+        aria-valuenow={live}
+        aria-valuemin={0}
+        aria-valuemax={slots}
+        aria-valuetext={label}
+      >
+        <div className="flex flex-wrap items-center gap-1" aria-hidden>
+          {Array.from({ length: slots }, (_, index) => (
+            <span
+              key={index}
+              className={cn(
+                "size-1.5 rounded-full transition-[opacity,transform] duration-300 ease-out",
+                index < live ? "bbx-worker" : "bbx-worker-idle",
+              )}
+              // Staggered so the row breathes as a wave rather than a unison
+              // blink, which at twelve dots reads as a warning light.
+              style={
+                index < live
+                  ? { animationDelay: `${(index % 8) * 110}ms` }
+                  : undefined
+              }
+            />
+          ))}
+        </div>
+        <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+          {label}
+        </span>
+      </div>
     </Slot>
   );
 }
 
 function Slot({ children }: { children: React.ReactNode }) {
   return <div className="flex flex-col gap-1.5 px-3.5 pb-3">{children}</div>;
-}
-
-function Caption({ children }: { children: React.ReactNode }) {
-  return <span className="text-xs text-muted-foreground">{children}</span>;
 }
 
 /**
@@ -799,27 +633,11 @@ function Shell({
 function StatusMark({
   status,
   small,
-  variant = "comet",
 }: {
   status: RunDto["status"];
   small?: boolean;
-  variant?: Variant;
 }) {
   if (LIVE.has(status)) {
-    // The spinner variant puts the whole live signal in the glyph.
-    if (variant === "spinner" && !small) {
-      return (
-        <span
-          className="bbx-text mt-0.5 flex size-4 shrink-0 items-center justify-center"
-          aria-hidden
-        >
-          <Icon
-            name="Spinner"
-            className={cn("size-4 animate-spin", status === "finishing" && "opacity-60")}
-          />
-        </span>
-      );
-    }
     return (
       <span
         className={cn(
@@ -828,16 +646,12 @@ function StatusMark({
         )}
         aria-hidden
       >
-        {variant === "halo" && !small ? (
-          <span className="bbx-halo absolute size-3.5 rounded-full" />
-        ) : (
-          <span
-            className={cn(
-              "bb-xcode-ping absolute rounded-full opacity-60",
-              small ? "size-2" : "size-2.5",
-            )}
-          />
-        )}
+        <span
+          className={cn(
+            "bb-xcode-ping absolute rounded-full opacity-60",
+            small ? "size-2" : "size-2.5",
+          )}
+        />
         <span
           className={cn(
             "relative rounded-full",

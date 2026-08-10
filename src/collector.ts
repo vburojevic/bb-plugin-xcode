@@ -187,8 +187,17 @@ export class Collector {
 
   // ------------------------------------------------------------------ probe
 
-  /** One tick: snapshot processes, harvest roots, fold into the engine. */
-  async probeTick(now = Date.now()): Promise<boolean> {
+  /**
+   * One tick: snapshot processes, harvest roots, fold into the engine.
+   *
+   * `signal` is checked between units of I/O. A reload aborts background
+   * services and waits a bounded time for them; a tick that ignores the
+   * signal can sit inside `ps` + `lsof` + a full sweep for far longer than
+   * that window, which puts the whole plugin in `degraded` — and a degraded
+   * plugin's frontend generation is deactivated, so every `::xcode` card in
+   * chat silently falls back to literal directive text.
+   */
+  async probeTick(now = Date.now(), signal?: AbortSignal): Promise<boolean> {
     const stdout = await psSnapshot();
     if (!stdout.trim()) return false;
 
@@ -196,6 +205,7 @@ export class Collector {
 
     // Attach cwd (cached per pid) and harvest DerivedData roots.
     for (const activity of activities) {
+      if (signal?.aborted) return false;
       let cwd = this.cwdCache.get(activity.pid);
       if (cwd === undefined) {
         cwd = await processCwd(activity.pid);
@@ -222,6 +232,7 @@ export class Collector {
 
     this.lastActivities = activities;
     this.lastScanAt = now;
+    if (signal?.aborted) return false;
     await this.refreshSimulators(now).catch(() => undefined);
 
     let changed = this.deps.engine.foldSnapshot(activities, now);
@@ -268,9 +279,13 @@ export class Collector {
   // ------------------------------------------------------------------ sweep
 
   /** Read every known root's Build/Test manifests and fold unseen entries. */
-  async sweepManifests(now = Date.now()): Promise<boolean> {
+  async sweepManifests(
+    now = Date.now(),
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     let changed = false;
     for (const { path: root } of this.deps.store.listRoots()) {
+      if (signal?.aborted) return changed;
       for (const domain of LOG_DOMAINS) {
         const manifestPath = join(
           root,
@@ -316,7 +331,7 @@ export class Collector {
    * claim via `-resultBundlePath`, and ones Xcode wrote into a root's Test
    * logs.
    */
-  async sweepBundles(now = Date.now()): Promise<boolean> {
+  async sweepBundles(now = Date.now(), signal?: AbortSignal): Promise<boolean> {
     const tool = await this.resolveTool();
     if (!tool) return false;
 
@@ -336,6 +351,9 @@ export class Collector {
 
     let changed = false;
     for (const bundle of candidates) {
+      // Between bundles is the only safe place to bail: one xcresulttool
+      // call can take up to its 60s timeout, far past the reload window.
+      if (signal?.aborted) return changed;
       // A bundle whose producing process is still alive cannot be complete;
       // parsing it wastes a 60s-class xcresulttool spawn AND — the measured
       // failure — burns through the corrupt-bundle retry budget while the
@@ -435,11 +453,13 @@ export class Collector {
   }
 
   /** Full pass: projects, roots, manifests, bundles, timeouts. */
-  async fullScan(now = Date.now()): Promise<boolean> {
+  async fullScan(now = Date.now(), signal?: AbortSignal): Promise<boolean> {
     await this.refreshProjects();
+    if (signal?.aborted) return false;
     await this.discoverRoots(now);
-    const swept = await this.sweepManifests(now);
-    const bundles = await this.sweepBundles(now);
+    if (signal?.aborted) return false;
+    const swept = await this.sweepManifests(now, signal);
+    const bundles = await this.sweepBundles(now, signal);
     const expired = this.deps.engine.expireFinishing(now);
     this.lastScanAt = now;
     return swept || bundles || expired;
