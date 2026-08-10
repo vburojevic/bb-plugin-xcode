@@ -101,15 +101,9 @@ export function statusLabel(status: RunStatus): string {
   }
 }
 
-/**
- * One-line explanation for states whose label alone reads as ambiguous.
- * Only the verdict-less "ended" has one: it is the tracker being honest
- * about not knowing, and the reader deserves to know why and the fix.
- */
-export function statusHint(status: RunStatus): string | null {
-  return status === "ended"
-    ? "Outcome unknown — no result bundle was recorded. `bb xcode run` or `bb xcode shim install` captures real pass/fail."
-    : null;
+/** Optional explanation for states whose label alone needs clarification. */
+export function statusHint(_status: RunStatus): string | null {
+  return null;
 }
 
 export function statusIcon(status: RunStatus): IconName {
@@ -124,7 +118,7 @@ export function statusIcon(status: RunStatus): IconName {
     case "cancelled":
       return "CircleMinus";
     case "ended":
-      return "CircleQuestion";
+      return "CircleDashed";
     default:
       return "CircleDashed";
   }

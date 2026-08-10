@@ -131,6 +131,58 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   const scopes = new ThreadScopes();
 
+  const injectedCardRuns = new Set(
+    (await bb.storage.kv.get<string[]>("injected-card-runs")) ?? [],
+  );
+  const cardInFlight = new Set<string>();
+
+  const persistInjectedCardRuns = async (): Promise<void> => {
+    const retained = [...injectedCardRuns].slice(-500);
+    if (retained.length !== injectedCardRuns.size) {
+      injectedCardRuns.clear();
+      for (const id of retained) injectedCardRuns.add(id);
+    }
+    await bb.storage.kv.set("injected-card-runs", retained);
+  };
+
+  const injectRunCard = async (run: Run): Promise<void> => {
+    if (
+      disposed ||
+      !run.threadId ||
+      injectedCardRuns.has(run.id) ||
+      cardInFlight.has(run.id)
+    ) {
+      return;
+    }
+
+    cardInFlight.add(run.id);
+    try {
+      await bb.sdk.threads.send({
+        threadId: run.threadId,
+        mode: "auto",
+        input: [
+          {
+            type: "text",
+            visibility: "agent-only",
+            mentions: [],
+            text:
+              "An Xcode build or test is currently tracked for this thread. " +
+              "Continue the current work without restarting the build, and include the following directive on its own line outside any code fence in your next assistant message:\n" +
+              `::xcode{run="${run.id}"}`,
+          },
+        ],
+      });
+      if (disposed) return;
+      injectedCardRuns.add(run.id);
+      await persistInjectedCardRuns();
+      log.debug(`injected chat card directive: ${run.id} -> ${run.threadId}`);
+    } catch (error: unknown) {
+      log.debug(`chat card injection failed (${run.id}): ${String(error)}`);
+    } finally {
+      cardInFlight.delete(run.id);
+    }
+  };
+
   // Engine and collector reference each other (engine asks the collector for
   // project attribution); a late-bound holder breaks the cycle for TS.
   let collectorRef: Collector | null = null;
@@ -138,6 +190,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     projectFor: (signals): string | null =>
       collectorRef ? collectorRef.projectFor(signals) : null,
     threadFor: (signals): string | null => scopes.threadFor(signals),
+    onRunStarted: (run) => detach(() => injectRunCard(run)),
     log: (message) => log.debug(message),
   });
   const collector = new Collector(
@@ -146,6 +199,11 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   );
   collectorRef = collector;
   engine.hydrate(Date.now());
+  // Runs survive plugin reloads. Backfill currently open, attributed runs so
+  // existing threads receive their card without waiting for another process.
+  for (const run of store.listUnresolved()) {
+    detach(() => injectRunCard(run));
+  }
 
   settings.onChange(async () => {
     current = await readSettings();
@@ -199,7 +257,14 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         env.path,
         Date.now() - 6 * 3_600_000,
       );
-      if (backfilled > 0) publish();
+      if (backfilled > 0) {
+        publish();
+        for (const run of store
+          .listUnresolved()
+          .filter((candidate) => candidate.threadId === threadId)) {
+          detach(() => injectRunCard(run));
+        }
+      }
       return scopes.get(threadId);
     } catch (error: unknown) {
       log.debug(`thread scope resolve failed (${threadId}): ${String(error)}`);
@@ -878,6 +943,17 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   // ----------------------------------------------------------- agent tools
 
+  const agentInstructions =
+    "When an Xcode build or test is needed, prefer `bb xcode run -- xcodebuild …` so bb can track it with a result bundle and a real pass/fail verdict. " +
+    "Use xcode_status instead of parsing build logs when checking whether a run passed. " +
+    'After starting or checking any Xcode build or test, emit `::xcode{}` (or `::xcode{run="<id>"}` for one specific run) on its own line, never inside a code fence, so bb renders the live status card.';
+
+  // Tool instructions only reach sessions where the provider is given that
+  // native tool. Builds also arrive through repo scripts, xcodebuildmcp, and
+  // provider-native shell tools, so make the card contract part of every
+  // ordinary thread's resolved instructions as well.
+  bb.agents.contributeInstructions(() => agentInstructions);
+
   const directiveHint = (runId: string | null): string =>
     "\n\nTo render a live status card in chat, emit this directive on its own line (never inside a code fence):\n" +
     (runId ? `::xcode{run="${runId}"}` : "::xcode{}") +
@@ -889,10 +965,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     name: "xcode_status",
     description:
       "Report Xcode build/test activity: what is running now and how recent runs finished, scoped to this thread's checkout when possible. Use instead of grepping build logs.",
-    instructions:
-      "Prefer xcode_status over parsing xcodebuild output when the user asks whether a build or test run passed. " +
-      "Start builds/tests with `bb xcode run -- xcodebuild …` instead of raw xcodebuild: it guarantees a result bundle, so the run always gets a real pass/fail verdict, returns immediately with a run id, and `bb xcode stop <id>` cancels it. " +
-      'After starting or checking an Xcode build or test run, emit `::xcode{}` (or `::xcode{run="<id>"}` for one specific run) on its own line, never inside a code fence — bb renders it as a live status card that updates as the build progresses.',
+    instructions: agentInstructions,
     experimental_statusLabels: {
       pending: "Checking Xcode activity",
       completed: "Checked Xcode activity",

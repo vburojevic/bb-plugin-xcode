@@ -45,6 +45,8 @@ export interface EngineHooks {
     cwd?: string | null;
     container?: string | null;
   }): string | null;
+  /** Notify the host when a newly observed process becomes a tracked run. */
+  onRunStarted?(run: Run): void;
   log(message: string): void;
 }
 
@@ -143,6 +145,7 @@ export class Engine {
       this.store.insertRun(run);
       this.live.set(activity.pid, { runId: run.id, misses: 0, lastSeenAt: now });
       this.hooks.log(`run started: ${run.kind} ${run.scheme ?? "?"} (${run.id})`);
+      this.hooks.onRunStarted?.(run);
       changed = true;
     }
 

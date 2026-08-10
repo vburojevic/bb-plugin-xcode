@@ -2,7 +2,12 @@ import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { Engine, MISSES_BEFORE_FINISHING, domainCompatible } from "../src/engine";
-import { FINISHING_TIMEOUT_MS, RANK, statusTransitionAllowed } from "../src/model";
+import {
+  FINISHING_TIMEOUT_MS,
+  RANK,
+  statusTransitionAllowed,
+  type Run,
+} from "../src/model";
 import { MIGRATIONS, Store, type Db } from "../src/store";
 import type { BuildResults, LiveActivity, TestResults } from "../src/types";
 
@@ -61,6 +66,19 @@ beforeEach(() => {
 });
 
 describe("lifecycle: running → finishing → ended", () => {
+  it("notifies the host once when a process becomes a tracked run", () => {
+    const started: Run[] = [];
+    engine = new Engine(store, {
+      ...hooks,
+      onRunStarted: (run) => started.push(run),
+    });
+
+    engine.foldSnapshot([activity()], 1_000_000);
+    engine.foldSnapshot([activity()], 1_002_000);
+
+    expect(started.map((run) => run.id)).toEqual(["r:100:1000"]);
+  });
+
   it("creates one run per process and keeps it across ticks", () => {
     engine.foldSnapshot([activity()], 1_000_000);
     engine.foldSnapshot([activity()], 1_002_000);

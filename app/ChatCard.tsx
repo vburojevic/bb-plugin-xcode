@@ -349,32 +349,36 @@ export function XcodeChatCard({
               </Badge>
             ) : null}
           </div>
-          <div className="mt-1 flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
-            <span className="bbx-text font-medium">
+          <div className="mt-1 flex min-w-0 items-baseline gap-x-2 text-xs text-muted-foreground">
+            <span className="bbx-text shrink-0 font-medium">
               {statusLabel(run.status)}
             </span>
             {run.worktree || run.branch ? (
-              <span className="inline-flex max-w-56 items-baseline gap-1 truncate">
-                {run.worktree ? <span>{run.worktree}</span> : null}
+              <span className="flex min-w-0 flex-1 items-baseline gap-1">
+                {run.worktree ? <span className="shrink-0">{run.worktree}</span> : null}
                 {run.branch ? (
-                  <span className="inline-flex items-baseline gap-0.5">
+                  <span className="flex min-w-0 items-baseline gap-0.5">
                     <Icon
                       name="GitBranch"
-                      className="size-3 self-center opacity-70"
+                      className="size-3 shrink-0 self-center opacity-70"
                       aria-hidden
                     />
-                    {run.branch}
+                    <span className="truncate" title={run.branch}>
+                      {run.branch}
+                    </span>
                   </span>
                 ) : null}
               </span>
             ) : run.projectName ? (
-              <span>{run.projectName}</span>
+              <span className="min-w-0 flex-1 truncate" title={run.projectName}>
+                {run.projectName}
+              </span>
             ) : null}
             {isLive && run.workerCount ? (
-              <span>{run.workerCount} compilers</span>
+              <span className="shrink-0">{run.workerCount} compilers</span>
             ) : null}
             {!isLive && run.endedAt ? (
-              <span>{formatRelative(run.endedAt)}</span>
+              <span className="shrink-0">{formatRelative(run.endedAt)}</span>
             ) : null}
           </div>
         </div>
