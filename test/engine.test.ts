@@ -5,6 +5,7 @@ import { Engine, MISSES_BEFORE_FINISHING, domainCompatible } from "../src/engine
 import {
   FINISHING_TIMEOUT_MS,
   RANK,
+  VERDICT_STATUSES,
   statusTransitionAllowed,
   type Run,
 } from "../src/model";
@@ -515,6 +516,197 @@ describe("foldThreadCommandExit", () => {
       1_060_000,
     );
     expect(store.getRun(id)!.status).toBe("failed");
+  });
+
+  // Production, 2026-08-10: bb reports `cwd: ""` on every commandExecution
+  // item and the agent wrote a RELATIVE script path, so the old path-matching
+  // arm had no absolute path to find and the build sat at "ended" forever.
+  // The same build resolved fine when the agent happened to write
+  // `cd /abs && ./scripts/build_app.sh` — a verdict decided by shell style.
+  it("resolves a relative build command with no cwd reported", () => {
+    const id = startThreadRun();
+    retire(1_002_000);
+
+    expect(
+      engine.foldThreadCommandExit(
+        {
+          threadId: "thr_build",
+          command:
+            './scripts/build_app.sh build --env dev --sim local > /tmp/b.log 2>&1; echo "EXIT=$?"',
+          cwd: "",
+          startedAt: 990_000,
+          endedAt: 1_060_000,
+          exitCode: 0,
+          interrupted: false,
+        },
+        1_060_000,
+      ),
+    ).toBe(true);
+    expect(store.getRun(id)!.status).toBe("passed");
+  });
+
+  // The hazard the old `xcodebuild`-anywhere arm opened: this poller names
+  // xcodebuild, exits 0, and overlaps the build — so it skipped every path
+  // check and was one single-candidate window away from calling a failed
+  // build green.
+  it("never lets a watcher's exit 0 become a build's verdict", () => {
+    const id = startThreadRun();
+    retire(1_002_000);
+
+    expect(
+      engine.foldThreadCommandExit(
+        {
+          threadId: "thr_build",
+          command:
+            'until ! pgrep -f xcodebuild > /dev/null; do sleep 5; done; echo "build finished"',
+          cwd: "",
+          startedAt: 990_000,
+          endedAt: 1_060_000,
+          exitCode: 0,
+          interrupted: false,
+        },
+        1_060_000,
+      ),
+    ).toBe(false);
+    expect(VERDICT_STATUSES.has(store.getRun(id)!.status)).toBe(false);
+  });
+
+  it("ignores a bb xcode status poll loop", () => {
+    const id = startThreadRun();
+    retire(1_002_000);
+
+    engine.foldThreadCommandExit(
+      {
+        threadId: "thr_build",
+        command:
+          'until ! bb xcode status 2>/dev/null | grep -q "^Active (1)"; do sleep 5; done',
+        cwd: "",
+        startedAt: 990_000,
+        endedAt: 1_060_000,
+        exitCode: 0,
+        interrupted: false,
+      },
+      1_060_000,
+    );
+    expect(VERDICT_STATUSES.has(store.getRun(id)!.status)).toBe(false);
+  });
+
+  // A build cannot have been launched by a command that started after it.
+  it("will not adopt a run that predates the command", () => {
+    const id = startThreadRun();
+    retire(1_002_000);
+
+    expect(
+      engine.foldThreadCommandExit(
+        {
+          threadId: "thr_build",
+          command: "./scripts/build_app.sh build",
+          cwd: "",
+          // Well clear of LAUNCH_SLACK_MS, which exists only to absorb the
+          // second-resolution start times `ps` reports.
+          startedAt: 1_010_000,
+          endedAt: 1_060_000,
+          exitCode: 0,
+          interrupted: false,
+        },
+        1_060_000,
+      ),
+    ).toBe(false);
+    expect(VERDICT_STATUSES.has(store.getRun(id)!.status)).toBe(false);
+  });
+
+  // `foo &` inside the command: the launcher returns 0 while the build is
+  // still compiling. Calling that passed would be a lie.
+  it("will not vouch for a build still running when the command exited", () => {
+    const id = startThreadRun();
+
+    expect(
+      engine.foldThreadCommandExit(
+        {
+          threadId: "thr_build",
+          command: "./scripts/build_app.sh build &",
+          cwd: "",
+          startedAt: 990_000,
+          endedAt: 1_001_000,
+          exitCode: 0,
+          interrupted: false,
+        },
+        1_001_000,
+      ),
+    ).toBe(false);
+    expect(store.getRun(id)!.status).toBe("running");
+  });
+
+  // One script, several sequential xcodebuild invocations. A zero exit vouches
+  // for all of them; a failure only for the one it died on.
+  it("passes every child of a successful multi-build script", () => {
+    const first = startThreadRun();
+    retire(1_002_000);
+    engine.foldSnapshot([activity({ pid: 101, startedAt: 1_010_000 })], 1_010_000);
+    const second = store.listRuns({ limit: 5 }).find((run) => run.id !== first)!.id;
+    engine.foldSnapshot([], 1_020_000);
+    engine.foldSnapshot([], 1_030_000);
+    engine.foldSnapshot([], 1_040_000);
+
+    engine.foldThreadCommandExit(
+      {
+        threadId: "thr_build",
+        command: "./scripts/build_app.sh build-all",
+        cwd: "",
+        startedAt: 990_000,
+        endedAt: 1_060_000,
+        exitCode: 0,
+        interrupted: false,
+      },
+      1_060_000,
+    );
+    expect(store.getRun(first)!.status).toBe("passed");
+    expect(store.getRun(second)!.status).toBe("passed");
+  });
+
+  it("blames only the last child when the script fails", () => {
+    const first = startThreadRun();
+    retire(1_002_000);
+    engine.foldSnapshot([activity({ pid: 101, startedAt: 1_010_000 })], 1_010_000);
+    const second = store.listRuns({ limit: 5 }).find((run) => run.id !== first)!.id;
+    engine.foldSnapshot([], 1_020_000);
+    engine.foldSnapshot([], 1_030_000);
+    engine.foldSnapshot([], 1_040_000);
+
+    engine.foldThreadCommandExit(
+      {
+        threadId: "thr_build",
+        command: "./scripts/build_app.sh build-all",
+        cwd: "",
+        startedAt: 990_000,
+        endedAt: 1_060_000,
+        exitCode: 65,
+        interrupted: false,
+      },
+      1_060_000,
+    );
+    expect(store.getRun(second)!.status).toBe("failed");
+    expect(store.getRun(first)!.status).not.toBe("failed");
+  });
+
+  // The real r:89323 shape: the agent stopped the background task mid-build.
+  it("maps an interrupted launcher to cancelled", () => {
+    const id = startThreadRun();
+    retire(1_002_000);
+
+    engine.foldThreadCommandExit(
+      {
+        threadId: "thr_build",
+        command: "./scripts/build_app.sh build --env dev --sim local",
+        cwd: "",
+        startedAt: 990_000,
+        endedAt: 1_060_000,
+        exitCode: null,
+        interrupted: true,
+      },
+      1_060_000,
+    );
+    expect(store.getRun(id)!.status).toBe("cancelled");
   });
 
   it("does not guess when two Xcode children fit the same command", () => {

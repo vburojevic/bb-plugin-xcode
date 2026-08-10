@@ -33,6 +33,38 @@ export const MISSES_BEFORE_FINISHING = 3;
 /** Window for matching an outcome artifact to a run, either side. */
 export const MATCH_SLACK_MS = 90_000;
 
+/**
+ * How far before its launcher's own start a run may begin and still count as
+ * launched by it. Process start times come from `ps` etime, which is only
+ * second-resolution, so a build that really did start after the command can
+ * read as a shade earlier.
+ */
+export const LAUNCH_SLACK_MS = 5_000;
+
+/**
+ * Commands that WATCH a build rather than run one. Their exit status describes
+ * the poll loop and must never become a build's verdict — the shapes here are
+ * taken from real agent transcripts (`until ! bb xcode status …; do sleep 5;
+ * done`, `until pgrep -f xcodebuild; …`).
+ */
+const WATCHER_RE =
+  /\b(?:until|while)\s|\bpgrep\b|\bpkill\b|\bbb\s+xcode\s+(?:status|show|runs|stop)\b|\bsleep\s+\d/i;
+
+/**
+ * Commands that plausibly LAUNCH one. Deliberately broad — agents build via
+ * bare xcodebuild, wrapper scripts, make, swift, fastlane and xcrun — because
+ * the temporal containment check is what does the real narrowing. Its only job
+ * is to keep an unrelated long-running command (a dev server, a watch task)
+ * from adopting a build that happened to run inside it.
+ */
+const BUILDER_RE =
+  /\bxcodebuild(?:mcp)?\b|\bbb\s+xcode\s+run\b|\.sh\b|\bmake\b|\bswift\s+(?:build|test)\b|\bfastlane\b|\bxcrun\b/i;
+
+/** A command whose exit code is allowed to speak for a build's outcome. */
+export function looksLikeBuildLauncher(command: string): boolean {
+  return BUILDER_RE.test(command) && !WATCHER_RE.test(command);
+}
+
 export interface EngineHooks {
   /** Resolve which bb project owns a path, most specific wins. */
   projectFor(signals: {
@@ -255,63 +287,92 @@ export class Engine {
   }
 
   /**
-   * Fold BB's terminal background-command exit into the one Xcode child that
-   * ran inside that command. This recovers a real verdict for agent-launched
-   * XcodeBuildMCP and shell-script builds even when they did not create an
-   * `.xcresult` bundle themselves.
+   * Fold BB's terminal background-command exit into the Xcode children that
+   * ran inside it. This is the only verdict source for agent-launched shell
+   * and XcodeBuildMCP builds, which never write an `.xcresult` of their own.
    *
-   * Ambiguity is deliberate: a script that spawned multiple Xcode children
-   * gets no guessed verdict. A result bundle or Xcode log can still resolve
-   * each child independently.
+   * The previous implementation matched by string archaeology — it looked for
+   * an absolute path from the run inside `${cwd}\n${command}`, or for the
+   * literal word `xcodebuild`. Measured against production data, both arms
+   * failed:
+   *
+   *  - bb reports `cwd: ""` on every `commandExecution` item, and agents write
+   *    relative commands (`./scripts/build_app.sh build …`), so the haystack
+   *    contained no absolute path at all and the path arm could never match.
+   *    The same build resolved or not purely on whether the agent happened to
+   *    prefix `cd /abs/path &&` — a verdict decided by shell style.
+   *  - the `xcodebuild` arm skipped the path check entirely, so a *watcher*
+   *    ("wait until my worktree's xcodebuild processes exit") was one
+   *    single-candidate window away from stamping its own exit 0 onto a build
+   *    that had actually failed.
+   *
+   * So the discriminator is no longer "does this text mention the run" but
+   * "could this command have LAUNCHED a build, and does the run sit wholly
+   * inside its lifetime":
+   *
+   *  - watchers are rejected outright; their exit code describes the poll
+   *    loop, never the build;
+   *  - a launched build cannot predate its launcher, so the run must start
+   *    after the command did;
+   *  - a build whose verdict this command can speak for must also have ENDED
+   *    before it did. This is what keeps a `foo &`-style backgrounded build,
+   *    still running after its launcher returned, from being called passed.
+   *
+   * The cost matrix is deliberately lopsided. A missed verdict leaves a run at
+   * the honest "ended"; a wrong one reports a failed build as green. Every
+   * ambiguity here resolves toward silence.
    */
   foldThreadCommandExit(
     outcome: BackgroundCommandOutcome & { threadId: string },
     now: number,
   ): boolean {
-    const haystack = `${outcome.cwd}\n${outcome.command}`;
-    const directlyNamesXcode = /\bxcodebuild(?:mcp)?\b/i.test(haystack);
-    const candidates = this.store
+    if (!looksLikeBuildLauncher(outcome.command)) return false;
+
+    const contained = this.store
       .listRuns({ limit: 500, includeNoise: true })
       .filter((run) => run.threadId === outcome.threadId)
       .filter((run) => !VERDICT_STATUSES.has(run.status))
+      .filter((run) => run.startedAt >= outcome.startedAt - LAUNCH_SLACK_MS)
       .filter(
         (run) =>
-          run.startedAt >= outcome.startedAt - MATCH_SLACK_MS &&
-          run.startedAt <= outcome.endedAt + MATCH_SLACK_MS &&
-          (run.endedAt === null || run.endedAt <= outcome.endedAt + MATCH_SLACK_MS),
+          run.endedAt !== null &&
+          run.endedAt <= outcome.endedAt + MATCH_SLACK_MS,
       )
-      .filter((run) => {
-        if (directlyNamesXcode) return true;
-        return [run.cwd, run.container, run.root]
-          .filter((path): path is string => Boolean(path))
-          .some((path) => haystack.includes(path));
-      });
-    if (candidates.length !== 1) return false;
+      .sort((a, b) => a.startedAt - b.startedAt);
+    if (contained.length === 0) return false;
 
-    const target = candidates[0]!;
-    const verdict: RunStatus = outcome.interrupted
-      ? "cancelled"
+    // A zero exit vouches for every build the command ran; a failure or a kill
+    // only tells us about the one it died on, which is the last to have run.
+    const last = contained[contained.length - 1]!;
+    const verdicts: Array<[Run, RunStatus]> = outcome.interrupted
+      ? [[last, "cancelled"]]
       : outcome.exitCode === 0
-        ? "passed"
-        : "failed";
-    if (
-      !statusTransitionAllowed(
-        { status: target.status, rank: target.statusRank },
-        { status: verdict, rank: RANK.logged },
-      )
-    ) {
-      return false;
-    }
+        ? contained.map((run): [Run, RunStatus] => [run, "passed"])
+        : [[last, "failed"]];
 
-    target.status = verdict;
-    target.statusRank = RANK.logged;
-    target.endedAt ??= Math.min(outcome.endedAt, now);
-    for (const [pid, live] of this.live) {
-      if (live.runId === target.id) this.live.delete(pid);
+    let changed = false;
+    for (const [target, verdict] of verdicts) {
+      if (
+        !statusTransitionAllowed(
+          { status: target.status, rank: target.statusRank },
+          { status: verdict, rank: RANK.logged },
+        )
+      ) {
+        continue;
+      }
+      target.status = verdict;
+      target.statusRank = RANK.logged;
+      target.endedAt ??= Math.min(outcome.endedAt, now);
+      for (const [pid, live] of this.live) {
+        if (live.runId === target.id) this.live.delete(pid);
+      }
+      this.store.updateRun(target);
+      this.hooks.log(
+        `verdict from thread command exit: ${verdict} (${target.id})`,
+      );
+      changed = true;
     }
-    this.store.updateRun(target);
-    this.hooks.log(`verdict from thread command exit: ${verdict} (${target.id})`);
-    return true;
+    return changed;
   }
 
   /**
