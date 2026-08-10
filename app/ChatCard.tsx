@@ -112,6 +112,37 @@ type RunDto = {
 
 const LIVE = new Set(["running", "finishing"]);
 
+/**
+ * Candidate expressions of the live state. The card is identical across all
+ * of them — only how "work is happening" is voiced changes, so they can be
+ * compared honestly. `::xcode{variant="workers"}`.
+ */
+const VARIANTS = [
+  "comet",
+  "segments",
+  "ambient",
+  "workers",
+  "stripes",
+  "halo",
+  "eta",
+  "ticker",
+  "history",
+  "spinner",
+] as const;
+type Variant = (typeof VARIANTS)[number];
+
+/** Live-state extras a variant may need; null where a run cannot supply them. */
+interface LiveExtras {
+  /** Build phases opened / closed, from the live result stream. */
+  sections: { done: number; total: number } | null;
+  /** Current phase description, from the live result stream. */
+  section: string | null;
+  /** Median duration of recent runs of the same scheme+kind. */
+  typicalMs: number | null;
+  /** Durations of recent comparable runs, oldest first. */
+  historyMs: number[] | null;
+}
+
 const DEMO_STATUSES = new Set<RunDto["status"]>([
   "running",
   "finishing",
@@ -230,6 +261,9 @@ export function XcodeChatCard({
     demoRaw && DEMO_STATUSES.has(demoRaw as RunDto["status"])
       ? (demoRaw as RunDto["status"])
       : null;
+  const variantRaw = attributes.variant?.trim() as Variant | undefined;
+  const variant: Variant =
+    variantRaw && VARIANTS.includes(variantRaw) ? variantRaw : "comet";
 
   const [data, setData] = useState<ChatStatus | null>(null);
   const [error, setError] = useState(false);
@@ -307,6 +341,9 @@ export function XcodeChatCard({
 
   const isLive = LIVE.has(run.status);
   const elapsed = isLive ? Date.now() - run.startedAt : run.durationMs;
+  const extras: LiveExtras = demo
+    ? demoExtras(run)
+    : { sections: null, section: null, typicalMs: null, historyMs: null };
   const testsBadge =
     run.testTotal !== null
       ? (run.testFailed ?? 0) > 0
@@ -319,10 +356,15 @@ export function XcodeChatCard({
   const problems = findings.length > 0 || failedTests.length > 0;
 
   return (
-    <Shell className={statusClass(run.status)}>
+    <Shell
+      className={cn(
+        statusClass(run.status),
+        isLive && variant === "ambient" && "bbx-ambient",
+      )}
+    >
       {/* Header */}
       <div className="flex items-start gap-2.5 px-3.5 pt-3 pb-2.5">
-        <StatusMark status={run.status} />
+        <StatusMark status={run.status} variant={variant} />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="truncate text-sm font-semibold leading-tight text-foreground">
@@ -383,7 +425,7 @@ export function XcodeChatCard({
           </span>
           {demo ? (
             <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60">
-              demo
+              {isLive && variantRaw ? variant : "demo"}
             </span>
           ) : null}
         </span>
@@ -397,20 +439,14 @@ export function XcodeChatCard({
         </div>
       ) : null}
 
-      {/* Live progress: comet sweep while building, breath while finishing. */}
+      {/* Live state, voiced by the chosen variant. */}
       {isLive ? (
-        <div className="px-3.5 pb-3">
-          <Progress
-            indeterminate
-            aria-label={`${statusLabel(run.status)} ${runTitle(run)}`}
-            className="bbx-progress-track h-1"
-            indicatorClassName={
-              run.status === "running"
-                ? "bbx-progress-comet"
-                : "bbx-progress-breath w-full"
-            }
-          />
-        </div>
+        <LiveIndicator
+          run={run}
+          variant={variant}
+          extras={extras}
+          elapsedMs={elapsed ?? 0}
+        />
       ) : null}
 
       {/* Counts */}
@@ -512,6 +548,225 @@ export function XcodeChatCard({
   );
 }
 
+/** Plausible live-stream/history values so variants can be judged fairly. */
+function demoExtras(run: RunDto): LiveExtras {
+  return {
+    sections: { done: run.status === "finishing" ? 9 : 6, total: 9 },
+    section:
+      run.status === "finishing"
+        ? "Signing Packerly.app"
+        : "Compiling TripPlanner.swift",
+    typicalMs: 292_000,
+    historyMs: [268_000, 301_000, 254_000, 292_000, 279_000, 318_000],
+  };
+}
+
+/**
+ * The live state, ten ways.
+ *
+ * Every variant answers the same two questions — is it moving, and how long
+ * has it been — and differs only in what else it volunteers: phase, worker
+ * parallelism, comparison with previous runs, or deliberately nothing.
+ */
+function LiveIndicator({
+  run,
+  variant,
+  extras,
+  elapsedMs,
+}: {
+  run: RunDto;
+  variant: Variant;
+  extras: LiveExtras;
+  elapsedMs: number;
+}) {
+  const finishing = run.status === "finishing";
+  const label = `${statusLabel(run.status)} ${runTitle(run)}`;
+
+  // These voice themselves entirely through the status glyph or the frame.
+  if (variant === "halo" || variant === "spinner" || variant === "ambient") {
+    return null;
+  }
+
+  if (variant === "segments") {
+    const total = extras.sections?.total ?? 8;
+    const done = extras.sections?.done ?? 0;
+    return (
+      <Slot>
+        <div
+          className="flex gap-1"
+          role="progressbar"
+          aria-label={label}
+          aria-valuenow={done}
+          aria-valuemax={total}
+        >
+          {Array.from({ length: total }, (_, index) => (
+            <span
+              key={index}
+              className={cn(
+                "h-1 flex-1 rounded-full",
+                index < done
+                  ? "bbx-seg-done"
+                  : index === done && !finishing
+                    ? "bbx-seg-active"
+                    : "bbx-seg",
+              )}
+            />
+          ))}
+        </div>
+        <Caption>
+          {finishing
+            ? "All phases complete — awaiting result"
+            : `Phase ${done + 1} of ${total}`}
+        </Caption>
+      </Slot>
+    );
+  }
+
+  if (variant === "workers") {
+    const count = Math.min(run.workerCount ?? 0, 24);
+    if (count === 0 && !finishing) return null;
+    return (
+      <Slot>
+        <div className="flex flex-wrap items-center gap-1" aria-label={label}>
+          {Array.from({ length: finishing ? 3 : count }, (_, index) => (
+            <span
+              key={index}
+              className={cn("size-1.5 rounded-full", "bbx-worker")}
+              style={{ animationDelay: `${(index % 8) * 120}ms` }}
+            />
+          ))}
+          <span className="ml-1 text-xs text-muted-foreground">
+            {finishing
+              ? "winding down"
+              : `${count} compiler${count === 1 ? "" : "s"}`}
+          </span>
+        </div>
+      </Slot>
+    );
+  }
+
+  if (variant === "stripes") {
+    return (
+      <Slot>
+        <Progress
+          indeterminate
+          aria-label={label}
+          className="bbx-progress-track h-1.5"
+          indicatorClassName={cn(
+            "w-full",
+            finishing ? "bbx-progress-breath" : "bbx-stripes",
+          )}
+        />
+      </Slot>
+    );
+  }
+
+  if (variant === "eta") {
+    const typical = extras.typicalMs;
+    if (!typical) {
+      return (
+        <Slot>
+          <Progress
+            indeterminate
+            aria-label={label}
+            className="bbx-progress-track h-1"
+            indicatorClassName="bbx-progress-comet"
+          />
+        </Slot>
+      );
+    }
+    const ratio = Math.min(elapsedMs / typical, 1);
+    const over = elapsedMs > typical;
+    return (
+      <Slot>
+        <Progress
+          value={Math.round(ratio * 100)}
+          aria-label={label}
+          className="bbx-progress-track h-1.5"
+          indicatorClassName={cn(
+            "bg-[var(--bbx)]",
+            over && "bbx-progress-breath",
+          )}
+        />
+        <Caption>
+          {over
+            ? `${formatDuration(elapsedMs - typical)} over the usual ${formatDuration(typical)}`
+            : `usually ${formatDuration(typical)} · ~${formatDuration(typical - elapsedMs)} left`}
+        </Caption>
+      </Slot>
+    );
+  }
+
+  if (variant === "ticker") {
+    return (
+      <Slot>
+        <div className="flex items-center gap-2">
+          <Icon
+            name="Spinner"
+            className="bbx-text size-3 shrink-0 animate-spin"
+            aria-hidden
+          />
+          <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">
+            {extras.section ?? (finishing ? "awaiting result" : "building…")}
+          </span>
+        </div>
+      </Slot>
+    );
+  }
+
+  if (variant === "history") {
+    const history = extras.historyMs ?? [];
+    const peak = Math.max(elapsedMs, ...history, 1);
+    return (
+      <Slot>
+        <div
+          className="flex h-6 items-end gap-1"
+          aria-label={`${label}; ${formatDuration(elapsedMs)} elapsed`}
+        >
+          {history.map((duration, index) => (
+            <span
+              key={index}
+              className="bbx-hist-bar w-2 rounded-sm"
+              style={{ height: `${Math.max((duration / peak) * 100, 8)}%` }}
+            />
+          ))}
+          <span
+            className="bbx-hist-now w-2 rounded-sm transition-[height] duration-1000 ease-linear"
+            style={{ height: `${Math.max((elapsedMs / peak) * 100, 8)}%` }}
+          />
+        </div>
+        <Caption>
+          {history.length
+            ? `this run vs. the last ${history.length}`
+            : "first run of this scheme"}
+        </Caption>
+      </Slot>
+    );
+  }
+
+  // comet (default)
+  return (
+    <Slot>
+      <Progress
+        indeterminate
+        aria-label={label}
+        className="bbx-progress-track h-1"
+        indicatorClassName={
+          finishing ? "bbx-progress-breath w-full" : "bbx-progress-comet"
+        }
+      />
+    </Slot>
+  );
+}
+
+function Slot({ children }: { children: React.ReactNode }) {
+  return <div className="flex flex-col gap-1.5 px-3.5 pb-3">{children}</div>;
+}
+
+function Caption({ children }: { children: React.ReactNode }) {
+  return <span className="text-xs text-muted-foreground">{children}</span>;
+}
+
 /**
  * Card frame: theme card surface whose 1px border carries a quiet status
  * tint. The border's eased color transition IS the card's motion moment —
@@ -544,11 +799,27 @@ function Shell({
 function StatusMark({
   status,
   small,
+  variant = "comet",
 }: {
   status: RunDto["status"];
   small?: boolean;
+  variant?: Variant;
 }) {
   if (LIVE.has(status)) {
+    // The spinner variant puts the whole live signal in the glyph.
+    if (variant === "spinner" && !small) {
+      return (
+        <span
+          className="bbx-text mt-0.5 flex size-4 shrink-0 items-center justify-center"
+          aria-hidden
+        >
+          <Icon
+            name="Spinner"
+            className={cn("size-4 animate-spin", status === "finishing" && "opacity-60")}
+          />
+        </span>
+      );
+    }
     return (
       <span
         className={cn(
@@ -557,12 +828,16 @@ function StatusMark({
         )}
         aria-hidden
       >
-        <span
-          className={cn(
-            "bb-xcode-ping absolute rounded-full opacity-60",
-            small ? "size-2" : "size-2.5",
-          )}
-        />
+        {variant === "halo" && !small ? (
+          <span className="bbx-halo absolute size-3.5 rounded-full" />
+        ) : (
+          <span
+            className={cn(
+              "bb-xcode-ping absolute rounded-full opacity-60",
+              small ? "size-2" : "size-2.5",
+            )}
+          />
+        )}
         <span
           className={cn(
             "relative rounded-full",
