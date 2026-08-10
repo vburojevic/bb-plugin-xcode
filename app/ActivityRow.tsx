@@ -6,10 +6,11 @@
  *  1. The FRAME is the host's. Geometry, radius, surface and rhythm come from
  *     `PromptStackCard` (see `.bbx-stack-card` in app.css) so the row sits in
  *     bb's prompt stack as a peer of "Running background command".
- *  2. The CONTENTS are ours. State leads as a filled pill in the run's own
- *     colour — BUILDING, SUCCEEDED, FAILED — because in a stack of neutral
- *     grey rows the one fact a build has that a shell command doesn't is an
- *     outcome, and it should be readable before anything else.
+ *  2. The CONTENTS are ours. The row opens with a phrase, not a badge:
+ *     "Building Packerly" while it runs, "Packerly succeeded" once it lands.
+ *     State and identity are one clause whose grammar does the work, in the
+ *     run's own colour. Everything else — simulator, branch, counts — is
+ *     supporting detail that may wrap behind it.
  *
  * ## Why it wraps instead of truncating
  *
@@ -22,8 +23,8 @@
  * lines the row clips, because a prompt-stack card that grows without bound
  * stops being chrome and starts being content.
  *
- * The status pill, the timer and the controls never wrap — they are the row's
- * fixed skeleton, and the wrapping happens between them.
+ * The timer and the controls never wrap — they are the row's fixed skeleton,
+ * and the wrapping happens between them and the headline.
  *
  * The host has five row states, Xcode has seven; the mapping is the one
  * judgement call here:
@@ -49,17 +50,24 @@ import {
   formatDuration,
   formatRelative,
   kindLabel,
+  runPhrase,
   runStatusLabel,
   runTitle,
 } from "./format";
 import { isLive, type RunDto } from "./status-types";
 
 /**
- * Three lines of meta at ~17px. The cap is a clip, not a scroll: whatever
- * falls past it is by definition the least important field, and the
- * disclosure holds the complete picture anyway.
+ * The meta group's line box, pinned rather than inherited.
+ *
+ * The cap has to be an exact multiple of the line height or the last visible
+ * line is sliced through the middle of its glyphs — which is what happened
+ * when this was a guessed pixel value against `text-xs`'s inherited 16px
+ * leading plus a 2px row gap. Fixing the leading here and dropping the
+ * vertical gap makes the arithmetic exact: three lines, nothing clipped.
  */
-const META_MAX_HEIGHT = 54;
+const META_LINE_HEIGHT = 20;
+const META_MAX_LINES = 3;
+const META_MAX_HEIGHT = META_LINE_HEIGHT * META_MAX_LINES;
 
 export function XcodeActivityRow({
   run,
@@ -106,19 +114,13 @@ export function XcodeActivityRow({
 
   const header = (
     <>
-      <StatusPill run={run} />
       {/* min-w-0 is what lets the children truncate instead of forcing the
           row wider than the card that holds it. */}
       <span
-        className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-0.5 overflow-hidden text-left"
-        style={{ maxHeight: META_MAX_HEIGHT }}
+        className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 overflow-hidden text-left"
+        style={{ maxHeight: META_MAX_HEIGHT, lineHeight: `${META_LINE_HEIGHT}px` }}
       >
-        <span className="max-w-full truncate font-semibold text-foreground">
-          {runTitle(run)}
-        </span>
-        <span className={activityMetaClass(state, "max-w-full truncate")}>
-          {kindLabel(run.kind)}
-        </span>
+        <Headline run={run} />
         {run.destinationLabel ? (
           <span
             className={activityMetaClass(state, "max-w-full truncate")}
@@ -236,17 +238,35 @@ export function XcodeActivityRow({
 }
 
 /**
- * The state, as a filled pill.
+ * The headline: state and identity as one clause, not two tokens.
  *
- * Solid fill rather than tinted text because this is the row's anchor: it
- * never wraps and never truncates, holding its position while everything to
- * its right reflows. The label is kind-aware while in flight (Testing,
- * Archiving), since a test run reading "Building" is simply wrong.
+ * Two earlier attempts put the state beside the name as its own object — a
+ * filled pill, then a bare word — and both read as two disconnected facts
+ * competing for the front of the row. Worse, while the verb was "Building"
+ * the row also carried a separate "build" kind token saying the same thing
+ * twice. Composing them fixes both: one clause, whose grammar carries the
+ * state, and the kind token is gone because the verb already is the kind.
+ *
+ * The whole phrase is a single wrapping unit, so "Packerly succeeded" never
+ * breaks across lines with the verb orphaned from its subject.
  */
-function StatusPill({ run }: { run: RunDto }) {
+function Headline({ run }: { run: RunDto }) {
+  const { name, verb, verbFirst } = runPhrase(run);
+  const nameEl = (
+    <span className="font-semibold text-foreground">{name}</span>
+  );
+  const verbEl = <span className="bbx-text font-medium">{verb}</span>;
   return (
-    <span className="bbx-pill shrink-0 rounded-full px-2 text-[10px] font-semibold uppercase leading-[17px] tracking-wide">
-      {runStatusLabel(run)}
+    <span className="max-w-full truncate" title={`${name} — ${verb}`}>
+      {verbFirst ? (
+        <>
+          {verbEl} {nameEl}
+        </>
+      ) : (
+        <>
+          {nameEl} {verbEl}
+        </>
+      )}
     </span>
   );
 }

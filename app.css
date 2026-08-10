@@ -74,16 +74,6 @@
   color: var(--bbx);
 }
 
-/*
- * The status pill: the row's anchor, and the only solid fill in the prompt
- * stack. `--background` as the label colour rather than a fixed dark keeps it
- * legible when a light theme pushes `--bbx` bright — the pill always reads as
- * the inverse of the surface behind it, whatever the palette does.
- */
-.bbx-pill {
-  color: var(--background);
-  background: var(--bbx);
-}
 .bbx-chip {
   color: var(--bbx);
   background: color-mix(in srgb, var(--bbx) 11%, transparent);

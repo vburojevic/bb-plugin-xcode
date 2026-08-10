@@ -97,7 +97,11 @@ export function statusLabel(status: RunStatus): string {
     case "cancelled":
       return "Cancelled";
     case "ended":
-      return "Finished";
+      // NOT "Finished". Finished what — succeeded, failed, was killed? This
+      // state means the run started, stopped, and no verdict source ever told
+      // us the outcome. A terminal label has to state a result or admit it has
+      // none; "Finished" did neither and read as a synonym for success.
+      return "No result";
   }
 }
 
@@ -113,7 +117,13 @@ export function runStatusLabel(run: {
   status: RunStatus;
   kind: RunKind;
 }): string {
-  if (run.status !== "running") return statusLabel(run.status);
+  // `finishing` deliberately keeps the in-flight verb. It is a real internal
+  // state — the 45s window where three verdict sources race — but as a word on
+  // screen it made a build that had already stopped look like it was still
+  // doing something, for up to three quarters of a minute.
+  if (run.status !== "running" && run.status !== "finishing") {
+    return statusLabel(run.status);
+  }
   switch (run.kind) {
     case "test":
       return "Testing";
@@ -137,6 +147,44 @@ export function runStatusLabel(run: {
       return "Running";
     default:
       return "Building";
+  }
+}
+
+/**
+ * The row's headline, as a phrase rather than a label plus a name.
+ *
+ * A leading status token sat beside the scheme and read as two disconnected
+ * facts — and when the verb was "Building" the separate "build" kind token
+ * said it a second time. Composing them removes both problems: the line reads
+ * as one clause, and its grammar carries the state.
+ *
+ *   running/finishing  →  "Building Packerly"   (verb first, present)
+ *   passed/warnings    →  "Packerly succeeded"  (verb last, past)
+ *   failed             →  "Packerly failed"
+ *   cancelled          →  "Packerly cancelled"
+ *   ended              →  "Packerly — no result"
+ */
+export function runPhrase(run: {
+  status: RunStatus;
+  kind: RunKind;
+  scheme: string | null;
+  container: string | null;
+  root: string | null;
+}): { name: string; verb: string; verbFirst: boolean } {
+  const name = runTitle(run);
+  switch (run.status) {
+    case "running":
+    case "finishing":
+      return { name, verb: runStatusLabel(run), verbFirst: true };
+    case "passed":
+    case "warnings":
+      return { name, verb: "succeeded", verbFirst: false };
+    case "failed":
+      return { name, verb: "failed", verbFirst: false };
+    case "cancelled":
+      return { name, verb: "cancelled", verbFirst: false };
+    case "ended":
+      return { name, verb: "— no result", verbFirst: false };
   }
 }
 
