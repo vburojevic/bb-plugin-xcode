@@ -25,6 +25,7 @@ import {
   shimPaths,
   uninstallShim,
 } from "./src/shim";
+import { safely, detach } from "./src/safe";
 import { MIGRATIONS, Store, type Db } from "./src/store";
 import { destinationLabel } from "./src/destination";
 import { ThreadScopes, runMatchesScope, type ThreadScope } from "./src/scopes";
@@ -93,14 +94,24 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
    * re-checks its own abort signal for this reason; the wrapped-build paths
    * had no equivalent and crashed the server on 2026-08-10.
    */
-  const publish = (payload?: Record<string, unknown>): void => {
-    if (disposed) return;
-    try {
+  const publish = safely(
+    () => disposed,
+    (payload?: Record<string, unknown>) => {
       bb.realtime.publish(XCODE_CHANNEL, payload ?? { at: Date.now() });
-    } catch {
-      // Disposed between the check and the call. The fresh instance owns the
-      // channel now, so there is nothing useful left to report.
-    }
+    },
+  );
+
+  /**
+   * Logging carries the same guard, and for a sharper reason: `bb.log` throws
+   * once stale, including from inside the very `catch` that was containing a
+   * failure — turning a handled error into an unhandled rejection. Nothing in
+   * this plugin calls `bb.log` directly.
+   */
+  const log = {
+    debug: safely(() => disposed, (m: string) => bb.log.debug(m)),
+    info: safely(() => disposed, (m: string) => bb.log.info(m)),
+    warn: safely(() => disposed, (m: string) => bb.log.warn(m)),
+    error: safely(() => disposed, (m: string) => bb.log.error(m)),
   };
 
   const listProjects = async (): Promise<CollectorProject[]> => {
@@ -127,10 +138,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     projectFor: (signals): string | null =>
       collectorRef ? collectorRef.projectFor(signals) : null,
     threadFor: (signals): string | null => scopes.threadFor(signals),
-    log: (message) => bb.log.debug(message),
+    log: (message) => log.debug(message),
   });
   const collector = new Collector(
-    { store, engine, listProjects, log: bb.log, dataDir },
+    { store, engine, listProjects, log, dataDir },
     current,
   );
   collectorRef = collector;
@@ -191,7 +202,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       if (backfilled > 0) publish();
       return scopes.get(threadId);
     } catch (error: unknown) {
-      bb.log.debug(`thread scope resolve failed (${threadId}): ${String(error)}`);
+      log.debug(`thread scope resolve failed (${threadId}): ${String(error)}`);
       return null;
     }
   };
@@ -201,7 +212,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     if (existing) {
       scopes.upsert({ ...existing, active: true }, Date.now());
     }
-    void refreshThreadScope(thread.id, true);
+    detach(() => refreshThreadScope(thread.id, true));
     scopes.prune(Date.now());
   });
   bb.events.on("thread.idle", ({ thread }) => {
@@ -411,7 +422,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     async start(signal) {
       await collector.isXcodeAvailable().catch(() => false);
       await collector.fullScan(Date.now(), signal).catch((error: unknown) => {
-        bb.log.warn(`initial scan failed: ${String(error)}`);
+        log.warn(`initial scan failed: ${String(error)}`);
       });
       publish();
 
@@ -446,7 +457,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           failures = 0;
         } catch (error: unknown) {
           failures = Math.min(failures + 1, 5);
-          bb.log.warn(`probe tick failed: ${String(error)}`);
+          log.warn(`probe tick failed: ${String(error)}`);
         }
         await sleep(
           failures > 0
@@ -472,7 +483,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     db.prepare(`DELETE FROM root WHERE last_seen_at < ?`).run(cutoff);
     db.prepare(`PRAGMA wal_checkpoint(TRUNCATE)`).get();
     if (removed > 0) {
-      bb.log.info(`pruned ${removed} run(s) past retention`);
+      log.info(`pruned ${removed} run(s) past retention`);
       publish();
     }
   });
@@ -600,11 +611,15 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
         }
         case "rescan": {
-          const changed = await collector.fullScan();
-          if (changed) publish();
+          // Detached, like the rpc method: a sweep can spawn xcresulttool with
+          // a 60s timeout per bundle, and holding the CLI handler open for
+          // that is what put xcode on perf-watch's slow-handler list.
+          detach(async () => {
+            if (await collector.fullScan()) publish();
+          });
           return {
             exitCode: 0,
-            stdout: `Scanned. ${store.listRoots().length} DerivedData root(s) known.\n`,
+            stdout: `Scanning in the background. ${store.listRoots().length} DerivedData root(s) known so far.\n`,
           };
         }
         case "run":
@@ -749,16 +764,16 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
             },
             Date.now(),
           );
-          await collector.fullScan();
+          await collector.fullScan(Date.now(), detachRuns.signal);
           publish();
-          bb.log.info(
+          log.info(
             `wrapped build ${describeExit(result.exitCode, result.signal)}: ${result.bundlePath}`,
           );
         })
         .catch((error: unknown) => {
           resolve();
           if (disposed) return;
-          bb.log.warn(`wrapped build failed to run: ${String(error)}`);
+          log.warn(`wrapped build failed to run: ${String(error)}`);
         });
     });
     await started;
@@ -769,8 +784,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     // Give the probe a moment to adopt the process so we can hand back a
     // run id (and thus a chat card) instead of just a bundle path.
     let tracked: Run | undefined;
-    for (let attempt = 0; attempt < 8 && !tracked; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+    for (let attempt = 0; attempt < 6 && !tracked; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 600));
       await collector.probeTick().catch(() => false);
       tracked = store
         .listRuns({ limit: 25 })
@@ -959,9 +974,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   bb.onDispose(() => {
     // Order matters: flip the flag before detaching, so anything the tail
     // loop has already queued finds `disposed` true when it lands.
+    log.debug("xcode tracker disposed");
     disposed = true;
     detachRuns.abort();
-    bb.log.debug("xcode tracker disposed");
   });
 }
 
