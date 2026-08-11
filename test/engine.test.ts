@@ -184,8 +184,9 @@ describe("manifest folding", () => {
     expect(runs[0]!.warningCount).toBe(2);
   });
 
-  it("is idempotent per manifest uuid", () => {
+  it("is idempotent per manifest uuid once the entry has been applied", () => {
     engine.foldSnapshot([activity()], 1_000_000);
+    retire(1_000_000);
     engine.foldManifestEntry("/tmp/dd", "build", manifestEntry(), 1_006_000);
     const changed = engine.foldManifestEntry(
       "/tmp/dd",
@@ -194,6 +195,31 @@ describe("manifest folding", () => {
       1_007_000,
     );
     expect(changed).toBe(false);
+    expect(store.listRuns({})).toHaveLength(1);
+  });
+
+  /**
+   * The regression that made this the plugin's deadest verdict source.
+   *
+   * Xcode writes the manifest the moment xcodebuild exits, which routinely
+   * lands BEFORE the `ps` hysteresis concedes the process is gone. The entry
+   * used to be consumed on that early pass, its verdict suppressed because the
+   * run was still `running`, and no later sweep reconsidered it — the run then
+   * timed out into a permanent verdict-less `ended`. Measured in production:
+   * zero manifest verdicts had ever been recorded.
+   */
+  it("retries an entry that arrived before the run left running", () => {
+    engine.foldSnapshot([activity()], 1_000_000);
+
+    // Early pass: process still alive, so the verdict must wait.
+    engine.foldManifestEntry("/tmp/dd", "build", manifestEntry(), 1_001_000);
+    expect(store.listRuns({})[0]!.status).toBe("running");
+    expect(store.listRuns({})[0]!.warningCount).toBe(2); // counts still adopted
+
+    // The probe catches up, and the same entry must still be available.
+    retire(1_002_000);
+    engine.foldManifestEntry("/tmp/dd", "build", manifestEntry(), 1_020_000);
+    expect(store.listRuns({})[0]!.status).toBe("passed");
     expect(store.listRuns({})).toHaveLength(1);
   });
 

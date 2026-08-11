@@ -190,6 +190,27 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   collectorRef = collector;
   engine.hydrate(Date.now());
 
+  /**
+   * One-time repair for runs stranded by the manifest consume-too-early race.
+   *
+   * Every manifest entry folded before its run left `running` was marked seen
+   * and never reconsidered, so the run timed out into a permanent verdict-less
+   * `ended`. Handing those entries back lets the next sweep resolve the
+   * history that bug created; folding is idempotent, so the only cost is
+   * re-reading some small plists once.
+   */
+  if (!(await bb.storage.kv.get<boolean>("manifest-race-backfill"))) {
+    const requeued = store.clearSeenSince(
+      "manifest:",
+      Date.now() - 7 * 24 * 3_600_000,
+    );
+    await bb.storage.kv.set("manifest-race-backfill", true);
+    if (requeued > 0) {
+      log.info(`re-queued ${requeued} manifest entries stranded by the fold race`);
+      detach(() => collector.fullScan().then((changed) => changed && publish()));
+    }
+  }
+
   // ------------------------------------------------ thread command verdicts
   //
   // Provider background commands have a launcher completion and a later task

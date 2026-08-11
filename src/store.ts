@@ -571,6 +571,14 @@ export class Store {
    * Idempotence ledger for external artifacts (manifest entries, bundles).
    * A key is recorded once; folding the same artifact twice is a no-op.
    */
+  /** Forget artifacts recorded since `since`, so a sweep reconsiders them. */
+  clearSeenSince(prefix: string, since: number): number {
+    const result = this.db
+      .prepare(`DELETE FROM seen_artifact WHERE key LIKE ? AND seen_at >= ?`)
+      .run(`${prefix}%`, since) as { changes?: number };
+    return result?.changes ?? 0;
+  }
+
   markSeen(key: string, now: number): boolean {
     const existed = this.db
       .prepare(`SELECT 1 FROM seen_artifact WHERE key = ?`)
@@ -586,6 +594,14 @@ export class Store {
     this.db.prepare(`DELETE FROM seen_artifact WHERE key = ?`).run(key);
   }
 
+  /**
+   * Peek without consuming.
+   *
+   * `markSeen` conflates "have we handled this?" with "we are handling it
+   * now", which is only safe when the caller is certain it can act. The
+   * manifest fold is not — it may arrive before the run it describes has left
+   * `running` — so it looks with this, declines, and comes back.
+   */
   hasSeen(key: string): boolean {
     return Boolean(
       this.db.prepare(`SELECT 1 FROM seen_artifact WHERE key = ?`).get(key),

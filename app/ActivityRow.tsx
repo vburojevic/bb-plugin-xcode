@@ -12,19 +12,18 @@
  *     run's own colour. Everything else — simulator, branch, counts — is
  *     supporting detail that may wrap behind it.
  *
- * ## Why it wraps instead of truncating
+ * ## One line, like its neighbours
  *
- * The fields are variable-length and unbounded: a scheme, a simulator name and
- * OS, a branch that can run fifty characters. Held on one line with `shrink-0`
- * they overlapped on a narrow composer — text drawn over text, which is worse
- * than either truncation or wrapping. So the meta group is a wrapping flex
- * row: one line when it fits, growing to at most three when it does not, each
- * field truncating individually rather than shoving its neighbour. Past three
- * lines the row clips, because a prompt-stack card that grows without bound
- * stops being chrome and starts being content.
+ * The fields are variable-length and unbounded — a scheme, a simulator name
+ * and OS, a branch that can run fifty characters. Held on one line with
+ * `shrink-0` they overlapped on a narrow composer; wrapped to three lines they
+ * stopped overlapping but made the card two lines taller than every native row
+ * beside it, which read as a different component bolted into the stack.
  *
- * The timer and the controls never wrap — they are the row's fixed skeleton,
- * and the wrapping happens between them and the headline.
+ * So it does what the native rows do: the whole identity run is ONE truncating
+ * unit, ellipsised as a unit, with the glyph, timer and controls as the fixed
+ * skeleton around it. Nothing can overlap because nothing competes for width,
+ * and the full text lives in the tooltip and the disclosure.
  *
  * The host has five row states, Xcode has seven; the mapping is the one
  * judgement call here:
@@ -45,7 +44,11 @@ import { Icon } from "@/components/ui/icon";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 
-import { activityMetaClass, runActivityState } from "./activity-styles";
+import {
+  activityIconClass,
+  activityMetaClass,
+  runActivityState,
+} from "./activity-styles";
 import {
   formatDuration,
   formatRelative,
@@ -53,21 +56,9 @@ import {
   runPhrase,
   runStatusLabel,
   runTitle,
+  statusIcon,
 } from "./format";
 import { isLive, type RunDto } from "./status-types";
-
-/**
- * The meta group's line box, pinned rather than inherited.
- *
- * The cap has to be an exact multiple of the line height or the last visible
- * line is sliced through the middle of its glyphs — which is what happened
- * when this was a guessed pixel value against `text-xs`'s inherited 16px
- * leading plus a 2px row gap. Fixing the leading here and dropping the
- * vertical gap makes the arithmetic exact: three lines, nothing clipped.
- */
-const META_LINE_HEIGHT = 20;
-const META_MAX_LINES = 3;
-const META_MAX_HEIGHT = META_LINE_HEIGHT * META_MAX_LINES;
 
 export function XcodeActivityRow({
   run,
@@ -112,37 +103,39 @@ export function XcodeActivityRow({
               ? formatRelative(run.endedAt)
               : null;
 
+  // Everything the row says about identity, as ONE truncating unit — which is
+  // exactly how the native rows beside it behave ("Running background command:
+  // …"). An earlier version wrapped this to three lines to stop the fields
+  // overlapping; it fixed the overlap and made the card two lines taller than
+  // every neighbour in the stack, which read as a different component.
+  const meta = [run.destinationLabel, run.branch, tail].filter(
+    (part): part is string => Boolean(part),
+  );
+
   const header = (
     <>
-      {/* min-w-0 is what lets the children truncate instead of forcing the
-          row wider than the card that holds it. */}
+      {/* Native rows lead with a fixed-size glyph; matching it keeps the whole
+          stack on one optical baseline. Live wears the plugin's mark, settled
+          wears its verdict. */}
+      <Icon
+        name={live ? "Toolbox" : statusIcon(run.status)}
+        className={cn(
+          "size-3.5 shrink-0",
+          live ? activityIconClass(state) : "bbx-text",
+        )}
+        aria-hidden
+      />
       <span
-        className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 overflow-hidden text-left"
-        style={{ maxHeight: META_MAX_HEIGHT, lineHeight: `${META_LINE_HEIGHT}px` }}
+        className="min-w-0 flex-1 truncate text-left"
+        title={[runPhrase(run).name, ...meta].join(" · ")}
       >
         <Headline run={run} />
-        {run.destinationLabel ? (
-          <span
-            className={activityMetaClass(state, "max-w-full truncate")}
-            title={run.destinationLabel}
-          >
-            {run.destinationLabel}
+        {meta.map((part) => (
+          <span key={part} className={activityMetaClass(state)}>
+            {" · "}
+            {part}
           </span>
-        ) : null}
-        {run.branch ? (
-          <span
-            className={activityMetaClass(state, "flex max-w-full items-center gap-0.5")}
-            title={run.branch}
-          >
-            <Icon name="GitBranch" className="size-3 shrink-0 opacity-70" aria-hidden />
-            <span className="truncate">{run.branch}</span>
-          </span>
-        ) : null}
-        {tail ? (
-          <span className={activityMetaClass(state, "max-w-full truncate tabular-nums")}>
-            {tail}
-          </span>
-        ) : null}
+        ))}
       </span>
       <span
         className={cn(

@@ -429,9 +429,9 @@ export class Engine {
     },
     now: number,
   ): boolean {
-    const key = `manifest:${entry.uniqueIdentifier}`;
-    if (!this.store.markSeen(key, now)) return false;
     if (entry.startedAt === null) return false;
+    const key = `manifest:${entry.uniqueIdentifier}`;
+    if (this.store.hasSeen(key)) return false;
 
     const candidates = this.store
       .findVerdictCandidates(entry.startedAt, MATCH_SLACK_MS)
@@ -465,6 +465,32 @@ export class Engine {
             : null
           : entry.status;
 
+      /**
+       * Look, decline, come back.
+       *
+       * Xcode writes the manifest the instant xcodebuild exits — routinely a
+       * few seconds BEFORE this plugin's `ps` hysteresis concedes the process
+       * is gone. Consuming the entry at that moment (which is what `markSeen`
+       * at the top of this function used to do) threw away the only
+       * launcher-independent verdict the plugin has: the run was still
+       * `running`, so `stillAlive` suppressed the outcome, the entry was
+       * marked seen, and no later sweep looked at it again. The run then timed
+       * out of `finishing` into a permanent, verdict-less `ended`.
+       *
+       * Measured before the fix: ZERO manifest verdicts had ever been
+       * recorded on this machine, against 10 from abandoned bundles and 3 from
+       * launcher exits. The entry that would have resolved the run in the bug
+       * report was consumed 2.9 seconds before that run left `running`.
+       *
+       * Counts are still adopted on the early pass — they are only ever
+       * revised upward, so re-reading is harmless — but the entry stays
+       * unseen until its verdict could actually be applied. That converges
+       * within seconds, because the probe always moves a dead process out of
+       * `running`.
+       */
+      const tooEarly = stillAlive && verdict === null;
+      if (!tooEarly) this.store.markSeen(key, now);
+
       if (
         verdict &&
         VERDICT_STATUSES.has(verdict) &&
@@ -479,12 +505,14 @@ export class Engine {
         for (const [pid, live] of this.live) {
           if (live.runId === target.id) this.live.delete(pid);
         }
+        this.hooks.log(`verdict from manifest: ${verdict} (${target.id})`);
       }
       this.store.updateRun(target);
       return true;
     }
 
     // Standalone: nothing observed overlaps. Historical or IDE-origin.
+    this.store.markSeen(key, now);
     const run: Run = {
       id: `m:${entry.uniqueIdentifier}`,
       status: VERDICT_STATUSES.has(entry.status) ? entry.status : "ended",
