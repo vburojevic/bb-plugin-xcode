@@ -57,6 +57,14 @@ export interface ActivityAttribution {
   worktree?: string | null;
 }
 
+/** What a build is doing right now. Ordered coarse-to-late in `PHASE_ORDER`. */
+export type BuildPhase =
+  | "compiling"
+  | "assets"
+  | "linking"
+  | "signing"
+  | "testing";
+
 export interface LiveActivity extends ActivityAttribution {
   pid: number;
   comm: string;
@@ -66,6 +74,10 @@ export interface LiveActivity extends ActivityAttribution {
   roots: string[];
   /** Live compiler/linker processes in the subtree (rough progress signal). */
   workerCount: number;
+  /** What the build is doing right now, from its live worker processes. */
+  phase: BuildPhase | null;
+  /** Source file a compiler is on, when exactly one is unambiguous. */
+  currentFile: string | null;
   /**
    * True for Xcode.app's resident build service rather than a one-shot
    * `xcodebuild`. Daemons need different lifecycle handling: they do not exit

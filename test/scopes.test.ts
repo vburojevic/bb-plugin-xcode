@@ -240,3 +240,82 @@ describe("scopeFilter", () => {
     expect(filter(foreign)).toBe(false);
   });
 });
+
+describe("Store.typicalDurationMs", () => {
+  function seed(): Store {
+    const db = new Database(":memory:") as unknown as Db;
+    for (const statement of MIGRATIONS) db.prepare(statement).run();
+    return new Store(db);
+  }
+  const base = {
+    statusRank: 1 as const,
+    kind: "build" as const,
+    scheme: "Index",
+    container: null,
+    configuration: null,
+    destination: null,
+    projectId: null,
+    root: "/dd",
+    cwd: null,
+    pid: null,
+    cmdline: null,
+    errorCount: 0,
+    warningCount: 0,
+    analyzerCount: 0,
+    testTotal: null,
+    testFailed: null,
+    testSkipped: null,
+    bundlePath: null,
+    detailed: false,
+    branch: null,
+    worktree: null,
+    threadId: null,
+  };
+  const add = (
+    store: Store,
+    id: string,
+    ms: number,
+    status: "passed" | "failed" | "cancelled",
+  ) =>
+    store.insertRun({
+      ...base,
+      id,
+      status,
+      startedAt: 1_000_000,
+      endedAt: 1_000_000 + ms,
+    });
+
+  const query = { root: "/dd", scheme: "Index", kind: "build" as const };
+
+  it("needs more than one sample to call anything usual", () => {
+    const store = seed();
+    add(store, "a", 60_000, "passed");
+    expect(store.typicalDurationMs(query)).toBeNull();
+  });
+
+  it("takes the median, so one cold build cannot drag it", () => {
+    const store = seed();
+    add(store, "a", 60_000, "passed");
+    add(store, "b", 70_000, "passed");
+    add(store, "c", 1_200_000, "passed"); // a clean rebuild
+    expect(store.typicalDurationMs(query)).toBe(70_000);
+  });
+
+  it("ignores runs that did not succeed", () => {
+    const store = seed();
+    add(store, "a", 60_000, "passed");
+    add(store, "b", 70_000, "passed");
+    add(store, "c", 900, "failed"); // failed in a second; says nothing
+    add(store, "d", 800, "cancelled");
+    expect(store.typicalDurationMs(query)).toBe(65_000);
+  });
+
+  it("does not answer for a different scheme or checkout", () => {
+    const store = seed();
+    add(store, "a", 60_000, "passed");
+    add(store, "b", 70_000, "passed");
+    expect(store.typicalDurationMs({ ...query, scheme: "Other" })).toBeNull();
+    expect(store.typicalDurationMs({ ...query, root: "/elsewhere" })).toBeNull();
+    expect(store.typicalDurationMs({ ...query, root: null })).toBeNull();
+  });
+});

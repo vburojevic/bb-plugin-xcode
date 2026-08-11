@@ -369,6 +369,47 @@ export class Store {
     return rows.map(toRun);
   }
 
+  /**
+   * How long this kind of run usually takes in this checkout.
+   *
+   * The median of recent SUCCESSFUL runs of the same scheme and kind — median
+   * rather than mean because one 20-minute cold build after a clean would drag
+   * a mean far off every warm build that follows. Only successes count: a build
+   * that failed in 8 seconds says nothing about how long a real one takes, and
+   * a cancelled one says less.
+   *
+   * This is what makes a determinate progress bar possible at all. llbuild's
+   * own task ledger would be exact, but it stays inside one open transaction
+   * for the whole build, so elapsed-against-typical is the honest alternative.
+   */
+  typicalDurationMs(query: {
+    root: string | null;
+    scheme: string | null;
+    kind: RunKind;
+  }): number | null {
+    if (!query.root || !query.scheme) return null;
+    const rows = this.db
+      .prepare(
+        `SELECT (ended_at - started_at) AS ms FROM run
+          WHERE root = ? AND scheme = ? AND kind = ?
+            AND ended_at IS NOT NULL
+            AND status IN ('passed', 'warnings')
+          ORDER BY started_at DESC LIMIT 20`,
+      )
+      .all(query.root, query.scheme, query.kind) as Array<{ ms: number }>;
+
+    const samples = rows
+      .map((row) => row.ms)
+      .filter((ms) => Number.isFinite(ms) && ms > 0)
+      .sort((a, b) => a - b);
+    // Two samples is the least that can be called "usual"; one is an anecdote.
+    if (samples.length < 2) return null;
+    const mid = Math.floor(samples.length / 2);
+    return samples.length % 2 === 0
+      ? Math.round((samples[mid - 1]! + samples[mid]!) / 2)
+      : samples[mid]!;
+  }
+
   countRuns(query: { projectId?: string | null; kind?: RunKind | null }): number {
     const where: string[] = [];
     const params: unknown[] = [];

@@ -67,6 +67,14 @@ const runSchema = z.object({
   destinationLabel: z.string().nullable(),
   /** Live compiler processes right now; null unless running. */
   workerCount: z.number().nullable(),
+  /** What the build is doing right now: compiling, linking, signing, testing. */
+  phase: z
+    .enum(["compiling", "assets", "linking", "signing", "testing"])
+    .nullable(),
+  /** Source file a compiler is on, when one is unambiguously identifiable. */
+  currentFile: z.string().nullable(),
+  /** Median duration of recent successful runs of this scheme and kind. */
+  typicalMs: z.number().nullable(),
 });
 
 const findingSchema = z.object({

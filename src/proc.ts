@@ -11,6 +11,7 @@
 
 import type {
   ActivityAttribution,
+  BuildPhase,
   LiveActivity,
   ObservedProcess,
   RunKind,
@@ -69,6 +70,48 @@ const DAEMON_ROOT = "XCBBuildService";
  *
  * Used to decide whether the build daemon is genuinely busy.
  */
+/**
+ * What a live worker process means the build is currently DOING.
+ *
+ * This is the only progress signal available while a build runs. llbuild keeps
+ * its own task ledger in `XCBuildData/build.db`, which would give an exact
+ * completed/total count — but it holds the entire build inside one open
+ * transaction (`journal_mode=delete`, a `build.db-journal` present throughout),
+ * so every reader sees the PREVIOUS build's committed state until this one
+ * ends. Verified against a live build: the rule count sat unchanged at 773 for
+ * the duration. A counter frozen for the whole build is worse than no counter.
+ *
+ * The process tree, by contrast, says what is happening right now for free —
+ * we already snapshot it every tick to count workers.
+ *
+ * Order matters: a run can have both compilers and a linker alive, and the
+ * later phase is the truer answer, so callers take the highest match.
+ */
+export const PHASE_ORDER = [
+  "compiling",
+  "assets",
+  "linking",
+  "signing",
+  "testing",
+] as const;
+
+const PHASE_BY_BINARY = new Map<string, BuildPhase>([
+  ["swift-frontend", "compiling"],
+  ["swift-driver", "compiling"],
+  ["swiftc", "compiling"],
+  ["clang", "compiling"],
+  ["clang++", "compiling"],
+  ["swift-symbolgraph-extract", "compiling"],
+  ["actool", "assets"],
+  ["ibtool", "assets"],
+  ["ld", "linking"],
+  ["ld64", "linking"],
+  ["libtool", "linking"],
+  ["codesign", "signing"],
+  ["xctest", "testing"],
+  ["swift-testing", "testing"],
+]);
+
 const WORKER_BINARIES = new Set([
   "swift-frontend",
   "swift-driver",
@@ -433,15 +476,33 @@ export function findRootActivities(procs: ObservedProcess[]): LiveActivity[] {
     return null;
   };
 
-  const rootsByPid = new Map<number, { roots: Set<string>; workers: number }>();
+  const rootsByPid = new Map<
+    number,
+    {
+      roots: Set<string>;
+      workers: number;
+      phases: Set<BuildPhase>;
+      currentFile: string | null;
+    }
+  >();
   for (const pid of rootPids) {
-    rootsByPid.set(pid, { roots: new Set(), workers: 0 });
+    rootsByPid.set(pid, {
+      roots: new Set(),
+      workers: 0,
+      phases: new Set(),
+      currentFile: null,
+    });
   }
   for (const proc of procs) {
     const owner = resolveOwner(proc);
     if (owner === null) continue;
     const bucket = rootsByPid.get(owner)!;
-    if (proc.pid !== owner && WORKER_BINARIES.has(proc.comm)) bucket.workers += 1;
+    if (proc.pid !== owner) {
+      if (WORKER_BINARIES.has(proc.comm)) bucket.workers += 1;
+      const phase = PHASE_BY_BINARY.get(proc.comm);
+      if (phase) bucket.phases.add(phase);
+      bucket.currentFile ??= primarySourceFile(proc.args);
+    }
     for (const root of derivedRootsFromArgs(proc.args)) bucket.roots.add(root);
   }
 
@@ -475,10 +536,46 @@ export function findRootActivities(procs: ObservedProcess[]): LiveActivity[] {
         startedAt: proc.startedAt ?? Date.now(),
         roots: [...bucket.roots],
         workerCount: bucket.workers,
+        phase: dominantPhase(bucket.phases),
+        currentFile: bucket.currentFile,
         isDaemon,
       },
     ];
   });
+}
+
+/**
+ * The latest phase any live worker is in.
+ *
+ * A build routinely has compilers and a linker alive at once as targets finish
+ * at different times; reporting "compiling" then would understate how far along
+ * it is. Taking the last match in `PHASE_ORDER` reports the frontier.
+ */
+export function dominantPhase(phases: ReadonlySet<BuildPhase>): BuildPhase | null {
+  let found: BuildPhase | null = null;
+  for (const phase of PHASE_ORDER) {
+    if (phases.has(phase)) found = phase;
+  }
+  return found;
+}
+
+/**
+ * The source file a compiler invocation is working on.
+ *
+ * `swift-frontend` names it explicitly with `-primary-file`; clang puts it
+ * last, as the only non-flag argument that looks like a source path. Anything
+ * ambiguous returns null rather than guessing, because a wrong filename in the
+ * row is worse than none.
+ */
+export function primarySourceFile(args: string): string | null {
+  const primary = /\s-primary-file\s+(\S+)/.exec(args);
+  if (primary?.[1]) return basename(primary[1]);
+
+  if (!/\/(clang\+*|swiftc)\s/.test(args)) return null;
+  const sources = args
+    .split(/\s+/)
+    .filter((token) => /\.(swift|m|mm|c|cc|cpp)$/.test(token));
+  return sources.length === 1 ? basename(sources[0]!) : null;
 }
 
 /** Walk up the process tree for scheme/container a wrapper knows but we don't. */

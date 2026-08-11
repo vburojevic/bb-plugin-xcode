@@ -21,6 +21,15 @@ import {
 import { isLive, statusClass, type ChatStatus, type RunDto } from "./status-types";
 import { WorkerSwarm } from "./WorkerSwarm";
 
+/** Human wording for the live build phase. */
+const PHASE_LABEL: Record<NonNullable<RunDto["phase"]>, string> = {
+  compiling: "Compiling",
+  assets: "Compiling assets",
+  linking: "Linking",
+  signing: "Signing",
+  testing: "Running tests",
+};
+
 export function RunDetail({
   run,
   findings,
@@ -41,6 +50,13 @@ export function RunDetail({
   // it so the device and its runtime read as two facts rather than one string.
   const [simulatorName, osVersion] = splitDestination(run.destinationLabel);
   const containerName = basename(run.container);
+  // Only ever shown while live, and only while it is still positive: an
+  // estimate that counts down past zero is worse than admitting the build has
+  // outrun what this checkout considers usual.
+  const remaining =
+    live && run.typicalMs !== null
+      ? Math.max(0, run.typicalMs - (Date.now() - run.startedAt)) || null
+      : null;
   const testsBadge =
     run.testTotal !== null
       ? (run.testFailed ?? 0) > 0
@@ -88,10 +104,26 @@ export function RunDetail({
         {run.endedAt ? (
           <Fact label="Finished" value={formatClock(run.endedAt)} />
         ) : null}
+        {live && run.phase ? (
+          <Fact label="Phase" value={PHASE_LABEL[run.phase]} />
+        ) : null}
+        {live && run.currentFile ? (
+          <Fact label="Current file" value={run.currentFile} mono />
+        ) : null}
         {live && run.workerCount ? (
           <Fact
             label="Compilers"
             value={`${run.workerCount} running`}
+          />
+        ) : null}
+        {run.typicalMs !== null ? (
+          <Fact
+            label={live ? "Usually takes" : "Usual"}
+            value={
+              live
+                ? `${formatDuration(run.typicalMs)}${remaining !== null ? ` · ~${formatDuration(remaining)} left` : " · running long"}`
+                : formatDuration(run.typicalMs)
+            }
           />
         ) : null}
         {run.pid !== null ? <Fact label="Process" value={`pid ${run.pid}`} /> : null}

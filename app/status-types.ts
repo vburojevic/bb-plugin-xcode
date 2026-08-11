@@ -48,6 +48,9 @@ export type RunDto = {
   branch: string | null;
   worktree: string | null;
   workerCount: number | null;
+  phase: "compiling" | "assets" | "linking" | "signing" | "testing" | null;
+  currentFile: string | null;
+  typicalMs: number | null;
   projectName: string | null;
 };
 

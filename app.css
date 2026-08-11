@@ -123,6 +123,15 @@ span.bbx-dot > span {
     transform: translateX(250%);
   }
 }
+/*
+ * Determinate fill: elapsed against this checkout's median. Eased rather than
+ * linear because the value only moves on the frontend's one-second tick, and an
+ * unsmoothed bar visibly steps.
+ */
+.bbx-progress-fill {
+  background: var(--bbx);
+  transition: transform 900ms cubic-bezier(0.33, 1, 0.68, 1);
+}
 .bbx-progress-breath {
   background: color-mix(in srgb, var(--bbx) 55%, transparent);
   animation: bbx-breath 2.4s ease-in-out infinite;
@@ -187,6 +196,10 @@ span.bbx-dot > span {
   .bbx-progress-breath {
     animation: none;
     opacity: 0.5;
+  }
+  /* A stepping bar is worse than a still one when motion is unwelcome. */
+  .bbx-progress-fill {
+    transition: none;
   }
   /* Lit dots stay fully lit, idle ones stay dim: the count still reads. */
   .bbx-worker {

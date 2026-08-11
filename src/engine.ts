@@ -114,9 +114,17 @@ export class Engine {
   }
 
   liveWorkerCount(runId: string, activities: readonly LiveActivity[]): number | null {
+    return this.liveActivity(runId, activities)?.workerCount ?? null;
+  }
+
+  /** The live process snapshot backing a run, for phase and current file. */
+  liveActivity(
+    runId: string,
+    activities: readonly LiveActivity[],
+  ): LiveActivity | null {
     for (const [pid, entry] of this.live) {
       if (entry.runId !== runId) continue;
-      return activities.find((a) => a.pid === pid)?.workerCount ?? null;
+      return activities.find((a) => a.pid === pid) ?? null;
     }
     return null;
   }

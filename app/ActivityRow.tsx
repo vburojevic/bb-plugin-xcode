@@ -84,13 +84,15 @@ export function XcodeActivityRow({
   const live = isLive(run);
   const elapsed = live ? Date.now() - run.startedAt : run.durationMs;
   const collapsible = Boolean(children);
+  const progress = elapsedProgress(run, elapsed);
 
   // One trailing fact, chosen for what the state leaves unanswered: a live
   // build is "how hard is it working", a settled one "what did it leave".
   const tail = live
-    ? run.workerCount
-      ? `${run.workerCount} compiler${run.workerCount === 1 ? "" : "s"}`
-      : null
+    ? run.currentFile ??
+      (run.workerCount
+        ? `${run.workerCount} compiler${run.workerCount === 1 ? "" : "s"}`
+        : null)
     : run.errorCount > 0
       ? `${run.errorCount} error${run.errorCount === 1 ? "" : "s"}`
       : (run.testFailed ?? 0) > 0
@@ -198,16 +200,29 @@ export function XcodeActivityRow({
       </div>
 
       {/* A live run keeps a hairline of motion even while collapsed, so the
-          row reads as working rather than merely present. */}
+          row reads as working rather than merely present. When this checkout
+          has enough history to know what "usual" is, that hairline becomes a
+          real fraction instead of a sweep. */}
       {live && !expanded ? (
-        <Progress
-          indeterminate
-          aria-label={`${runStatusLabel(run)} ${runTitle(run)}`}
-          className="bbx-progress-track h-0.5 rounded-none"
-          indicatorClassName={
-            run.status === "finishing" ? "bbx-progress-breath w-full" : "bbx-progress-comet"
-          }
-        />
+        progress === null ? (
+          <Progress
+            indeterminate
+            aria-label={`${runStatusLabel(run)} ${runTitle(run)}`}
+            className="bbx-progress-track h-0.5 rounded-none"
+            indicatorClassName={
+              run.status === "finishing"
+                ? "bbx-progress-breath w-full"
+                : "bbx-progress-comet"
+            }
+          />
+        ) : (
+          <Progress
+            value={progress}
+            aria-label={`${runStatusLabel(run)} ${runTitle(run)} — ${progress}% of a typical run`}
+            className="bbx-progress-track h-0.5 rounded-none"
+            indicatorClassName="bbx-progress-fill"
+          />
+        )
       ) : null}
 
       {collapsible ? (
@@ -228,6 +243,28 @@ export function XcodeActivityRow({
       ) : null}
     </>
   );
+}
+
+/**
+ * How far along a live run is, as a percentage of a typical one.
+ *
+ * Not a task count — llbuild holds its ledger inside one open transaction for
+ * the whole build, so the only exact counter available is frozen until the
+ * build ends. Elapsed against this checkout's own median is the honest
+ * alternative, and it is genuinely useful because incremental builds of the
+ * same scheme cluster tightly.
+ *
+ * It never reaches 100 and never goes backwards: a build that outruns its
+ * median pins at 99 and the caption says so, because a bar that sat full while
+ * work continued would be a lie told every single time a build ran long.
+ */
+function elapsedProgress(
+  run: RunDto,
+  elapsed: number | null,
+): number | null {
+  if (!isLive(run) || run.typicalMs === null || elapsed === null) return null;
+  if (run.typicalMs <= 0) return null;
+  return Math.min(99, Math.max(1, Math.round((elapsed / run.typicalMs) * 100)));
 }
 
 /**

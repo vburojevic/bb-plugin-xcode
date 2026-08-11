@@ -494,6 +494,24 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       run.status === "running"
         ? engine.liveWorkerCount(run.id, collector.getLastActivities())
         : null,
+    phase:
+      run.status === "running"
+        ? (engine.liveActivity(run.id, collector.getLastActivities())?.phase ??
+          null)
+        : null,
+    currentFile:
+      run.status === "running"
+        ? (engine.liveActivity(run.id, collector.getLastActivities())
+            ?.currentFile ?? null)
+        : null,
+    // What a run of this shape usually costs here, so the row can show a real
+    // fraction instead of an indeterminate sweep. Null until there are enough
+    // successful samples to call anything "usual".
+    typicalMs: store.typicalDurationMs({
+      root: run.root,
+      scheme: run.scheme,
+      kind: run.kind,
+    }),
   });
 
   // ------------------------------------------------------------------- RPC
@@ -666,12 +684,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       // Detached: a full sweep can spawn xcresulttool with a 60s timeout per
       // bundle plus a sync JSON.parse of tens of MB — far too slow to hold an
       // RPC handler (and the shared event loop) open for.
-      void collector
-        .fullScan()
-        .then((changed) => {
-          if (changed) publish();
-        })
-        .catch(() => {});
+      detach(async () => {
+        if (await collector.fullScan(Date.now(), detachRuns.signal)) publish();
+      });
       return { ok: true, rootCount: store.listRoots().length };
     },
   });
@@ -762,9 +777,17 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     },
   });
 
-  bb.background.schedule("discover", "*/10 * * * *", async () => {
-    const changed = await collector.fullScan();
-    if (changed) publish();
+  bb.background.schedule("discover", "*/10 * * * *", () => {
+    // A sweep may spend up to 60s in xcresulttool for each bundle. Keeping
+    // that work inside the schedule callback made the host measure a 27s
+    // handler and could push the whole plugin into an error state. The
+    // schedule only triggers the sweep; the collector owns its lifetime.
+    detach(
+      async () => {
+        if (await collector.fullScan(Date.now(), detachRuns.signal)) publish();
+      },
+      (error) => log.warn(`scheduled discovery failed: ${String(error)}`),
+    );
   });
 
   bb.background.schedule("prune", "23 4 * * *", async () => {
@@ -825,7 +848,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       {
         name: "run",
         summary:
-          "Start xcodebuild with live tracking, detached from this command (returns a run id + chat directive)",
+          "Start xcodebuild with live tracking, detached from this command",
         usage: "bb xcode run -- xcodebuild -scheme App build",
       },
       {
@@ -901,7 +924,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           // a 60s timeout per bundle, and holding the CLI handler open for
           // that is what put xcode on perf-watch's slow-handler list.
           detach(async () => {
-            if (await collector.fullScan()) publish();
+            if (await collector.fullScan(Date.now(), detachRuns.signal)) publish();
           });
           return {
             exitCode: 0,
@@ -980,8 +1003,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   let lastLivePublishAt = 0;
 
   /**
-   * Start a wrapped xcodebuild and return as soon as the tracker has adopted
-   * it. DELIBERATELY DETACHED from the CLI request: holding the request open
+   * Start a wrapped xcodebuild and return as soon as the child has spawned.
+   * DELIBERATELY DETACHED from the CLI request: holding the request open
    * for a whole build meant bb's CLI proxy timeout (~5 min, measured live on
    * a Packerly build) aborted ctx.signal, which SIGTERM'd xcodebuild mid-
    * build and left an unfinalized result bundle. A build's lifetime belongs
@@ -1067,22 +1090,11 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       return { exitCode: 1, stderr: "Failed to start the build.\n" };
     }
 
-    // Give the probe a moment to adopt the process so we can hand back a
-    // run id (and thus a chat card) instead of just a bundle path.
-    let tracked: Run | undefined;
-    for (let attempt = 0; attempt < 6 && !tracked; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 600));
-      await collector.probeTick().catch(() => false);
-      tracked = store
-        .listRuns({ limit: 25 })
-        .find((run) => run.bundlePath === bundlePath);
-    }
-    publish();
-
     const lines = [
-      `Build started${tracked ? ` and tracked as ${tracked.id}` : ""}.`,
-      `It keeps running if this command disconnects; stop it with: bb xcode stop ${tracked?.id ?? "<run-id>"}`,
-      `Watch it: bb xcode status, or the live row above the composer.`,
+      "Build started; the background probe will assign its run id.",
+      "It keeps running if this command disconnects.",
+      "Watch it with: bb xcode status (then stop it with: bb xcode stop <run-id>).",
+      "It also appears in the live row above the composer.",
       "",
       `result bundle: ${bundlePath}`,
     ];
