@@ -33,6 +33,7 @@ import {
 import { safely, detach } from "./src/safe";
 import { MIGRATIONS, Store, type Db } from "./src/store";
 import { destinationLabel } from "./src/destination";
+import { formatDuration } from "./src/duration";
 import {
   ThreadScopes,
   runMatchesScope,
@@ -782,13 +783,6 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   // ------------------------------------------------------------------- CLI
 
-  function formatDuration(ms: number | null): string {
-    if (ms === null || !Number.isFinite(ms)) return "—";
-    if (ms < 1000) return `${Math.round(ms)}ms`;
-    const seconds = ms / 1000;
-    if (seconds < 60) return `${seconds.toFixed(1)}s`;
-    return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-  }
 
   function shortName(path: string | null): string | null {
     if (!path) return null;

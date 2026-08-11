@@ -2,6 +2,10 @@
 
 import type { IconName } from "@/components/ui/icon";
 
+import { formatDuration } from "../src/duration";
+
+export { formatDuration };
+
 export type RunStatus =
   | "running"
   | "finishing"
@@ -23,18 +27,6 @@ export type RunKind =
   | "package"
   | "index"
   | "unknown";
-
-export function formatDuration(ms: number | null | undefined): string {
-  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) return "—";
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  const totalSeconds = ms / 1000;
-  if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = Math.floor(totalSeconds % 60);
-  if (minutes < 60) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
-}
 
 export function formatRelative(at: number, now: number = Date.now()): string {
   const delta = now - at;
