@@ -78,6 +78,31 @@ export function isNoiseRun(run: {
   return run.kind === "unknown" && run.scheme === null && run.root === null;
 }
 
+/**
+ * A "failure" that is really a snapshot baseline being written.
+ *
+ * swift-snapshot-testing reports every recorded baseline AS A TEST FAILURE by
+ * design — in record mode there is nothing to assert against yet, so the only
+ * way it can tell you it wrote a file is to fail the test. xcodebuild then
+ * exits non-zero and the xcresult says `failedTests: N`, all of it truthful
+ * and all of it misleading: the recording did exactly what was asked.
+ *
+ * Observed in production (thr_yivibempsv, r:66968): the agent reported "build
+ * succeeded and all verified" while this plugin showed a red failed run, and
+ * both were faithfully reporting the same xcresult.
+ *
+ * Matched on the library's own wording rather than the test name, because the
+ * name is the user's and the wording is the library's. Both the current
+ * "Record mode is on." phrasing and the older bare "Automatically recorded
+ * snapshot" are covered.
+ */
+const SNAPSHOT_RECORDING_RE =
+  /record mode is on|automatically recorded snapshot|re-run .* to (?:assert|test) against the newly-recorded snapshot/i;
+
+export function isSnapshotRecording(failureMessage: string | null): boolean {
+  return failureMessage !== null && SNAPSHOT_RECORDING_RE.test(failureMessage);
+}
+
 /** A verdict is a terminal status that states an actual outcome. */
 export const VERDICT_STATUSES: ReadonlySet<RunStatus> = new Set([
   "passed",
@@ -146,7 +171,19 @@ export interface TestCase {
   runId: string;
   suite: string | null;
   name: string;
-  status: "passed" | "failed" | "skipped" | "expected-failure" | "unknown";
+  /**
+   * `recorded` is ours, not xcodebuild's: a snapshot test that wrote a new
+   * baseline. The library reports those as failures because record mode has
+   * nothing to assert against, so they are reclassified on the way in to keep
+   * a recording run from presenting as a broken one.
+   */
+  status:
+    | "passed"
+    | "failed"
+    | "skipped"
+    | "expected-failure"
+    | "recorded"
+    | "unknown";
   durationMs: number | null;
   failureMessage: string | null;
   target: string | null;

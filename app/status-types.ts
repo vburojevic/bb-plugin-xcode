@@ -57,6 +57,8 @@ export type ChatStatus = {
   recent: RunDto[];
   /** Newest settled, undismissed run — what the banner shows when idle. */
   lastSettled: RunDto | null;
+  /** Snapshot baselines written by this run (record mode), not failures. */
+  recordedSnapshots: number;
   scope: {
     threadId: string;
     path: string;

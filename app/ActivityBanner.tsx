@@ -156,6 +156,7 @@ function RunDetailForRun({ threadId, run }: { threadId: string; run: RunDto }) {
       run={detailed}
       findings={data?.findings ?? []}
       failedTests={data?.failedTests ?? []}
+      recordedSnapshots={data?.recordedSnapshots ?? 0}
     />
   );
 }

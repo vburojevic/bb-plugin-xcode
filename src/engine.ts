@@ -12,6 +12,7 @@
 
 import {
   FINISHING_TIMEOUT_MS,
+  isSnapshotRecording,
   RANK,
   type Run,
   type RunKind,
@@ -559,7 +560,13 @@ export class Engine {
     testCases: readonly {
       suite: string | null;
       name: string;
-      status: "passed" | "failed" | "skipped" | "expected-failure" | "unknown";
+      status:
+        | "passed"
+        | "failed"
+        | "skipped"
+        | "expected-failure"
+        | "recorded"
+        | "unknown";
       durationMs: number | null;
       failureMessage: string | null;
       target: string | null;
@@ -614,14 +621,44 @@ export class Engine {
 
     if (tests && tests.total > 0) {
       target.kind = "test";
+
+      /**
+       * Recording a snapshot baseline is not a failing test.
+       *
+       * swift-snapshot-testing fails every test it records, because in record
+       * mode there is nothing to assert against yet. xcodebuild duly exits
+       * non-zero and the xcresult duly says `failedTests: N` — all truthful,
+       * all misleading. Reclassifying those rows to `recorded` keeps the fact
+       * (the baseline was written, and the message says which file) while
+       * taking it out of the failure count, so a recording run stops being
+       * presented as a broken one. A run that also has REAL assertion
+       * failures still fails on those.
+       */
+      const classified = testCases.map((test) =>
+        test.status === "failed" && isSnapshotRecording(test.failureMessage)
+          ? { ...test, status: "recorded" as const }
+          : test,
+      );
+      const recorded = classified.filter(
+        (test) => test.status === "recorded",
+      ).length;
+      const realFailed = Math.max(0, tests.failed - recorded);
+
       target.testTotal = tests.total;
-      target.testFailed = tests.failed;
+      target.testFailed = realFailed;
       target.testSkipped = tests.skipped;
       target.destination ??= tests.destination;
-      verdict = tests.status; // test outcome outranks the compile phase
+      // test outcome outranks the compile phase — unless every "failure" was
+      // a recording, in which case the suite did what it was asked.
+      verdict =
+        tests.status === "failed" && realFailed === 0 && recorded > 0
+          ? target.warningCount > 0
+            ? "warnings"
+            : "passed"
+          : tests.status;
       this.store.replaceTests(
         target.id,
-        testCases.map((test) => ({ ...test, runId: target.id })),
+        classified.map((test) => ({ ...test, runId: target.id })),
       );
       target.detailed = true;
     }

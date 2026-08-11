@@ -80,7 +80,15 @@ const findingSchema = z.object({
 const testSchema = z.object({
   suite: z.string().nullable(),
   name: z.string(),
-  status: z.enum(["passed", "failed", "skipped", "expected-failure", "unknown"]),
+  /** `recorded` is a snapshot baseline written in record mode — see model.ts. */
+  status: z.enum([
+    "passed",
+    "failed",
+    "skipped",
+    "expected-failure",
+    "recorded",
+    "unknown",
+  ]),
   durationMs: z.number().nullable(),
   failureMessage: z.string().nullable(),
   target: z.string().nullable(),
@@ -215,6 +223,13 @@ export const rpcContract = defineRpcContract({
           worktree: z.string().nullable(),
         })
         .nullable(),
+      /**
+       * Snapshot baselines this run wrote. Reported separately from failures
+       * because swift-snapshot-testing signals a recording BY failing the
+       * test — counting those as failures made a successful recording run
+       * present as a broken one.
+       */
+      recordedSnapshots: z.number(),
       /** Error findings for the pinned/relevant run when it has problems. */
       findings: z.array(findingSchema),
       /** Failed tests for the pinned/relevant run. */

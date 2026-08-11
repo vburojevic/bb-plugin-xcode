@@ -320,6 +320,78 @@ describe("bundle folding (verified rank)", () => {
     expect(store.listFindings(run.id)).toHaveLength(1);
   });
 
+  /**
+   * thr_yivibempsv / r:66968: the agent reported "build succeeded and all
+   * verified"; the plugin showed a red failed run. Both were reporting the
+   * same xcresult truthfully — swift-snapshot-testing fails every test it
+   * records, because record mode has nothing to assert against yet.
+   */
+  it("does not call a snapshot recording run failed", () => {
+    engine.foldSnapshot(
+      [activity({ kind: "test", args: "xcodebuild -scheme Demo test" })],
+      1_000_000,
+    );
+    retire(1_000_000);
+    engine.foldBundle(
+      "/b/rec.xcresult",
+      { ...build, status: "passed" },
+      { ...tests, total: 1, passed: 0, failed: 1 },
+      [
+        {
+          suite: "DSComponentSnapshotTests",
+          name: "testLocationCard()",
+          status: "failed",
+          durationMs: 840,
+          failureMessage:
+            "Record mode is on. Automatically recorded snapshot: … Turn record mode off and re-run to assert against the newly-recorded snapshot",
+          target: "OttoDesignSystemTests",
+        },
+      ],
+      1_010_000,
+    );
+    const run = store.listRuns({})[0]!;
+    // `warnings` is a SUCCESS state here — the compile phase carried warnings.
+    // The invariant is that a recording run is never presented as failed.
+    expect(["passed", "warnings"]).toContain(run.status);
+    expect(run.testFailed).toBe(0);
+    expect(store.listTests(run.id)[0]!.status).toBe("recorded");
+  });
+
+  it("still fails when a real assertion failed alongside a recording", () => {
+    engine.foldSnapshot(
+      [activity({ kind: "test", args: "xcodebuild -scheme Demo test" })],
+      1_000_000,
+    );
+    retire(1_000_000);
+    engine.foldBundle(
+      "/b/mixed.xcresult",
+      { ...build, status: "passed" },
+      { ...tests, total: 2, passed: 0, failed: 2 },
+      [
+        {
+          suite: "DSComponentSnapshotTests",
+          name: "testLocationCard()",
+          status: "failed",
+          durationMs: 840,
+          failureMessage: "Record mode is on. Automatically recorded snapshot: …",
+          target: "OttoDesignSystemTests",
+        },
+        {
+          suite: "DemoTests",
+          name: "testReal()",
+          status: "failed",
+          durationMs: 12,
+          failureMessage: "XCTAssertEqual failed: (3) is not equal to (4)",
+          target: "DemoTests",
+        },
+      ],
+      1_010_000,
+    );
+    const run = store.listRuns({})[0]!;
+    expect(run.status).toBe("failed");
+    expect(run.testFailed).toBe(1); // the recording is not counted against it
+  });
+
   it("test outcome outranks the compile phase of the same bundle", () => {
     engine.foldSnapshot(
       [activity({ kind: "test", args: "xcodebuild -scheme Demo test" })],

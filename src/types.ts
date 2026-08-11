@@ -107,7 +107,19 @@ export interface TestRow {
   suite: string | null;
   name: string;
   identifier: string | null;
-  status: "passed" | "failed" | "skipped" | "expected-failure" | "unknown";
+  /**
+   * `recorded` is ours, not xcodebuild's: a snapshot test that wrote a new
+   * baseline. The library reports those as failures because record mode has
+   * nothing to assert against, so they are reclassified on the way in to keep
+   * a recording run from presenting as a broken one.
+   */
+  status:
+    | "passed"
+    | "failed"
+    | "skipped"
+    | "expected-failure"
+    | "recorded"
+    | "unknown";
   durationMs: number | null;
   failureMessage: string | null;
   target: string | null;

@@ -25,11 +25,14 @@ export function RunDetail({
   run,
   findings,
   failedTests,
+  recordedSnapshots = 0,
   active,
 }: {
   run: RunDto;
   findings: ChatStatus["findings"];
   failedTests: ChatStatus["failedTests"];
+  /** Baselines written in record mode — an outcome, not a failure. */
+  recordedSnapshots?: number;
   active?: RunDto[];
 }) {
   const live = isLive(run);
@@ -101,7 +104,10 @@ export function RunDetail({
         ) : null}
       </dl>
 
-      {run.errorCount > 0 || run.warningCount > 0 || testsBadge ? (
+      {run.errorCount > 0 ||
+      run.warningCount > 0 ||
+      recordedSnapshots > 0 ||
+      testsBadge ? (
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
           {run.errorCount > 0 ? (
             <Chip
@@ -129,6 +135,13 @@ export function RunDetail({
               cls={testsBadge.cls}
               icon={(run.testFailed ?? 0) > 0 ? "CircleX" : "CircleCheck"}
               label={testsBadge.label}
+            />
+          ) : null}
+          {recordedSnapshots > 0 ? (
+            <Chip
+              cls="bbx-status-run"
+              icon="Layers"
+              label={`${recordedSnapshots} snapshot${recordedSnapshots === 1 ? "" : "s"} recorded`}
             />
           ) : null}
           {(run.testSkipped ?? 0) > 0 ? (

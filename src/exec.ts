@@ -32,6 +32,11 @@ export function run(
       [...args],
       {
         timeout: options.timeoutMs ?? 10_000,
+        // SIGKILL, not the default SIGTERM. Measured at load average 795, a
+        // `ps -A` blocked in the kernel ignored SIGTERM and held the call for
+        // over two minutes — fifteen times its own timeout — which is exactly
+        // when the probe must NOT be stuck. A timeout has to be a timeout.
+        killSignal: "SIGKILL",
         maxBuffer: options.maxBuffer ?? 32 * 1024 * 1024,
         cwd: options.cwd,
         encoding: "utf8",

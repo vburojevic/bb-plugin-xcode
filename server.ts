@@ -49,6 +49,14 @@ import {
  */
 const FINDING_LIMIT = 40;
 
+/**
+ * Share of wall-clock the process probe may consume. A tick costing 40s is
+ * followed by an 80s pause, so the probe never exceeds a third of one core's
+ * worth of the machine's attention no matter how slow `ps` becomes.
+ */
+const PROBE_DUTY_FACTOR = 2;
+const PROBE_MAX_SLEEP_MS = 60_000;
+
 export default async function plugin(bb: BbPluginApi): Promise<void> {
   const settings = bb.settings.define({
     scanIntervalSeconds: {
@@ -580,6 +588,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
                 target: finding.target,
               }))
           : [],
+        recordedSnapshots: run
+          ? store.listTests(run.id).filter((test) => test.status === "recorded")
+              .length
+          : 0,
         failedTests: problems
           ? store
               .listTests(run.id)
@@ -634,7 +646,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       let pendingVerdicts = false;
 
       let failures = 0;
+      let backedOff = false;
       while (!signal.aborted) {
+        const tickStartedAt = Date.now();
         try {
           const changed = await collector.probeTick(Date.now(), signal);
           // A sweep can run for a minute; without these re-checks a reload
@@ -661,12 +675,43 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           failures = Math.min(failures + 1, 5);
           log.warn(`probe tick failed: ${String(error)}`);
         }
-        await sleep(
+        /**
+         * Sleep proportionally to what the tick just cost.
+         *
+         * The old rule backed off only on thrown errors, so a tick that
+         * SUCCEEDED slowly reset the counter and slept the flat 2s interval.
+         * On a machine at load average 795 — four parallel snapshot suites and
+         * a pile of orphaned simulator runtimes — a single `ps -A` took tens
+         * of seconds, so the probe ran a ~100% duty cycle against a host that
+         * could least afford it, and its own handlers were measured at 38.3s.
+         * The plugin then goes `degraded`, which deactivates its frontend and
+         * makes the activity row vanish: starved by the very builds it exists
+         * to report on.
+         *
+         * Holding the probe to a fixed share of wall-clock makes it
+         * self-limiting — the busier the machine, the quieter the plugin gets,
+         * with no threshold to tune and no health check to get wrong.
+         */
+        const elapsed = Date.now() - tickStartedAt;
+        const cooldown =
           failures > 0
-            ? Math.min(current.scanIntervalMs * 2 ** failures, 60_000)
-            : current.scanIntervalMs,
-          signal,
-        );
+            ? Math.min(current.scanIntervalMs * 2 ** failures, PROBE_MAX_SLEEP_MS)
+            : Math.min(
+                Math.max(current.scanIntervalMs, elapsed * PROBE_DUTY_FACTOR),
+                PROBE_MAX_SLEEP_MS,
+              );
+        if (cooldown > current.scanIntervalMs && failures === 0) {
+          if (!backedOff) {
+            backedOff = true;
+            log.info(
+              `probe tick took ${elapsed}ms; backing off to ${cooldown}ms while the host is loaded`,
+            );
+          }
+        } else if (backedOff && failures === 0) {
+          backedOff = false;
+          log.info("probe tick back to normal cadence");
+        }
+        await sleep(cooldown, signal);
       }
     },
   });
