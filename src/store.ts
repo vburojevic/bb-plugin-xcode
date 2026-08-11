@@ -146,6 +146,7 @@ export const MIGRATIONS: readonly string[] = [
   `ALTER TABLE run ADD COLUMN worktree TEXT`,
   `ALTER TABLE run ADD COLUMN thread_id TEXT`,
   `CREATE INDEX IF NOT EXISTS run_thread_idx ON run (thread_id) WHERE thread_id IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS run_typical_idx ON run (root, scheme, kind, started_at DESC)`,
 ];
 
 /** Minimal structural type for the better-sqlite3 handle the host provides. */
@@ -665,6 +666,22 @@ export class Store {
       .prepare(`DELETE FROM run WHERE started_at < ?`)
       .run(cutoff) as { changes?: number };
     return result?.changes ?? 0;
+  }
+
+  /**
+   * Delete finding/test_case rows whose run no longer exists. `prune` deletes
+   * children of runs it is about to delete, but rows orphaned by any other
+   * path (crashes mid-write, pre-fix data) accumulated forever — measured at
+   * 16k child rows against 404 runs.
+   */
+  pruneOrphans(): number {
+    const findings = this.db
+      .prepare(`DELETE FROM finding WHERE run_id NOT IN (SELECT id FROM run)`)
+      .run() as { changes?: number };
+    const tests = this.db
+      .prepare(`DELETE FROM test_case WHERE run_id NOT IN (SELECT id FROM run)`)
+      .run() as { changes?: number };
+    return (findings?.changes ?? 0) + (tests?.changes ?? 0);
   }
 
   trends(projectId: string | null, sinceMs: number): {

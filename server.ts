@@ -113,6 +113,15 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   let current = await readSettings();
 
+  /**
+   * Retention bookkeeping. Persisted so a string of short-lived instances
+   * (dev reloads) does not re-prune on every boot; 0 when never pruned, which
+   * makes the first probe pass after load prune immediately — the cron-only
+   * schedule below fires at 04:23 and on a laptop that mostly never happens.
+   */
+  let lastPruneAt = (await bb.storage.kv.get<number>("last-prune-at")) ?? 0;
+  const OPPORTUNISTIC_PRUNE_MS = 6 * 3_600_000;
+
   let disposed = false;
   /** Aborted on dispose: stops tailing live builds without killing them. */
   const detachRuns = new AbortController();
@@ -133,6 +142,26 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       bb.realtime.publish(XCODE_CHANNEL, payload ?? { at: Date.now() });
     },
   );
+
+  /**
+   * Coalesced state-change publish. Every bare publish means each open panel
+   * refetches the full overview, and several sources fire in bursts (a probe
+   * tick, a sweep and a scope backfill can all land within one second).
+   * Collapsing them to at most one publish per 300ms bounds that
+   * amplification without a subscriber ever seeing stale state for longer
+   * than the throttle. The live-progress publish keeps its own payload path.
+   */
+  let publishTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastPublishAt = 0;
+  const publishSoon = (): void => {
+    if (disposed || publishTimer) return;
+    const wait = Math.max(0, 300 - (Date.now() - lastPublishAt));
+    publishTimer = setTimeout(() => {
+      publishTimer = null;
+      lastPublishAt = Date.now();
+      publish();
+    }, wait);
+  };
 
   /**
    * Logging carries the same guard, and for a sharper reason: `bb.log` throws
@@ -221,7 +250,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     await bb.storage.kv.set("manifest-race-backfill", true);
     if (requeued > 0) {
       log.info(`re-queued ${requeued} manifest entries stranded by the fold race`);
-      detach(() => collector.fullScan().then((changed) => changed && publish()));
+      detach(() => collector.fullScan(Date.now(), detachRuns.signal).then((changed) => changed && publishSoon()));
     }
   }
 
@@ -244,7 +273,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     await bb.storage.kv.set("snapshot-verdict-backfill", true);
     if (requeued > 0) {
       log.info(`re-queued ${requeued} result bundle(s) after the record-mode fix`);
-      detach(() => collector.fullScan().then((changed) => changed && publish()));
+      detach(() => collector.fullScan(Date.now(), detachRuns.signal).then((changed) => changed && publishSoon()));
     }
   }
 
@@ -282,6 +311,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           ...(afterSeq ? { afterSeq } : {}),
           limit: "1000",
         });
+        // A reload can land between pages; the next bb.sdk call and the
+        // engine/kv writes below would then touch a stale handle.
+        if (disposed) return;
         const typed = batch as unknown as ThreadEventLike[];
         rows.push(...typed);
         if (typed.length < 1000) break;
@@ -304,8 +336,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           log.debug(`thread task verdict consumed: ${outcome.taskId}`);
         }
       }
+      if (disposed) return;
       if (processed) await persistProcessedThreadTasks();
-      if (changed) publish();
+      if (changed) publishSoon();
     } catch (error: unknown) {
       log.debug(`thread task reconciliation failed (${threadId}): ${String(error)}`);
     } finally {
@@ -349,7 +382,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   }
 
   settings.onChange(async () => {
-    current = await readSettings();
+    if (disposed) return;
+    const next = await readSettings();
+    if (disposed) return;
+    current = next;
     collector.updateSettings(current);
   });
 
@@ -396,11 +432,17 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     scopeResolvedAt.set(threadId, now);
     try {
       const thread = await bb.sdk.threads.get({ threadId });
+      if (disposed) return null;
       const environmentId =
         (thread as { environmentId?: string | null }).environmentId ?? null;
       if (!environmentId) return null;
       const env = await bb.sdk.environments.get({ environmentId });
+      // This runs detached from thread events and bounded-awaited from agent
+      // tools; either way a reload can land mid-flight, and the store/publish
+      // below belong to the fresh instance then.
+      if (disposed) return null;
       if (!env.path) return null;
+      const before = scopes.get(threadId);
       scopes.upsert(
         {
           threadId,
@@ -420,8 +462,19 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       );
       // The banner reads the thread's runs on every publish, so a late claim
       // surfaces on its own — no prompt, no turn spent, nothing to retry.
-      if (backfilled > 0) publish();
-      return scopes.get(threadId);
+      // A newly resolved (or moved) scope also publishes: chatStatus now
+      // answers from cache and kicks this refresh detached, so the publish is
+      // what tells the panel its scope just became known.
+      const resolved = scopes.get(threadId);
+      if (
+        backfilled > 0 ||
+        !before ||
+        before.path !== resolved?.path ||
+        before.branch !== (resolved?.branch ?? null)
+      ) {
+        publishSoon();
+      }
+      return resolved;
     } catch (error: unknown) {
       log.debug(`thread scope resolve failed (${threadId}): ${String(error)}`);
       return null;
@@ -450,6 +503,59 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   });
 
   // ------------------------------------------------------------------ DTOs
+
+  /**
+   * Shim install state, cached. `isShimInstalled` reads the shim script off
+   * disk; `overview` is the panel's polling endpoint and must not do fs I/O
+   * per call. Served from cache, refreshed detached when stale; the install/
+   * uninstall CLI paths update it directly since they just learned the truth.
+   */
+  let shimInstalled: boolean | null = null;
+  let shimCheckedAt = 0;
+  const shimInstalledCached = (): boolean => {
+    const now = Date.now();
+    if (now - shimCheckedAt > 60_000) {
+      shimCheckedAt = now;
+      detach(async () => {
+        const value = await isShimInstalled(dataDir);
+        if (disposed) return;
+        const changedValue = value !== shimInstalled;
+        shimInstalled = value;
+        if (changedValue) publishSoon();
+      });
+    }
+    return shimInstalled ?? false;
+  };
+
+  /**
+   * Memo for `typicalDurationMs`. `overview` maps up to 100 runs to DTOs and
+   * each one cost a SQL aggregate; distinct (root, scheme, kind) triples
+   * number a handful, so a 10s memo turns ~100 queries per call into ~5.
+   */
+  const typicalMemo = new Map<string, { at: number; value: number | null }>();
+  const typicalFor = (run: Run): number | null => {
+    const key = `${run.root}|${run.scheme}|${run.kind}`;
+    const now = Date.now();
+    const hit = typicalMemo.get(key);
+    if (hit && now - hit.at < 10_000) return hit.value;
+    const value = store.typicalDurationMs({
+      root: run.root,
+      scheme: run.scheme,
+      kind: run.kind,
+    });
+    if (typicalMemo.size > 500) typicalMemo.clear();
+    typicalMemo.set(key, { at: now, value });
+    return value;
+  };
+
+  // Warm both caches off the handler path. Overview answers optimistically
+  // until these land; the publish corrects any panel that asked too early.
+  shimInstalledCached();
+  detach(async () => {
+    const available = await collector.isXcodeAvailable();
+    if (disposed) return;
+    if (!available) publishSoon();
+  });
 
   const projectNames = new Map<string, string>();
   const refreshProjectNames = (): void => {
@@ -507,11 +613,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     // What a run of this shape usually costs here, so the row can show a real
     // fraction instead of an indeterminate sweep. Null until there are enough
     // successful samples to call anything "usual".
-    typicalMs: store.typicalDurationMs({
-      root: run.root,
-      scheme: run.scheme,
-      kind: run.kind,
-    }),
+    typicalMs: typicalFor(run),
   });
 
   // ------------------------------------------------------------------- RPC
@@ -535,9 +637,13 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         projects: [...unique.values()],
         rootCount: store.listRoots().length,
         lastScanAt: collector.getLastScanAt(),
-        xcodeAvailable: await collector.isXcodeAvailable(),
+        // Sync cache only. Awaiting the resolve here spawned a cold `xcrun
+        // --find` inside the RPC handler — the measured 1.69s overview right
+        // after a reload. Optimistic `true` until the detached resolve lands
+        // (it publishes, so the panel refetches the real answer).
+        xcodeAvailable: collector.xcodeAvailableSync() ?? true,
         shimActive:
-          (await isShimInstalled(dataDir)) &&
+          shimInstalledCached() &&
           (process.env.PATH ?? "").includes(shim.binDir),
         simulators: collector.getBootedSimulators(),
       };
@@ -571,12 +677,16 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       return store.trends(input.projectId ?? null, since);
     },
 
-    async chatStatus({ threadId, runId }) {
+    chatStatus({ threadId, runId }) {
       refreshProjectNames();
 
       let scope: ThreadScope | null = null;
       if (threadId) {
-        scope = scopes.get(threadId) ?? (await refreshThreadScope(threadId, false));
+        // Cached only — a scope miss used to cost two inline bb.sdk calls per
+        // chatStatus, and the UI polls this endpoint. The detached refresh
+        // publishes when the scope resolves, which makes the panel re-ask.
+        scope = scopes.get(threadId);
+        if (!scope) detach(() => refreshThreadScope(threadId, false));
       }
       const scopeDto = scope
         ? {
@@ -676,7 +786,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     async dismissRun({ runId }) {
       dismissedRuns.add(runId);
       await persistDismissedRuns();
-      publish();
+      publishSoon();
       return { ok: true };
     },
 
@@ -685,7 +795,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       // bundle plus a sync JSON.parse of tens of MB — far too slow to hold an
       // RPC handler (and the shared event loop) open for.
       detach(async () => {
-        if (await collector.fullScan(Date.now(), detachRuns.signal)) publish();
+        if (await collector.fullScan(Date.now(), detachRuns.signal)) publishSoon();
       });
       return { ok: true, rootCount: store.listRoots().length };
     },
@@ -699,7 +809,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       await collector.fullScan(Date.now(), signal).catch((error: unknown) => {
         log.warn(`initial scan failed: ${String(error)}`);
       });
-      publish();
+      if (signal.aborted) return;
+      publishSoon();
 
       let sinceSweep = 0;
       // The moment a run leaves `running`, sweep soon after: the log store and
@@ -715,7 +826,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           // A sweep can run for a minute; without these re-checks a reload
           // mid-sweep lets the publish below fire on a disposed handle.
           if (signal.aborted) break;
-          if (changed) publish();
+          if (changed) publishSoon();
 
           const open = engine.hasOpenRuns();
           sinceSweep += current.scanIntervalMs;
@@ -726,10 +837,20 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
             sinceSweep = 0;
             const swept = await collector.fullScan(Date.now(), signal);
             if (signal.aborted) break;
-            if (swept) publish();
+            if (swept) publishSoon();
             pendingVerdicts = engine.hasOpenRuns();
           } else if (open) {
             pendingVerdicts = true;
+          }
+          // Opportunistic retention: the 04:23 cron only fires if bb happens
+          // to be awake then, which on this machine it never was — the db held
+          // fourteen MONTHS of runs against a 30-day retention setting. The
+          // probe loop is already background work, so piggyback on it.
+          if (Date.now() - lastPruneAt > OPPORTUNISTIC_PRUNE_MS) {
+            lastPruneAt = Date.now();
+            detach(runPrune, (error) =>
+              log.warn(`opportunistic prune failed: ${String(error)}`),
+            );
           }
           failures = 0;
         } catch (error: unknown) {
@@ -784,24 +905,36 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     // schedule only triggers the sweep; the collector owns its lifetime.
     detach(
       async () => {
-        if (await collector.fullScan(Date.now(), detachRuns.signal)) publish();
+        if (await collector.fullScan(Date.now(), detachRuns.signal)) publishSoon();
       },
       (error) => log.warn(`scheduled discovery failed: ${String(error)}`),
     );
   });
 
-  bb.background.schedule("prune", "23 4 * * *", async () => {
-    await pruneShimBundles(dataDir, current.retentionDays * 86_400_000, Date.now());
-    const cutoff = Date.now() - current.retentionDays * 86_400_000;
+  const runPrune = async (): Promise<void> => {
+    if (disposed) return;
+    const now = Date.now();
+    lastPruneAt = now;
+    await pruneShimBundles(dataDir, current.retentionDays * 86_400_000, now);
+    if (disposed) return;
+    const cutoff = now - current.retentionDays * 86_400_000;
     const removed = store.prune(cutoff);
+    const orphans = store.pruneOrphans();
     // Roots were never pruned (stale ones make every sweep slower forever),
     // and the WAL was never checkpointed — the visible "4.8MB db" was 82% WAL.
     db.prepare(`DELETE FROM root WHERE last_seen_at < ?`).run(cutoff);
     db.prepare(`PRAGMA wal_checkpoint(TRUNCATE)`).get();
-    if (removed > 0) {
-      log.info(`pruned ${removed} run(s) past retention`);
-      publish();
+    await bb.storage.kv.set("last-prune-at", now);
+    if (removed > 0 || orphans > 0) {
+      log.info(`pruned ${removed} run(s) and ${orphans} orphaned row(s) past retention`);
+      publishSoon();
     }
+  };
+
+  bb.background.schedule("prune", "23 4 * * *", () => {
+    // Detached like discover: pruning a large backlog plus a WAL checkpoint
+    // is real work, and schedule callbacks are measured as handlers.
+    detach(runPrune, (error) => log.warn(`scheduled prune failed: ${String(error)}`));
   });
 
   // ------------------------------------------------------------------- CLI
@@ -924,7 +1057,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           // a 60s timeout per bundle, and holding the CLI handler open for
           // that is what put xcode on perf-watch's slow-handler list.
           detach(async () => {
-            if (await collector.fullScan(Date.now(), detachRuns.signal)) publish();
+            if (await collector.fullScan(Date.now(), detachRuns.signal)) publishSoon();
           });
           return {
             exitCode: 0,
@@ -1074,7 +1207,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
             Date.now(),
           );
           await collector.fullScan(Date.now(), detachRuns.signal);
-          publish();
+          if (disposed) return;
+          publishSoon();
           log.info(
             `wrapped build ${describeExit(result.exitCode, result.signal)}: ${result.bundlePath}`,
           );
@@ -1127,6 +1261,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     switch (action) {
       case "install": {
         await installShim(dataDir);
+        shimInstalled = true;
+        shimCheckedAt = Date.now();
         return {
           exitCode: 0,
           stdout:
@@ -1139,6 +1275,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       }
       case "uninstall": {
         const removed = await uninstallShim(dataDir);
+        shimInstalled = false;
+        shimCheckedAt = Date.now();
         return {
           exitCode: 0,
           stdout: removed
@@ -1175,6 +1313,25 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   // ----------------------------------------------------------- agent tools
 
+  /**
+   * Scope for an agent tool call: cached when known, otherwise one refresh
+   * bounded to 800ms. Unlike chatStatus (polled, so it can answer scope-less
+   * and let the publish-driven refetch fill it in), a tool call is a single
+   * question — waiting a beat for the right scope is worth it, but waiting on
+   * a slow SDK round-trip under load is how this plugin ended up on the
+   * slow-handler list. On timeout the refresh keeps running detached and the
+   * tool answers unscoped, saying so.
+   */
+  const scopeBounded = async (threadId: string): Promise<ThreadScope | null> => {
+    const cached = scopes.get(threadId);
+    if (cached) return cached;
+    const refresh = refreshThreadScope(threadId, false);
+    return await Promise.race([
+      refresh,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 800)),
+    ]);
+  };
+
   const agentInstructions =
     "When an Xcode build or test is needed, prefer `bb xcode run -- xcodebuild …` so bb can track it with a result bundle and a real pass/fail verdict. " +
     "Use xcode_status instead of parsing build logs when checking whether a run passed. " +
@@ -1204,9 +1361,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     }),
     async execute({ limit, machineWide }, { threadId }) {
       refreshProjectNames();
-      const scope = machineWide
-        ? null
-        : (scopes.get(threadId) ?? (await refreshThreadScope(threadId, false)));
+      const scope = machineWide ? null : await scopeBounded(threadId);
       // `machineWide` is the caller's explicit request; an unresolvable thread
       // scope is not a licence to answer for the whole machine.
       const inScope = scopeFilter<Run>(scope, machineWide);
@@ -1250,9 +1405,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     }),
     async execute({ projectId, machineWide }, { threadId }) {
       refreshProjectNames();
-      const scope = machineWide
-        ? null
-        : (scopes.get(threadId) ?? (await refreshThreadScope(threadId, false)));
+      const scope = machineWide ? null : await scopeBounded(threadId);
       const failed = store
         .listRuns({ projectId: projectId ?? null, onlyProblems: true, limit: 25 })
         .filter((run) => !scope || runMatchesScope(run, scope))[0];
@@ -1272,6 +1425,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     log.debug("xcode tracker disposed");
     unsubscribeThreadChanges();
     disposed = true;
+    if (publishTimer) {
+      clearTimeout(publishTimer);
+      publishTimer = null;
+    }
     detachRuns.abort();
   });
 }

@@ -172,6 +172,16 @@ export class Collector {
     return (await this.resolveTool()) !== null;
   }
 
+  /**
+   * The already-known answer, without spawning anything. `null` means the
+   * first `xcrun --find` has not completed yet. Handlers must use this: the
+   * async form can cost a cold ~300-1700ms xcrun spawn, which is exactly the
+   * inline work an RPC handler on the shared event loop must never do.
+   */
+  xcodeAvailableSync(): boolean | null {
+    return this.xcresultTool === undefined ? null : this.xcresultTool !== null;
+  }
+
   private toolPromise: Promise<string | null> | undefined;
 
   private resolveTool(): Promise<string | null> {
