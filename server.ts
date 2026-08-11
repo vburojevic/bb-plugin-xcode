@@ -15,7 +15,12 @@ import { XCODE_CHANNEL } from "./src/channel";
 import { rpcContract } from "./src/contract";
 import { Collector, type CollectorProject } from "./src/collector";
 import { Engine } from "./src/engine";
-import { durationMs, isNoiseRun, type Run } from "./src/model";
+import {
+  durationMs,
+  isNoiseRun,
+  VERDICT_STATUSES,
+  type Run,
+} from "./src/model";
 import { describeExit, runWrapped } from "./src/runner";
 import {
   installShim,
@@ -576,9 +581,26 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       // back to the one before would answer a question nobody asked: a run
       // older than the one you just cleared is, by definition, staler news,
       // and it would take a dozen clicks to get an empty card.
-      // Noise excluded here, not just in the UI: a `-find` lookup taking this
-      // slot would suppress the real result rather than merely appear.
-      const newest = settled.find((run) => !isNoiseRun(run)) ?? null;
+      /**
+       * The newest run that actually CONCLUDED something.
+       *
+       * `ended` is the verdict-less terminal state — the run started, it
+       * stopped, and no source ever said how it went. Showing that as the
+       * thread's last result puts "— no result" in the prompt stack, which
+       * tells nobody anything and reads like a failure. Skipping to the last
+       * run we can actually speak for is strictly more informative, and if
+       * there is none the card simply stays away.
+       *
+       * The underlying gap is worth naming: `bb xcode shim` exists precisely
+       * to capture a real exit code and result bundle for every invocation,
+       * and it reports "on PATH: no" — so script-launched builds fall back to
+       * inference, and when Xcode also writes no log entry there is nothing
+       * left to infer from.
+       */
+      const newest =
+        settled.find(
+          (run) => !isNoiseRun(run) && VERDICT_STATUSES.has(run.status),
+        ) ?? null;
       const lastSettled =
         newest && !dismissedRuns.has(newest.id) ? newest : null;
 
