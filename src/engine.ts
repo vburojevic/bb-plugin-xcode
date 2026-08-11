@@ -594,6 +594,23 @@ export class Engine {
     const key = `bundle:${bundlePath}:${target.id}`;
     if (!this.store.markSeen(key, now)) return false;
 
+    /**
+     * Re-reading an artifact this run already recorded is the SAME authority
+     * speaking again — not a second source contradicting the first.
+     *
+     * The rank lattice refuses same-rank terminal flips, and it is right to:
+     * that rule is what stops the probe, the manifest and a bundle fighting
+     * over one run. But it also froze verdicts this plugin had itself derived
+     * WRONGLY, so fixing the interpretation could never repair the rows the
+     * bug produced. A recording run stayed red forever, on screen, as the
+     * thread's latest result.
+     *
+     * A re-read is narrow and safe: it requires the run to already carry this
+     * exact bundle path, and it only happens when the seen key was explicitly
+     * cleared. Nothing else gains the right to overwrite a verified verdict.
+     */
+    const reread = target.bundlePath === bundlePath;
+
     target.bundlePath = bundlePath;
 
     if (build) {
@@ -673,10 +690,11 @@ export class Engine {
     if (
       verdict &&
       VERDICT_STATUSES.has(verdict) &&
-      statusTransitionAllowed(
-        { status: target.status, rank: target.statusRank },
-        { status: verdict, rank: RANK.verified },
-      )
+      (reread ||
+        statusTransitionAllowed(
+          { status: target.status, rank: target.statusRank },
+          { status: verdict, rank: RANK.verified },
+        ))
     ) {
       target.status = verdict;
       target.statusRank = RANK.verified;

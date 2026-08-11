@@ -392,6 +392,89 @@ describe("bundle folding (verified rank)", () => {
     expect(run.testFailed).toBe(1); // the recording is not counted against it
   });
 
+  /**
+   * The lattice refuses same-rank terminal flips so sources cannot fight over
+   * a run — but that also froze verdicts this plugin had derived WRONGLY, so
+   * fixing the interpretation could never repair the rows the bug produced.
+   * A recording run stayed red on screen as its thread's latest result.
+   * Re-reading the SAME artifact is the same authority speaking again.
+   */
+  it("lets a re-read of the same bundle correct its own earlier verdict", () => {
+    engine.foldSnapshot(
+      [activity({ kind: "test", args: "xcodebuild -scheme Demo test" })],
+      1_000_000,
+    );
+    retire(1_000_000);
+    const recording = [
+      {
+        suite: "DSComponentSnapshotTests",
+        name: "testLocationCard()",
+        status: "failed" as const,
+        durationMs: 840,
+        failureMessage: "Record mode is on. Automatically recorded snapshot: …",
+        target: "OttoDesignSystemTests",
+      },
+    ];
+
+    // First read, pre-fix behaviour: the recording counted as a failure.
+    engine.foldBundle(
+      "/b/same.xcresult",
+      { ...build, status: "passed" },
+      { ...tests, total: 1, passed: 0, failed: 1 },
+      [{ ...recording[0]!, failureMessage: "XCTAssertEqual failed" }],
+      1_010_000,
+    );
+    const runId = store.listRuns({})[0]!.id;
+    expect(store.getRun(runId)!.status).toBe("failed");
+
+    // Re-read after the fix — same bundle, same run.
+    store.clearSeen(`bundle:/b/same.xcresult:${runId}`);
+    engine.foldBundle(
+      "/b/same.xcresult",
+      { ...build, status: "passed" },
+      { ...tests, total: 1, passed: 0, failed: 1 },
+      recording,
+      1_020_000,
+    );
+    expect(store.getRun(runId)!.status).not.toBe("failed");
+    expect(store.getRun(runId)!.testFailed).toBe(0);
+  });
+
+  it("does not let a DIFFERENT bundle overwrite a verified verdict", () => {
+    engine.foldSnapshot(
+      [activity({ kind: "test", args: "xcodebuild -scheme Demo test" })],
+      1_000_000,
+    );
+    retire(1_000_000);
+    engine.foldBundle(
+      "/b/first.xcresult",
+      { ...build, status: "passed" },
+      { ...tests, total: 1, passed: 0, failed: 1 },
+      [
+        {
+          suite: "DemoTests",
+          name: "testReal()",
+          status: "failed" as const,
+          durationMs: 10,
+          failureMessage: "XCTAssertEqual failed",
+          target: "DemoTests",
+        },
+      ],
+      1_010_000,
+    );
+    const runId = store.listRuns({})[0]!.id;
+    expect(store.getRun(runId)!.status).toBe("failed");
+
+    engine.foldBundle(
+      "/b/second.xcresult",
+      { ...build, status: "passed" },
+      { ...tests, total: 1, passed: 1, failed: 0, status: "passed" },
+      [],
+      1_020_000,
+    );
+    expect(store.getRun(runId)!.status).toBe("failed"); // still the real failure
+  });
+
   it("test outcome outranks the compile phase of the same bundle", () => {
     engine.foldSnapshot(
       [activity({ kind: "test", args: "xcodebuild -scheme Demo test" })],

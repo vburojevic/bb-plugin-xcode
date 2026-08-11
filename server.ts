@@ -219,6 +219,29 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     }
   }
 
+  /**
+   * One-time repair for verdicts this plugin derived wrongly from a bundle.
+   *
+   * Snapshot recordings were counted as test failures, so recording runs were
+   * frozen at `failed` at rank `verified` — the one rank nothing could
+   * correct. Clearing a day of bundle keys lets those xcresults be re-read
+   * with the fixed interpretation, and `foldBundle` now permits an artifact to
+   * revise its own earlier conclusion. A day, not a week, because each re-read
+   * spawns `xcresulttool` and this runs on whatever machine the user is
+   * already building on.
+   */
+  if (!(await bb.storage.kv.get<boolean>("snapshot-verdict-backfill"))) {
+    const day = Date.now() - 24 * 3_600_000;
+    const requeued =
+      store.clearSeenSince("bundle:", day) +
+      store.clearSeenSince("bundle-scanned:", day);
+    await bb.storage.kv.set("snapshot-verdict-backfill", true);
+    if (requeued > 0) {
+      log.info(`re-queued ${requeued} result bundle(s) after the record-mode fix`);
+      detach(() => collector.fullScan().then((changed) => changed && publish()));
+    }
+  }
+
   // ------------------------------------------------ thread command verdicts
   //
   // Provider background commands have a launcher completion and a later task

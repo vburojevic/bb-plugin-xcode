@@ -341,7 +341,19 @@ export class Collector {
     for (const run of runs) {
       if (!run.bundlePath) continue;
       claimers.set(run.bundlePath, run);
-      if (!run.detailed) candidates.add(run.bundlePath);
+      // `detailed` means "we already extracted its contents", which is not the
+      // same question as "has this bundle been scanned". The seen key is the
+      // authority on the latter, and keeping them separate is what lets a
+      // deliberate re-queue actually re-read: a one-time repair that clears
+      // the key was otherwise silently skipped here for every run that had
+      // parsed successfully — i.e. exactly the ones a wrong interpretation
+      // had already ruined.
+      if (
+        !run.detailed ||
+        !this.deps.store.hasSeen(`bundle-scanned:${run.bundlePath}`)
+      ) {
+        candidates.add(run.bundlePath);
+      }
     }
     for (const { path: root } of this.deps.store.listRoots()) {
       for (const bundle of await findTestResultBundles(root)) {
