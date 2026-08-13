@@ -136,29 +136,116 @@ export async function listShimBundles(dataDir: string): Promise<string[]> {
 }
 
 /**
- * Delete bundles older than `maxAgeMs`.
+ * How long result bundles are kept, and how much room they may take.
  *
- * Result bundles are not small and one is produced per build, so an
- * uncollected directory would grow without bound on an active machine.
+ * These are NOT the run-history retention, and conflating them was a real
+ * hazard: history is rows, measured in kilobytes, and a month of it is cheap.
+ * A result bundle is a directory tree — a build's is a few MB, a test run's
+ * with attachments is routinely hundreds — and one is produced per `build`,
+ * `test`, `archive` and `analyze` on the machine. Pointing a month of run
+ * retention at them meant following this plugin's own README could quietly
+ * cost tens of gigabytes.
+ *
+ * They are also worth much less than history: everything the tracker needs is
+ * extracted into the database on the first sweep. A bundle only has to outlive
+ * the gap between the build finishing and the sweep reading it, plus enough
+ * slack to survive a bb restart. Two days is generous for that.
+ */
+export interface BundleRetention {
+  maxAgeMs: number;
+  /** Ceiling on the whole bundle directory; oldest are evicted first. */
+  maxTotalBytes: number;
+}
+
+export interface BundlePruneResult {
+  removed: number;
+  bytesFreed: number;
+  /** Bytes still held after pruning, for the log line. */
+  bytesRetained: number;
+}
+
+/** Recursive size of a directory tree, resilient to a build writing into it. */
+async function treeSize(path: string): Promise<number> {
+  let total = 0;
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > 12) return;
+    let entries: Array<{ name: string; isDirectory: boolean }>;
+    try {
+      entries = (await readdir(dir, { withFileTypes: true })).map((entry) => ({
+        name: entry.name,
+        isDirectory: entry.isDirectory(),
+      }));
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const child = join(dir, entry.name);
+      if (entry.isDirectory) {
+        await walk(child, depth + 1);
+        continue;
+      }
+      try {
+        total += (await stat(child)).size;
+      } catch {
+        /* vanished mid-walk */
+      }
+    }
+  };
+  await walk(path, 0);
+  return total;
+}
+
+/**
+ * Enforce both halves of `BundleRetention`: age first, then the size budget.
+ *
+ * Age alone is not enough. A single afternoon of snapshot-test runs can blow
+ * past any sane disk budget well inside the age window, and "your disk filled
+ * up but the retention setting was respected" is not a defence.
  */
 export async function pruneShimBundles(
   dataDir: string,
-  maxAgeMs: number,
+  retention: BundleRetention,
   now: number,
-): Promise<number> {
-  let removed = 0;
+): Promise<BundlePruneResult> {
+  const result: BundlePruneResult = {
+    removed: 0,
+    bytesFreed: 0,
+    bytesRetained: 0,
+  };
+
+  const surviving: Array<{ path: string; mtimeMs: number; size: number }> = [];
   for (const bundle of await listShimBundles(dataDir)) {
     try {
       const info = await stat(bundle);
-      if (now - info.mtimeMs > maxAgeMs) {
+      const size = await treeSize(bundle);
+      if (now - info.mtimeMs > retention.maxAgeMs) {
         await rm(bundle, { recursive: true, force: true });
-        removed += 1;
+        result.removed += 1;
+        result.bytesFreed += size;
+        continue;
       }
+      surviving.push({ path: bundle, mtimeMs: info.mtimeMs, size });
     } catch {
       // Racing with a build that is still writing; leave it alone.
     }
   }
-  return removed;
+
+  // Oldest first, so the budget evicts the least useful bundles.
+  surviving.sort((a, b) => a.mtimeMs - b.mtimeMs);
+  let held = surviving.reduce((sum, entry) => sum + entry.size, 0);
+  for (const entry of surviving) {
+    if (held <= retention.maxTotalBytes) break;
+    try {
+      await rm(entry.path, { recursive: true, force: true });
+      held -= entry.size;
+      result.removed += 1;
+      result.bytesFreed += entry.size;
+    } catch {
+      /* leave it and try again next prune */
+    }
+  }
+  result.bytesRetained = held;
+  return result;
 }
 
 /** The shell line a user adds to make the shim take effect. */

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A push that lands while an older run of the same ref is still going makes
+# that run's verdict irrelevant; cancel it rather than pay for both.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # ubuntu, deliberately: the suite is pure parsing and an in-memory SQLite,
+    # with every `ps`/`xcrun`/`xcresulttool` call injected as fixture text. It
+    # must stay that way, and a Linux runner is what proves it still is.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

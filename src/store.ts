@@ -9,6 +9,7 @@
  */
 
 import type { Finding, Rank, Run, RunKind, RunStatus, TestCase } from "./model";
+import { MIGRATIONS as SIMULATOR_MIGRATIONS } from "./sim/store";
 
 export const MIGRATIONS: readonly string[] = [
   // ---- v1 (frozen; never edit) -------------------------------------------
@@ -147,16 +148,62 @@ export const MIGRATIONS: readonly string[] = [
   `ALTER TABLE run ADD COLUMN thread_id TEXT`,
   `CREATE INDEX IF NOT EXISTS run_thread_idx ON run (thread_id) WHERE thread_id IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS run_typical_idx ON run (root, scheme, kind, started_at DESC)`,
+  /**
+   * Bundle path is an identity, so look runs up by it.
+   *
+   * Three call sites used to answer "which run owns this bundle?" by scanning
+   * the newest 50-100 runs and comparing in JS. A build that outlives that
+   * window — a long test suite on a machine where agents are also building —
+   * fell out of it, and then: the wrapped exit's verdict was dropped, the
+   * bundle fold lost its by-path preference, and the sweep no longer knew the
+   * bundle's producer was still `running`, so it parsed a half-written bundle
+   * and spent its corrupt-bundle retry budget on it.
+   */
+  `CREATE INDEX IF NOT EXISTS run_bundle_idx ON run (bundle_path) WHERE bundle_path IS NOT NULL`,
+
+  // ---- Simulators (frozen from here down) ---------------------------------
+  // Spliced in, never interleaved. `bb.storage.migrate` applies statements by
+  // index across the whole plugin, so the Simulators half cannot own its own
+  // array — its statements live in `src/sim/store.ts` for readability and are
+  // appended here, after everything above, permanently.
+  ...SIMULATOR_MIGRATIONS,
 ];
+
+/**
+ * Escape a value for use as a LIKE prefix pattern.
+ *
+ * `_` is a single-character wildcard in SQL LIKE, and it is an ordinary and
+ * common character in a checkout path (`env_q29t…`, `my_project`). Without
+ * escaping, scoping a thread to `/w/my_project` also matched `/w/myXproject`.
+ */
+export function likePrefix(base: string): string {
+  return `${base.replace(/[\\%_]/g, (char) => `\\${char}`)}/%`;
+}
+
+/** A compiled statement, as better-sqlite3 hands them back. */
+export interface Statement {
+  run(...params: unknown[]): unknown;
+  get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
+}
 
 /** Minimal structural type for the better-sqlite3 handle the host provides. */
 export interface Db {
-  prepare(sql: string): {
-    run(...params: unknown[]): unknown;
-    get(...params: unknown[]): unknown;
-    all(...params: unknown[]): unknown[];
-  };
+  prepare(sql: string): Statement;
   transaction<T extends (...args: never[]) => unknown>(fn: T): T;
+}
+
+/**
+ * A run's scope: the thread that owns a checkout, and the checkout itself.
+ *
+ * Mirrors `runMatchesScope` in `scopes.ts` — deliberately, because the two must
+ * agree. This is the SQL half, used to filter BEFORE the limit; that one is the
+ * in-memory half, used on collections we already hold.
+ */
+export interface RunScope {
+  threadId: string;
+  path: string;
+  branch: string | null;
 }
 
 interface RunRowRaw {
@@ -221,96 +268,150 @@ function toRun(raw: RunRowRaw): Run {
 
 /** All reads and writes go through this class; the engine is its only writer. */
 export class Store {
+  /**
+   * Compiled statements, keyed by their SQL text.
+   *
+   * better-sqlite3 compiles on every `prepare` — it keeps no cache of its own.
+   * This class prepared inside each method, so the hot paths recompiled their
+   * SQL on every call: `hasSeen`/`markSeen` once per manifest entry and once
+   * per bundle candidate on every sweep, `getRun`/`updateRun` once per fold,
+   * `listUnresolved` twice per probe tick. Keying on the text means the
+   * dynamically-built queries below cache per *shape*, of which there are a
+   * handful.
+   */
+  private readonly compiled = new Map<string, Statement>();
+
   constructor(private readonly db: Db) {}
 
+  private sql(text: string): Statement {
+    let statement = this.compiled.get(text);
+    if (!statement) {
+      statement = this.db.prepare(text);
+      this.compiled.set(text, statement);
+    }
+    return statement;
+  }
+
   insertRun(run: Run): void {
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO run (
-           id, status, status_rank, kind, scheme, container, configuration,
-           destination, project_id, root, cwd, pid, cmdline, started_at,
-           ended_at, error_count, warning_count, analyzer_count, test_total,
-           test_failed, test_skipped, bundle_path, detailed, branch, worktree,
-           thread_id
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      )
-      .run(
-        run.id,
-        run.status,
-        run.statusRank,
-        run.kind,
-        run.scheme,
-        run.container,
-        run.configuration,
-        run.destination,
-        run.projectId,
-        run.root,
-        run.cwd,
-        run.pid,
-        run.cmdline,
-        run.startedAt,
-        run.endedAt,
-        run.errorCount,
-        run.warningCount,
-        run.analyzerCount,
-        run.testTotal,
-        run.testFailed,
-        run.testSkipped,
-        run.bundlePath,
-        run.detailed ? 1 : 0,
-        run.branch,
-        run.worktree,
-        run.threadId,
-      );
+    this.sql(
+      `INSERT OR IGNORE INTO run (
+         id, status, status_rank, kind, scheme, container, configuration,
+         destination, project_id, root, cwd, pid, cmdline, started_at,
+         ended_at, error_count, warning_count, analyzer_count, test_total,
+         test_failed, test_skipped, bundle_path, detailed, branch, worktree,
+         thread_id
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      run.id,
+      run.status,
+      run.statusRank,
+      run.kind,
+      run.scheme,
+      run.container,
+      run.configuration,
+      run.destination,
+      run.projectId,
+      run.root,
+      run.cwd,
+      run.pid,
+      run.cmdline,
+      run.startedAt,
+      run.endedAt,
+      run.errorCount,
+      run.warningCount,
+      run.analyzerCount,
+      run.testTotal,
+      run.testFailed,
+      run.testSkipped,
+      run.bundlePath,
+      run.detailed ? 1 : 0,
+      run.branch,
+      run.worktree,
+      run.threadId,
+    );
   }
 
   getRun(id: string): Run | null {
-    const raw = this.db.prepare(`SELECT * FROM run WHERE id = ?`).get(id) as
+    const raw = this.sql(`SELECT * FROM run WHERE id = ?`).get(id) as
       | RunRowRaw
       | undefined;
     return raw ? toRun(raw) : null;
   }
 
+  /**
+   * The run that owns a result bundle.
+   *
+   * A bundle path is an identity — one run declares it via `-resultBundlePath`
+   * and no other run can claim it — so this is a point lookup against
+   * `run_bundle_idx`, not a scan of whatever happens to be recent. `ORDER BY`
+   * only settles the pathological case of pre-index duplicates.
+   */
+  getRunByBundlePath(bundlePath: string): Run | null {
+    const raw = this.sql(
+      `SELECT * FROM run WHERE bundle_path = ? ORDER BY started_at DESC LIMIT 1`,
+    ).get(bundlePath) as RunRowRaw | undefined;
+    return raw ? toRun(raw) : null;
+  }
+
+  /**
+   * Bundles a run has claimed but that have not been read yet.
+   *
+   * `detailed` means "we extracted its contents"; the `bundle-scanned:` key
+   * means "we looked at it". They are different questions, and keeping them
+   * separate is what lets a deliberate re-queue actually re-read. Answered in
+   * SQL so a long build's bundle cannot age out of a fixed window.
+   */
+  listUnscannedBundlePaths(limit = 500): string[] {
+    const rows = this.sql(
+      `SELECT bundle_path AS path, MAX(started_at) AS at FROM run
+        WHERE bundle_path IS NOT NULL
+          AND (detailed = 0
+               OR NOT EXISTS (SELECT 1 FROM seen_artifact s
+                               WHERE s.key = 'bundle-scanned:' || run.bundle_path))
+        GROUP BY bundle_path
+        ORDER BY at DESC LIMIT ?`,
+    ).all(limit) as Array<{ path: string }>;
+    return rows.map((row) => row.path);
+  }
+
   updateRun(run: Run): void {
-    this.db
-      .prepare(
-        `UPDATE run SET
-           status = ?, status_rank = ?, kind = ?, scheme = ?, container = ?,
-           configuration = ?, destination = ?, project_id = ?, root = ?,
-           cwd = ?, cmdline = ?, started_at = ?, ended_at = ?, error_count = ?,
-           warning_count = ?, analyzer_count = ?, test_total = ?,
-           test_failed = ?, test_skipped = ?, bundle_path = ?, detailed = ?,
-           branch = COALESCE(?, branch), worktree = COALESCE(?, worktree),
-           thread_id = COALESCE(?, thread_id)
-         WHERE id = ?`,
-      )
-      .run(
-        run.status,
-        run.statusRank,
-        run.kind,
-        run.scheme,
-        run.container,
-        run.configuration,
-        run.destination,
-        run.projectId,
-        run.root,
-        run.cwd,
-        run.cmdline,
-        run.startedAt,
-        run.endedAt,
-        run.errorCount,
-        run.warningCount,
-        run.analyzerCount,
-        run.testTotal,
-        run.testFailed,
-        run.testSkipped,
-        run.bundlePath,
-        run.detailed ? 1 : 0,
-        run.branch,
-        run.worktree,
-        run.threadId,
-        run.id,
-      );
+    this.sql(
+      `UPDATE run SET
+         status = ?, status_rank = ?, kind = ?, scheme = ?, container = ?,
+         configuration = ?, destination = ?, project_id = ?, root = ?,
+         cwd = ?, cmdline = ?, started_at = ?, ended_at = ?, error_count = ?,
+         warning_count = ?, analyzer_count = ?, test_total = ?,
+         test_failed = ?, test_skipped = ?, bundle_path = ?, detailed = ?,
+         branch = COALESCE(?, branch), worktree = COALESCE(?, worktree),
+         thread_id = COALESCE(?, thread_id)
+       WHERE id = ?`,
+    ).run(
+      run.status,
+      run.statusRank,
+      run.kind,
+      run.scheme,
+      run.container,
+      run.configuration,
+      run.destination,
+      run.projectId,
+      run.root,
+      run.cwd,
+      run.cmdline,
+      run.startedAt,
+      run.endedAt,
+      run.errorCount,
+      run.warningCount,
+      run.analyzerCount,
+      run.testTotal,
+      run.testFailed,
+      run.testSkipped,
+      run.bundlePath,
+      run.detailed ? 1 : 0,
+      run.branch,
+      run.worktree,
+      run.threadId,
+      run.id,
+    );
   }
 
   /**
@@ -321,14 +422,13 @@ export class Store {
   attributeRunsToThread(threadId: string, path: string, since: number): number {
     const base = path.endsWith("/") ? path.slice(0, -1) : path;
     if (!base) return 0;
-    const prefix = `${base}/%`;
-    const result = this.db
-      .prepare(
-        `UPDATE run SET thread_id = ?
-          WHERE thread_id IS NULL AND started_at >= ?
-            AND (cwd = ? OR cwd LIKE ? OR container = ? OR container LIKE ?)`,
-      )
-      .run(threadId, since, base, prefix, base, prefix) as { changes?: number };
+    const prefix = likePrefix(base);
+    const result = this.sql(
+      `UPDATE run SET thread_id = ?
+        WHERE thread_id IS NULL AND started_at >= ?
+          AND (cwd = ? OR cwd LIKE ? ESCAPE '\\'
+               OR container = ? OR container LIKE ? ESCAPE '\\')`,
+    ).run(threadId, since, base, prefix, base, prefix) as { changes?: number };
     return result?.changes ?? 0;
   }
 
@@ -337,6 +437,14 @@ export class Store {
     kind?: RunKind | null;
     onlyProblems?: boolean;
     includeNoise?: boolean;
+    /** Runs attributed to exactly this thread when they were observed. */
+    threadId?: string | null;
+    /**
+     * Restrict to one thread's checkout. Applied in SQL, BEFORE the limit:
+     * filtering afterwards meant a thread whose newest run sat outside the
+     * machine-wide top 100 got an empty answer rather than its own history.
+     */
+    scope?: RunScope | null;
     limit?: number;
     offset?: number;
   }): Run[] {
@@ -359,14 +467,21 @@ export class Store {
     if (query.onlyProblems) {
       where.push("(status = 'failed' OR error_count > 0 OR test_failed > 0)");
     }
+    if (query.threadId) {
+      where.push("thread_id = ?");
+      params.push(query.threadId);
+    }
+    if (query.scope) {
+      const clause = scopeClause(query.scope);
+      where.push(clause.sql);
+      params.push(...clause.params);
+    }
     const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
     const limit = Math.min(Math.max(query.limit ?? 100, 1), 500);
     const offset = Math.max(query.offset ?? 0, 0);
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM run ${clause} ORDER BY started_at DESC LIMIT ? OFFSET ?`,
-      )
-      .all(...params, limit, offset) as RunRowRaw[];
+    const rows = this.sql(
+      `SELECT * FROM run ${clause} ORDER BY started_at DESC LIMIT ? OFFSET ?`,
+    ).all(...params, limit, offset) as RunRowRaw[];
     return rows.map(toRun);
   }
 
@@ -389,15 +504,13 @@ export class Store {
     kind: RunKind;
   }): number | null {
     if (!query.root || !query.scheme) return null;
-    const rows = this.db
-      .prepare(
-        `SELECT (ended_at - started_at) AS ms FROM run
-          WHERE root = ? AND scheme = ? AND kind = ?
-            AND ended_at IS NOT NULL
-            AND status IN ('passed', 'warnings')
-          ORDER BY started_at DESC LIMIT 20`,
-      )
-      .all(query.root, query.scheme, query.kind) as Array<{ ms: number }>;
+    const rows = this.sql(
+      `SELECT (ended_at - started_at) AS ms FROM run
+        WHERE root = ? AND scheme = ? AND kind = ?
+          AND ended_at IS NOT NULL
+          AND status IN ('passed', 'warnings')
+        ORDER BY started_at DESC LIMIT 20`,
+    ).all(query.root, query.scheme, query.kind) as Array<{ ms: number }>;
 
     const samples = rows
       .map((row) => row.ms)
@@ -424,20 +537,34 @@ export class Store {
       params.push(query.kind);
     }
     const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-    const row = this.db
-      .prepare(`SELECT COUNT(*) AS n FROM run ${clause}`)
-      .get(...params) as { n: number };
+    const row = this.sql(`SELECT COUNT(*) AS n FROM run ${clause}`).get(
+      ...params,
+    ) as { n: number };
     return row?.n ?? 0;
   }
 
   listUnresolved(): Run[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM run WHERE status IN ('running','finishing')
-          ORDER BY started_at DESC`,
-      )
-      .all() as RunRowRaw[];
+    const rows = this.sql(
+      `SELECT * FROM run WHERE status IN ('running','finishing')
+        ORDER BY started_at DESC`,
+    ).all() as RunRowRaw[];
     return rows.map(toRun);
+  }
+
+  /**
+   * Is anything still running or awaiting a verdict?
+   *
+   * The probe asks this every tick, and it used to be answered by fetching
+   * every unresolved row and mapping it to a `Run` just to read `.length` —
+   * alongside `expireFinishing`, which fetches the same rows for real. This is
+   * the question actually being asked.
+   */
+  hasUnresolved(): boolean {
+    return Boolean(
+      this.sql(
+        `SELECT 1 FROM run WHERE status IN ('running','finishing') LIMIT 1`,
+      ).get(),
+    );
   }
 
   /**
@@ -451,22 +578,20 @@ export class Store {
    * verified verdict; the filter's only job is candidacy, not protection.
    */
   findVerdictCandidates(aroundMs: number, slackMs: number): Run[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM run
-          WHERE status_rank < 2
-            AND kind NOT IN ('index','package')
-            AND started_at <= ?
-            AND COALESCE(ended_at, started_at + ?) >= ?
-          ORDER BY started_at DESC LIMIT 20`,
-      )
-      .all(aroundMs + slackMs, slackMs, aroundMs - slackMs) as RunRowRaw[];
+    const rows = this.sql(
+      `SELECT * FROM run
+        WHERE status_rank < 2
+          AND kind NOT IN ('index','package')
+          AND started_at <= ?
+          AND COALESCE(ended_at, started_at + ?) >= ?
+        ORDER BY started_at DESC LIMIT 20`,
+    ).all(aroundMs + slackMs, slackMs, aroundMs - slackMs) as RunRowRaw[];
     return rows.map(toRun);
   }
 
   replaceFindings(runId: string, findings: Finding[]): void {
-    this.db.prepare(`DELETE FROM finding WHERE run_id = ?`).run(runId);
-    const insert = this.db.prepare(
+    this.sql(`DELETE FROM finding WHERE run_id = ?`).run(runId);
+    const insert = this.sql(
       `INSERT INTO finding (run_id, severity, message, file_path, line, target)
        VALUES (?,?,?,?,?,?)`,
     );
@@ -483,13 +608,12 @@ export class Store {
   }
 
   listFindings(runId: string): Finding[] {
-    return this.db
-      .prepare(
-        `SELECT run_id, severity, message, file_path, line, target
-           FROM finding WHERE run_id = ?
-          ORDER BY CASE severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
-                   file_path, line`,
-      )
+    return this.sql(
+      `SELECT run_id, severity, message, file_path, line, target
+         FROM finding WHERE run_id = ?
+        ORDER BY CASE severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                 file_path, line`,
+    )
       .all(runId)
       .map((raw) => {
         const row = raw as {
@@ -512,8 +636,8 @@ export class Store {
   }
 
   replaceTests(runId: string, tests: TestCase[]): void {
-    this.db.prepare(`DELETE FROM test_case WHERE run_id = ?`).run(runId);
-    const insert = this.db.prepare(
+    this.sql(`DELETE FROM test_case WHERE run_id = ?`).run(runId);
+    const insert = this.sql(
       `INSERT INTO test_case (run_id, suite, name, status, duration_ms, failure_message, target)
        VALUES (?,?,?,?,?,?,?)`,
     );
@@ -531,12 +655,11 @@ export class Store {
   }
 
   listTests(runId: string): TestCase[] {
-    return this.db
-      .prepare(
-        `SELECT run_id, suite, name, status, duration_ms, failure_message, target
-           FROM test_case WHERE run_id = ?
-          ORDER BY CASE status WHEN 'failed' THEN 0 ELSE 1 END, suite, name`,
-      )
+    return this.sql(
+      `SELECT run_id, suite, name, status, duration_ms, failure_message, target
+         FROM test_case WHERE run_id = ?
+        ORDER BY CASE status WHEN 'failed' THEN 0 ELSE 1 END, suite, name`,
+    )
       .all(runId)
       .map((raw) => {
         const row = raw as {
@@ -560,24 +683,28 @@ export class Store {
       });
   }
 
+  /** How many tests of a run carry each status, without loading the rows. */
+  countTestsByStatus(runId: string, status: TestCase["status"]): number {
+    const row = this.sql(
+      `SELECT COUNT(*) AS n FROM test_case WHERE run_id = ? AND status = ?`,
+    ).get(runId, status) as { n: number } | undefined;
+    return row?.n ?? 0;
+  }
+
   upsertRoot(
     path: string,
     projectId: string | null,
     via: string,
     now: number,
   ): boolean {
-    const existed = this.db
-      .prepare(`SELECT 1 FROM root WHERE path = ?`)
-      .get(path);
-    this.db
-      .prepare(
-        `INSERT INTO root (path, project_id, discovered_via, first_seen_at, last_seen_at)
-         VALUES (?,?,?,?,?)
-         ON CONFLICT(path) DO UPDATE SET
-           last_seen_at = excluded.last_seen_at,
-           project_id = COALESCE(root.project_id, excluded.project_id)`,
-      )
-      .run(path, projectId, via, now, now);
+    const existed = this.sql(`SELECT 1 FROM root WHERE path = ?`).get(path);
+    this.sql(
+      `INSERT INTO root (path, project_id, discovered_via, first_seen_at, last_seen_at)
+       VALUES (?,?,?,?,?)
+       ON CONFLICT(path) DO UPDATE SET
+         last_seen_at = excluded.last_seen_at,
+         project_id = COALESCE(root.project_id, excluded.project_id)`,
+    ).run(path, projectId, via, now, now);
     return !existed;
   }
 
@@ -588,8 +715,7 @@ export class Store {
     firstSeenAt: number;
     lastSeenAt: number;
   }> {
-    return this.db
-      .prepare(`SELECT * FROM root ORDER BY last_seen_at DESC`)
+    return this.sql(`SELECT * FROM root ORDER BY last_seen_at DESC`)
       .all()
       .map((raw) => {
         const row = raw as {
@@ -615,25 +741,26 @@ export class Store {
    */
   /** Forget artifacts recorded since `since`, so a sweep reconsiders them. */
   clearSeenSince(prefix: string, since: number): number {
-    const result = this.db
-      .prepare(`DELETE FROM seen_artifact WHERE key LIKE ? AND seen_at >= ?`)
-      .run(`${prefix}%`, since) as { changes?: number };
+    const result = this.sql(
+      `DELETE FROM seen_artifact WHERE key LIKE ? AND seen_at >= ?`,
+    ).run(`${prefix}%`, since) as { changes?: number };
     return result?.changes ?? 0;
   }
 
   markSeen(key: string, now: number): boolean {
-    const existed = this.db
-      .prepare(`SELECT 1 FROM seen_artifact WHERE key = ?`)
-      .get(key);
+    const existed = this.sql(`SELECT 1 FROM seen_artifact WHERE key = ?`).get(
+      key,
+    );
     if (existed) return false;
-    this.db
-      .prepare(`INSERT INTO seen_artifact (key, seen_at) VALUES (?, ?)`)
-      .run(key, now);
+    this.sql(`INSERT INTO seen_artifact (key, seen_at) VALUES (?, ?)`).run(
+      key,
+      now,
+    );
     return true;
   }
 
   clearSeen(key: string): void {
-    this.db.prepare(`DELETE FROM seen_artifact WHERE key = ?`).run(key);
+    this.sql(`DELETE FROM seen_artifact WHERE key = ?`).run(key);
   }
 
   /**
@@ -646,25 +773,21 @@ export class Store {
    */
   hasSeen(key: string): boolean {
     return Boolean(
-      this.db.prepare(`SELECT 1 FROM seen_artifact WHERE key = ?`).get(key),
+      this.sql(`SELECT 1 FROM seen_artifact WHERE key = ?`).get(key),
     );
   }
 
   prune(cutoff: number): number {
-    this.db
-      .prepare(
-        `DELETE FROM finding WHERE run_id IN (SELECT id FROM run WHERE started_at < ?)`,
-      )
-      .run(cutoff);
-    this.db
-      .prepare(
-        `DELETE FROM test_case WHERE run_id IN (SELECT id FROM run WHERE started_at < ?)`,
-      )
-      .run(cutoff);
-    this.db.prepare(`DELETE FROM seen_artifact WHERE seen_at < ?`).run(cutoff);
-    const result = this.db
-      .prepare(`DELETE FROM run WHERE started_at < ?`)
-      .run(cutoff) as { changes?: number };
+    this.sql(
+      `DELETE FROM finding WHERE run_id IN (SELECT id FROM run WHERE started_at < ?)`,
+    ).run(cutoff);
+    this.sql(
+      `DELETE FROM test_case WHERE run_id IN (SELECT id FROM run WHERE started_at < ?)`,
+    ).run(cutoff);
+    this.sql(`DELETE FROM seen_artifact WHERE seen_at < ?`).run(cutoff);
+    const result = this.sql(`DELETE FROM run WHERE started_at < ?`).run(
+      cutoff,
+    ) as { changes?: number };
     return result?.changes ?? 0;
   }
 
@@ -675,13 +798,36 @@ export class Store {
    * 16k child rows against 404 runs.
    */
   pruneOrphans(): number {
-    const findings = this.db
-      .prepare(`DELETE FROM finding WHERE run_id NOT IN (SELECT id FROM run)`)
-      .run() as { changes?: number };
-    const tests = this.db
-      .prepare(`DELETE FROM test_case WHERE run_id NOT IN (SELECT id FROM run)`)
-      .run() as { changes?: number };
+    const findings = this.sql(
+      `DELETE FROM finding WHERE run_id NOT IN (SELECT id FROM run)`,
+    ).run() as { changes?: number };
+    const tests = this.sql(
+      `DELETE FROM test_case WHERE run_id NOT IN (SELECT id FROM run)`,
+    ).run() as { changes?: number };
     return (findings?.changes ?? 0) + (tests?.changes ?? 0);
+  }
+
+  /**
+   * Drop roots nothing has referenced since the cutoff.
+   *
+   * A stale root makes every sweep slower forever — it is a directory tree the
+   * collector keeps walking for manifests that will never change again.
+   */
+  pruneRoots(cutoff: number): number {
+    const result = this.sql(`DELETE FROM root WHERE last_seen_at < ?`).run(
+      cutoff,
+    ) as { changes?: number };
+    return result?.changes ?? 0;
+  }
+
+  /**
+   * Fold the write-ahead log back into the database file.
+   *
+   * Without this the WAL grows unbounded between restarts: the visible "4.8MB
+   * db" was measured at 82% WAL.
+   */
+  checkpoint(): void {
+    this.sql(`PRAGMA wal_checkpoint(TRUNCATE)`).get();
   }
 
   trends(projectId: string | null, sinceMs: number): {
@@ -710,14 +856,12 @@ export class Store {
     const params: unknown[] = projectId ? [sinceMs, projectId] : [sinceMs];
 
     const durations = (
-      this.db
-        .prepare(
-          `SELECT started_at, ended_at, status, scheme, kind FROM run
-            WHERE started_at >= ? ${projectClause}
-              AND ended_at IS NOT NULL AND status NOT IN ('running','finishing')
-            ORDER BY started_at ASC LIMIT 500`,
-        )
-        .all(...params) as Array<{
+      this.sql(
+        `SELECT started_at, ended_at, status, scheme, kind FROM run
+          WHERE started_at >= ? ${projectClause}
+            AND ended_at IS NOT NULL AND status NOT IN ('running','finishing')
+          ORDER BY started_at ASC LIMIT 500`,
+      ).all(...params) as Array<{
         started_at: number;
         ended_at: number;
         status: RunStatus;
@@ -733,19 +877,17 @@ export class Store {
     }));
 
     const daily = (
-      this.db
-        .prepare(
-          `SELECT date(started_at / 1000, 'unixepoch', 'localtime') AS day,
-                  COUNT(*) AS total,
-                  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-                  SUM(CASE WHEN status IN ('passed','warnings') THEN 1 ELSE 0 END) AS passed,
-                  AVG(CASE WHEN ended_at IS NOT NULL THEN ended_at - started_at END) AS avg_duration
-             FROM run
-            WHERE started_at >= ? ${projectClause}
-              AND status NOT IN ('running','finishing')
-            GROUP BY day ORDER BY day ASC`,
-        )
-        .all(...params) as Array<{
+      this.sql(
+        `SELECT date(started_at / 1000, 'unixepoch', 'localtime') AS day,
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN status IN ('passed','warnings') THEN 1 ELSE 0 END) AS passed,
+                AVG(CASE WHEN ended_at IS NOT NULL THEN ended_at - started_at END) AS avg_duration
+           FROM run
+          WHERE started_at >= ? ${projectClause}
+            AND status NOT IN ('running','finishing')
+          GROUP BY day ORDER BY day ASC`,
+      ).all(...params) as Array<{
         day: string;
         total: number;
         failed: number;
@@ -760,18 +902,16 @@ export class Store {
       avgDurationMs: row.avg_duration === null ? null : Math.round(row.avg_duration),
     }));
 
-    const flakyTests = this.db
-      .prepare(
-        `SELECT t.name AS name, t.suite AS suite,
-                SUM(CASE WHEN t.status = 'failed' THEN 1 ELSE 0 END) AS failures,
-                COUNT(*) AS runs
-           FROM test_case t JOIN run r ON r.id = t.run_id
-          WHERE r.started_at >= ? ${projectId ? "AND r.project_id = ?" : ""}
-          GROUP BY t.name, t.suite
-         HAVING failures > 0 AND runs > failures
-          ORDER BY failures DESC LIMIT 20`,
-      )
-      .all(...params) as Array<{
+    const flakyTests = this.sql(
+      `SELECT t.name AS name, t.suite AS suite,
+              SUM(CASE WHEN t.status = 'failed' THEN 1 ELSE 0 END) AS failures,
+              COUNT(*) AS runs
+         FROM test_case t JOIN run r ON r.id = t.run_id
+        WHERE r.started_at >= ? ${projectId ? "AND r.project_id = ?" : ""}
+        GROUP BY t.name, t.suite
+       HAVING failures > 0 AND runs > failures
+        ORDER BY failures DESC LIMIT 20`,
+    ).all(...params) as Array<{
       name: string;
       suite: string | null;
       failures: number;
@@ -780,4 +920,44 @@ export class Store {
 
     return { durations, daily, flakyTests };
   }
+}
+
+/**
+ * The SQL half of `runMatchesScope`.
+ *
+ * Kept in lockstep with `scopes.ts` by `test/scopes.test.ts`, which runs the
+ * same fixtures through both. The three arms, weakest last:
+ *
+ *  - the run was attributed to this thread when it was observed;
+ *  - one of its paths sits under the thread's checkout;
+ *  - same checkout NAME and same branch, which rescues a run whose cwd was
+ *    unresolvable (lsof raced the process) without letting every `main` build
+ *    on the machine claim the thread.
+ */
+function scopeClause(scope: RunScope): { sql: string; params: unknown[] } {
+  const base = scope.path.endsWith("/") ? scope.path.slice(0, -1) : scope.path;
+  const prefix = likePrefix(base);
+  const arms = [
+    "thread_id = ?",
+    "cwd = ?",
+    "cwd LIKE ? ESCAPE '\\'",
+    "container = ?",
+    "container LIKE ? ESCAPE '\\'",
+    "root = ?",
+    "root LIKE ? ESCAPE '\\'",
+  ];
+  const params: unknown[] = [
+    scope.threadId,
+    base,
+    prefix,
+    base,
+    prefix,
+    base,
+    prefix,
+  ];
+  if (scope.branch) {
+    arms.push("(worktree = ? AND branch = ?)");
+    params.push(base.slice(base.lastIndexOf("/") + 1), scope.branch);
+  }
+  return { sql: `(${arms.join(" OR ")})`, params };
 }

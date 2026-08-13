@@ -2,58 +2,34 @@
  * Xcode activity tracker — backend, v2.
  *
  * Pure wiring. The rules live in `src/model.ts`, state in `src/store.ts`,
- * reconciliation in `src/engine.ts`, and I/O in `src/collector.ts`.
+ * reconciliation in `src/engine.ts`, I/O in `src/collector.ts`, and each
+ * surface in its own module: `src/cli.ts`, `src/tools.ts`, `src/dto.ts`,
+ * `src/scope-sync.ts`, `src/thread-sync.ts`, `src/wrapped.ts`.
  */
 
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { PLUGIN_CLI_OUTPUT_MAX_BYTES, type BbPluginApi } from "@bb/plugin-sdk";
-import { z } from "zod";
+import type { BbPluginApi } from "@bb/plugin-sdk";
 
 import { XCODE_CHANNEL } from "./src/channel";
+import { CLI_COMMANDS, createCli } from "./src/cli";
 import { rpcContract } from "./src/contract";
 import { Collector, type CollectorProject } from "./src/collector";
+import { DtoMapper } from "./src/dto";
 import { Engine } from "./src/engine";
-import {
-  durationMs,
-  isNoiseRun,
-  VERDICT_STATUSES,
-  type Run,
-} from "./src/model";
-import { describeExit, runWrapped } from "./src/runner";
-import {
-  installShim,
-  isShimInstalled,
-  pathExportLine,
-  pruneShimBundles,
-  shimPaths,
-  uninstallShim,
-} from "./src/shim";
+import { VERDICT_STATUSES } from "./src/model";
+import { createRpcHandlers } from "./src/rpc";
+import { ScopeSync } from "./src/scope-sync";
+import { pruneShimBundles, isShimInstalled } from "./src/shim";
 import { safely, detach } from "./src/safe";
 import { MIGRATIONS, Store, type Db } from "./src/store";
-import { destinationLabel } from "./src/destination";
-import { formatDuration } from "./src/duration";
-import {
-  ThreadScopes,
-  runMatchesScope,
-  scopeFilter,
-  type ThreadScope,
-} from "./src/scopes";
-import {
-  backgroundCommandOutcomes,
-  type ThreadEventLike,
-} from "./src/thread-outcome";
-
-/**
- * Findings and failed tests returned to the activity card.
- *
- * Ten was a card-sized number back when this fed a two-line summary; the
- * disclosure is a scrollable panel and a broken build routinely has more than
- * ten errors, where seeing only the first ten is actively misleading about the
- * scale of the breakage.
- */
-const FINDING_LIMIT = 40;
+import { installSimulators, type SimulatorCliRun } from "./src/sim/wire";
+import { CLI_COMMANDS as SIM_VERBS } from "./src/sim/cli";
+import { SETTINGS_DESCRIPTORS as SIMULATOR_SETTINGS } from "./src/sim/settings";
+import { ThreadSync } from "./src/thread-sync";
+import { AGENT_INSTRUCTIONS, createTools } from "./src/tools";
+import type { WrappedDeps } from "./src/wrapped";
 
 /**
  * Share of wall-clock the process probe may consume. A tick costing 40s is
@@ -62,6 +38,28 @@ const FINDING_LIMIT = 40;
  */
 const PROBE_DUTY_FACTOR = 2;
 const PROBE_MAX_SLEEP_MS = 60_000;
+
+/** Coalescing window for state-change publishes. */
+const PUBLISH_THROTTLE_MS = 300;
+
+const OPPORTUNISTIC_PRUNE_MS = 6 * 3_600_000;
+
+/**
+ * The simulator verbs, as one entry.
+ *
+ * bb validates command names against `[a-z0-9-]+`, so `sim devices` cannot be
+ * registered as a name — and registering twenty `sim-<verb>` entries would bury
+ * the tracker's own six in `bb xcode --help`. One line advertises the prefix,
+ * and `bb xcode sim` with no arguments prints the verb list that
+ * `src/sim/cli.ts` already writes for itself.
+ */
+const SIMULATOR_CLI_COMMANDS = [
+  {
+    name: "sim",
+    summary: "Look at, and touch, an iOS simulator",
+    usage: `bb xcode sim <verb>  (${SIM_VERBS.map((command) => command.name).join(", ")})`,
+  },
+];
 
 export default async function plugin(bb: BbPluginApi): Promise<void> {
   const settings = bb.settings.define({
@@ -75,6 +73,20 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       label: "Keep history for (days)",
       default: "30",
     },
+    bundleRetentionDays: {
+      type: "string",
+      label: "Keep result bundles for (days)",
+      description:
+        "Result bundles are directories, not rows: a test run's can be hundreds of megabytes, and one is written per build. Everything the tracker needs is extracted on the first sweep, so these only have to outlive that.",
+      default: "2",
+    },
+    bundleBudgetGb: {
+      type: "string",
+      label: "Result bundle disk budget (GB)",
+      description:
+        "Hard ceiling on the bundle directory; the oldest are deleted first. Age alone cannot hold a line — an afternoon of snapshot tests can pass any sane budget well inside the age window.",
+      default: "5",
+    },
     scanProjects: {
       type: "boolean",
       label: "Scan project worktrees for DerivedData",
@@ -85,6 +97,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       label: "Extra DerivedData roots (comma separated)",
       default: "",
     },
+    // `bb.settings.define` is one call per plugin, so the Simulators half's
+    // descriptors are spread in here rather than declared where they are read.
+    // The key spaces are disjoint and asserted to be, in `test/sim/merge.test.ts`.
+    ...SIMULATOR_SETTINGS,
   });
 
   const dataDir = join(homedir(), ".bb", "plugins", bb.pluginId);
@@ -92,17 +108,22 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   bb.storage.migrate(db as never, [...MIGRATIONS]);
   const store = new Store(db);
 
+  const positive = (raw: string, fallback: number, max = Infinity): number => {
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? Math.min(value, max) : fallback;
+  };
+
   const readSettings = async () => {
     const values = await settings.get();
     const interval = Number(values.scanIntervalSeconds);
-    const retention = Number(values.retentionDays);
     return {
       scanIntervalMs:
         Number.isFinite(interval) && interval >= 1
           ? Math.min(interval, 60) * 1000
           : 2000,
-      retentionDays:
-        Number.isFinite(retention) && retention >= 1 ? retention : 30,
+      retentionDays: positive(values.retentionDays, 30),
+      bundleRetentionDays: positive(values.bundleRetentionDays, 2),
+      bundleBudgetBytes: positive(values.bundleBudgetGb, 5) * 1024 ** 3,
       scanProjects: values.scanProjects,
       extraRoots: values.extraRoots
         .split(",")
@@ -120,9 +141,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
    * schedule below fires at 04:23 and on a laptop that mostly never happens.
    */
   let lastPruneAt = (await bb.storage.kv.get<number>("last-prune-at")) ?? 0;
-  const OPPORTUNISTIC_PRUNE_MS = 6 * 3_600_000;
 
   let disposed = false;
+  const isDisposed = (): boolean => disposed;
   /** Aborted on dispose: stops tailing live builds without killing them. */
   const detachRuns = new AbortController();
 
@@ -136,12 +157,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
    * re-checks its own abort signal for this reason; the wrapped-build paths
    * had no equivalent and crashed the server on 2026-08-10.
    */
-  const publish = safely(
-    () => disposed,
-    (payload?: Record<string, unknown>) => {
-      bb.realtime.publish(XCODE_CHANNEL, payload ?? { at: Date.now() });
-    },
-  );
+  const publish = safely(isDisposed, (payload?: Record<string, unknown>) => {
+    bb.realtime.publish(XCODE_CHANNEL, payload ?? { at: Date.now() });
+  });
 
   /**
    * Coalesced state-change publish. Every bare publish means each open panel
@@ -155,7 +173,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   let lastPublishAt = 0;
   const publishSoon = (): void => {
     if (disposed || publishTimer) return;
-    const wait = Math.max(0, 300 - (Date.now() - lastPublishAt));
+    const wait = Math.max(0, PUBLISH_THROTTLE_MS - (Date.now() - lastPublishAt));
     publishTimer = setTimeout(() => {
       publishTimer = null;
       lastPublishAt = Date.now();
@@ -170,10 +188,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
    * this plugin calls `bb.log` directly.
    */
   const log = {
-    debug: safely(() => disposed, (m: string) => bb.log.debug(m)),
-    info: safely(() => disposed, (m: string) => bb.log.info(m)),
-    warn: safely(() => disposed, (m: string) => bb.log.warn(m)),
-    error: safely(() => disposed, (m: string) => bb.log.error(m)),
+    debug: safely(isDisposed, (m: string) => bb.log.debug(m)),
+    info: safely(isDisposed, (m: string) => bb.log.info(m)),
+    warn: safely(isDisposed, (m: string) => bb.log.warn(m)),
+    error: safely(isDisposed, (m: string) => bb.log.error(m)),
   };
 
   const listProjects = async (): Promise<CollectorProject[]> => {
@@ -191,39 +209,25 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     return out;
   };
 
-  const scopes = new ThreadScopes();
-
-  const processedThreadTasks = new Set(
-    (await bb.storage.kv.get<string[]>("processed-thread-tasks")) ?? [],
-  );
-
-  /**
-   * Runs the user has dismissed from the activity banner.
-   *
-   * The banner keeps the last settled run on screen so "how did that go"
-   * outlives the build itself; this is the other half of that contract — an
-   * explicit way to say "seen it". Persisted, because a dismissal that came
-   * back on the next window reload would be worse than no dismissal at all.
-   */
-  const dismissedRuns = new Set(
-    (await bb.storage.kv.get<string[]>("dismissed-runs")) ?? [],
-  );
-  const persistDismissedRuns = async (): Promise<void> => {
-    const retained = [...dismissedRuns].slice(-500);
-    if (retained.length !== dismissedRuns.size) {
-      dismissedRuns.clear();
-      for (const id of retained) dismissedRuns.add(id);
-    }
-    await bb.storage.kv.set("dismissed-runs", retained);
-  };
+  // ------------------------------------------------------------------ core
 
   // Engine and collector reference each other (engine asks the collector for
   // project attribution); a late-bound holder breaks the cycle for TS.
   let collectorRef: Collector | null = null;
+  const scopeSync = new ScopeSync({
+    store,
+    getThread: (threadId) => bb.sdk.threads.get({ threadId }),
+    getEnvironment: (environmentId) =>
+      bb.sdk.environments.get({ environmentId }),
+    log: (message) => log.debug(message),
+    isDisposed,
+    onChanged: publishSoon,
+  });
+
   const engine: Engine = new Engine(store, {
     projectFor: (signals): string | null =>
       collectorRef ? collectorRef.projectFor(signals) : null,
-    threadFor: (signals): string | null => scopes.threadFor(signals),
+    threadFor: (signals): string | null => scopeSync.scopes.threadFor(signals),
     log: (message) => log.debug(message),
   });
   const collector = new Collector(
@@ -233,118 +237,30 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   collectorRef = collector;
   engine.hydrate(Date.now());
 
-  /**
-   * One-time repair for runs stranded by the manifest consume-too-early race.
-   *
-   * Every manifest entry folded before its run left `running` was marked seen
-   * and never reconsidered, so the run timed out into a permanent verdict-less
-   * `ended`. Handing those entries back lets the next sweep resolve the
-   * history that bug created; folding is idempotent, so the only cost is
-   * re-reading some small plists once.
-   */
-  if (!(await bb.storage.kv.get<boolean>("manifest-race-backfill"))) {
-    const requeued = store.clearSeenSince(
-      "manifest:",
-      Date.now() - 7 * 24 * 3_600_000,
-    );
-    await bb.storage.kv.set("manifest-race-backfill", true);
-    if (requeued > 0) {
-      log.info(`re-queued ${requeued} manifest entries stranded by the fold race`);
-      detach(() => collector.fullScan(Date.now(), detachRuns.signal).then((changed) => changed && publishSoon()));
-    }
-  }
+  const dto = new DtoMapper(store, engine, collector);
 
-  /**
-   * One-time repair for verdicts this plugin derived wrongly from a bundle.
-   *
-   * Snapshot recordings were counted as test failures, so recording runs were
-   * frozen at `failed` at rank `verified` — the one rank nothing could
-   * correct. Clearing a day of bundle keys lets those xcresults be re-read
-   * with the fixed interpretation, and `foldBundle` now permits an artifact to
-   * revise its own earlier conclusion. A day, not a week, because each re-read
-   * spawns `xcresulttool` and this runs on whatever machine the user is
-   * already building on.
-   */
-  if (!(await bb.storage.kv.get<boolean>("snapshot-verdict-backfill"))) {
-    const day = Date.now() - 24 * 3_600_000;
-    const requeued =
-      store.clearSeenSince("bundle:", day) +
-      store.clearSeenSince("bundle-scanned:", day);
-    await bb.storage.kv.set("snapshot-verdict-backfill", true);
-    if (requeued > 0) {
-      log.info(`re-queued ${requeued} result bundle(s) after the record-mode fix`);
-      detach(() => collector.fullScan(Date.now(), detachRuns.signal).then((changed) => changed && publishSoon()));
-    }
-  }
-
-  // ------------------------------------------------ thread command verdicts
-  //
-  // Provider background commands have a launcher completion and a later task
-  // completion. The launcher commonly exits 0 merely because it successfully
-  // backgrounded the command; only the later event contains the real exit.
-  // Fetch complete thread history so a plugin reload between those two events
-  // cannot sever the parentToolCallId link.
-
-  const threadOutcomeInFlight = new Set<string>();
-
-  const persistProcessedThreadTasks = async (): Promise<void> => {
-    const retained = [...processedThreadTasks].slice(-2000);
-    if (retained.length !== processedThreadTasks.size) {
-      processedThreadTasks.clear();
-      for (const id of retained) processedThreadTasks.add(id);
-    }
-    await bb.storage.kv.set("processed-thread-tasks", retained);
-  };
-
-  const reconcileThreadOutcomes = async (threadId: string): Promise<void> => {
-    if (disposed || threadOutcomeInFlight.has(threadId)) return;
-    threadOutcomeInFlight.add(threadId);
-    try {
-      const rows: ThreadEventLike[] = [];
-      let afterSeq: string | undefined;
-      // Histories are chronological and the API has no reverse cursor. Twenty
-      // thousand rows is a generous bound for one coding thread while keeping
-      // a malformed/unbounded history from becoming plugin work forever.
-      for (let page = 0; page < 20; page++) {
-        const batch = await bb.sdk.threads.events.list({
-          threadId,
-          ...(afterSeq ? { afterSeq } : {}),
-          limit: "1000",
-        });
-        // A reload can land between pages; the next bb.sdk call and the
-        // engine/kv writes below would then touch a stale handle.
-        if (disposed) return;
-        const typed = batch as unknown as ThreadEventLike[];
-        rows.push(...typed);
-        if (typed.length < 1000) break;
-        afterSeq = String(typed[typed.length - 1]!.seq);
-      }
-
-      let changed = false;
-      let processed = false;
-      for (const outcome of backgroundCommandOutcomes(rows)) {
-        if (processedThreadTasks.has(outcome.taskId)) continue;
-        if (
-          engine.foldThreadCommandExit(
-            { ...outcome, threadId },
-            Date.now(),
-          )
-        ) {
-          processedThreadTasks.add(outcome.taskId);
-          changed = true;
-          processed = true;
-          log.debug(`thread task verdict consumed: ${outcome.taskId}`);
+  const runRescan = (): void => {
+    detach(
+      async () => {
+        if (await collector.fullScan(Date.now(), detachRuns.signal)) {
+          publishSoon();
         }
-      }
-      if (disposed) return;
-      if (processed) await persistProcessedThreadTasks();
-      if (changed) publishSoon();
-    } catch (error: unknown) {
-      log.debug(`thread task reconciliation failed (${threadId}): ${String(error)}`);
-    } finally {
-      threadOutcomeInFlight.delete(threadId);
-    }
+      },
+      (error) => log.warn(`scan failed: ${String(error)}`),
+    );
   };
+
+  // ------------------------------------------------------ thread reconciling
+
+  const threadSync = new ThreadSync({
+    engine,
+    listEvents: (args) => bb.sdk.threads.events.list(args),
+    kvGet: (key) => bb.storage.kv.get(key),
+    kvSet: (key, value) => bb.storage.kv.set(key, value),
+    log: (message) => log.debug(message),
+    isDisposed,
+    onChanged: publishSoon,
+  });
 
   const unsubscribeThreadChanges = bb.sdk.subscribe({
     event: "thread:changed",
@@ -360,25 +276,24 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       ) {
         return;
       }
-      detach(() => reconcileThreadOutcomes(event.id!));
+      detach(() => threadSync.reconcile(event.id!));
     },
   });
 
   // Backfill recent verdict-less runs, including cards already rendered in an
   // existing thread before this event consumer was installed.
-  const recentOutcomeThreads = new Set(
+  for (const threadId of new Set(
     store
       .listRuns({ limit: 500, includeNoise: true })
       .filter(
         (run) =>
           run.threadId &&
-          !["passed", "warnings", "failed", "cancelled"].includes(run.status) &&
+          !VERDICT_STATUSES.has(run.status) &&
           run.startedAt >= Date.now() - 24 * 3_600_000,
       )
       .map((run) => run.threadId!),
-  );
-  for (const threadId of recentOutcomeThreads) {
-    detach(() => reconcileThreadOutcomes(threadId));
+  )) {
+    detach(() => threadSync.reconcile(threadId));
   }
 
   settings.onChange(async () => {
@@ -395,114 +310,25 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   // when a thread starts a turn, and its environment names the exact checkout
   // any build it launches will run from. Registering that path as a scope
   // lets the probe attribute a new build to its thread on first sighting, and
-  // lets the chat card / agent tools answer for "this thread's build" instead
-  // of the whole machine.
-
-  const scopeResolvedAt = new Map<string, number>();
-
-  /**
-   * How long a resolved scope is trusted before we ask the SDK again, and how
-   * long a FAILED resolve is remembered.
-   *
-   * These have to differ. A brand-new thread is momentarily env-less — the
-   * thread row exists before its environment is attached — and the miss was
-   * being cached for the full 30s alongside genuine successes. Combined with
-   * the old `!scope` filter widening to machine-wide, that gave a fresh thread
-   * a half-minute window in which it confidently showed another worktree's
-   * build. The filter fix makes that window merely empty instead of wrong;
-   * this makes the window short.
-   */
-  const SCOPE_TTL_MS = 30_000;
-  const SCOPE_MISS_TTL_MS = 4_000;
-
-  const refreshThreadScope = async (
-    threadId: string,
-    active: boolean,
-  ): Promise<ThreadScope | null> => {
-    const now = Date.now();
-    const last = scopeResolvedAt.get(threadId) ?? 0;
-    const known = scopes.get(threadId);
-    // Within the throttle window, answer from the registry. A hit is trusted
-    // for the full TTL; a miss is retried far sooner, because "no checkout
-    // yet" and "no checkout ever" look identical here and only one of them
-    // stays true. The long TTL exists so an env-less side chat does not cost
-    // two SDK calls per event.
-    if (now - last < (known ? SCOPE_TTL_MS : SCOPE_MISS_TTL_MS)) return known;
-    if (scopeResolvedAt.size > 1000) scopeResolvedAt.clear();
-    scopeResolvedAt.set(threadId, now);
-    try {
-      const thread = await bb.sdk.threads.get({ threadId });
-      if (disposed) return null;
-      const environmentId =
-        (thread as { environmentId?: string | null }).environmentId ?? null;
-      if (!environmentId) return null;
-      const env = await bb.sdk.environments.get({ environmentId });
-      // This runs detached from thread events and bounded-awaited from agent
-      // tools; either way a reload can land mid-flight, and the store/publish
-      // below belong to the fresh instance then.
-      if (disposed) return null;
-      if (!env.path) return null;
-      const before = scopes.get(threadId);
-      scopes.upsert(
-        {
-          threadId,
-          projectId: env.projectId ?? null,
-          environmentId,
-          path: env.path,
-          branch: env.branchName ?? null,
-          active,
-        },
-        Date.now(),
-      );
-      // A build the probe saw before this scope existed: claim it now.
-      const backfilled = store.attributeRunsToThread(
-        threadId,
-        env.path,
-        Date.now() - 6 * 3_600_000,
-      );
-      // The banner reads the thread's runs on every publish, so a late claim
-      // surfaces on its own — no prompt, no turn spent, nothing to retry.
-      // A newly resolved (or moved) scope also publishes: chatStatus now
-      // answers from cache and kicks this refresh detached, so the publish is
-      // what tells the panel its scope just became known.
-      const resolved = scopes.get(threadId);
-      if (
-        backfilled > 0 ||
-        !before ||
-        before.path !== resolved?.path ||
-        before.branch !== (resolved?.branch ?? null)
-      ) {
-        publishSoon();
-      }
-      return resolved;
-    } catch (error: unknown) {
-      log.debug(`thread scope resolve failed (${threadId}): ${String(error)}`);
-      return null;
-    }
-  };
+  // lets the banner / agent tools answer for "this thread's build" instead of
+  // the whole machine.
 
   bb.events.on("thread.active", ({ thread }) => {
-    const existing = scopes.get(thread.id);
-    if (existing) {
-      scopes.upsert({ ...existing, active: true }, Date.now());
-    }
-    detach(() => refreshThreadScope(thread.id, true));
-    scopes.prune(Date.now());
+    scopeSync.markActive(thread.id);
+    detach(() => scopeSync.refresh(thread.id, true));
   });
-  bb.events.on("thread.idle", ({ thread }) => {
-    scopes.deactivate(thread.id, Date.now());
-  });
-  bb.events.on("thread.failed", ({ thread }) => {
-    scopes.deactivate(thread.id, Date.now());
-  });
+  bb.events.on("thread.idle", ({ thread }) => scopeSync.deactivate(thread.id));
+  bb.events.on("thread.failed", ({ thread }) => scopeSync.deactivate(thread.id));
   bb.events.on("thread.archived", ({ thread }) => {
-    scopes.remove(thread.id);
+    scopeSync.remove(thread.id);
+    threadSync.forget(thread.id);
   });
   bb.events.on("thread.deleted", ({ thread }) => {
-    scopes.remove(thread.id);
+    scopeSync.remove(thread.id);
+    threadSync.forget(thread.id);
   });
 
-  // ------------------------------------------------------------------ DTOs
+  // -------------------------------------------------------------- shim state
 
   /**
    * Shim install state, cached. `isShimInstalled` reads the shim script off
@@ -512,6 +338,12 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
    */
   let shimInstalled: boolean | null = null;
   let shimCheckedAt = 0;
+  const onShimStateKnown = (installed: boolean): void => {
+    const changed = installed !== shimInstalled;
+    shimInstalled = installed;
+    shimCheckedAt = Date.now();
+    if (changed) publishSoon();
+  };
   const shimInstalledCached = (): boolean => {
     const now = Date.now();
     if (now - shimCheckedAt > 60_000) {
@@ -519,33 +351,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       detach(async () => {
         const value = await isShimInstalled(dataDir);
         if (disposed) return;
-        const changedValue = value !== shimInstalled;
-        shimInstalled = value;
-        if (changedValue) publishSoon();
+        onShimStateKnown(value);
       });
     }
     return shimInstalled ?? false;
-  };
-
-  /**
-   * Memo for `typicalDurationMs`. `overview` maps up to 100 runs to DTOs and
-   * each one cost a SQL aggregate; distinct (root, scheme, kind) triples
-   * number a handful, so a 10s memo turns ~100 queries per call into ~5.
-   */
-  const typicalMemo = new Map<string, { at: number; value: number | null }>();
-  const typicalFor = (run: Run): number | null => {
-    const key = `${run.root}|${run.scheme}|${run.kind}`;
-    const now = Date.now();
-    const hit = typicalMemo.get(key);
-    if (hit && now - hit.at < 10_000) return hit.value;
-    const value = store.typicalDurationMs({
-      root: run.root,
-      scheme: run.scheme,
-      kind: run.kind,
-    });
-    if (typicalMemo.size > 500) typicalMemo.clear();
-    typicalMemo.set(key, { at: now, value });
-    return value;
   };
 
   // Warm both caches off the handler path. Overview answers optimistically
@@ -557,249 +366,122 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     if (!available) publishSoon();
   });
 
-  const projectNames = new Map<string, string>();
-  const refreshProjectNames = (): void => {
-    projectNames.clear();
-    for (const project of collector.getProjects()) {
-      projectNames.set(project.id, project.name);
-    }
+  // ---------------------------------------------------------- build wrapper
+
+  const wrapped: WrappedDeps = {
+    store,
+    engine,
+    collector,
+    dataDir,
+    detachSignal: detachRuns.signal,
+    publishLive: (payload) => publish(payload),
+    publishSoon,
+    log,
+    isDisposed,
   };
 
-  const toDto = (run: Run) => ({
-    id: run.id,
-    status: run.status,
-    kind: run.kind,
-    scheme: run.scheme,
-    container: run.container,
-    configuration: run.configuration,
-    destination: run.destination,
-    projectId: run.projectId,
-    projectName: run.projectId
-      ? (projectNames.get(run.projectId) ?? null)
-      : null,
-    root: run.root,
-    cwd: run.cwd,
-    pid: run.pid,
-    cmdline: run.cmdline,
-    startedAt: run.startedAt,
-    endedAt: run.endedAt,
-    durationMs: durationMs(run),
-    errorCount: run.errorCount,
-    warningCount: run.warningCount,
-    analyzerCount: run.analyzerCount,
-    testTotal: run.testTotal,
-    testFailed: run.testFailed,
-    testSkipped: run.testSkipped,
-    bundlePath: run.bundlePath,
-    detailed: run.detailed,
-    branch: run.branch,
-    worktree: run.worktree,
-    threadId: run.threadId,
-    destinationLabel: destinationLabel(run.destination, collector.getSimulators()),
-    workerCount:
-      run.status === "running"
-        ? engine.liveWorkerCount(run.id, collector.getLastActivities())
-        : null,
-    phase:
-      run.status === "running"
-        ? (engine.liveActivity(run.id, collector.getLastActivities())?.phase ??
-          null)
-        : null,
-    currentFile:
-      run.status === "running"
-        ? (engine.liveActivity(run.id, collector.getLastActivities())
-            ?.currentFile ?? null)
-        : null,
-    // What a run of this shape usually costs here, so the row can show a real
-    // fraction instead of an indeterminate sweep. Null until there are enough
-    // successful samples to call anything "usual".
-    typicalMs: typicalFor(run),
+  /**
+   * Runs the user has dismissed from the activity banner.
+   *
+   * The banner keeps the last settled run on screen so "how did that go"
+   * outlives the build itself; this is the other half of that contract — an
+   * explicit way to say "seen it". Persisted, because a dismissal that came
+   * back on the next window reload would be worse than no dismissal at all.
+   *
+   * Loaded BEFORE the RPC handlers are registered: a handler that closed over
+   * a `const` still in its temporal dead zone would throw if a call landed in
+   * the await between the two.
+   */
+  const dismissedRuns = new Set(
+    (await bb.storage.kv.get<string[]>("dismissed-runs")) ?? [],
+  );
+  const persistDismissedRuns = async (): Promise<void> => {
+    const retained = [...dismissedRuns].slice(-500);
+    if (retained.length !== dismissedRuns.size) {
+      dismissedRuns.clear();
+      for (const id of retained) dismissedRuns.add(id);
+    }
+    await bb.storage.kv.set("dismissed-runs", retained);
+  };
+
+  const cli = createCli({
+    store,
+    collector,
+    dataDir,
+    projectName: (id) => dto.projectName(id),
+    refreshProjectNames: () => dto.refreshProjectNames(),
+    rescan: runRescan,
+    wrapped,
+    onShimStateKnown,
   });
 
   // ------------------------------------------------------------------- RPC
 
-  bb.rpc.register(rpcContract, {
-    async overview(input) {
-      refreshProjectNames();
-      const query = {
-        projectId: input.projectId ?? null,
-        kind: input.kind ?? null,
-        limit: input.limit ?? 100,
-      };
-      const unique = new Map<string, CollectorProject>();
-      for (const project of collector.getProjects()) {
-        if (!unique.has(project.id)) unique.set(project.id, project);
-      }
-      const shim = shimPaths(dataDir);
-      return {
-        runs: store.listRuns(query).map(toDto),
-        total: store.countRuns(query),
-        projects: [...unique.values()],
-        rootCount: store.listRoots().length,
-        lastScanAt: collector.getLastScanAt(),
-        // Sync cache only. Awaiting the resolve here spawned a cold `xcrun
-        // --find` inside the RPC handler — the measured 1.69s overview right
-        // after a reload. Optimistic `true` until the detached resolve lands
-        // (it publishes, so the panel refetches the real answer).
-        xcodeAvailable: collector.xcodeAvailableSync() ?? true,
-        shimActive:
-          shimInstalledCached() &&
-          (process.env.PATH ?? "").includes(shim.binDir),
-        simulators: collector.getBootedSimulators(),
-      };
-    },
+  bb.rpc.register(
+    rpcContract,
+    createRpcHandlers({
+      store,
+      collector,
+      dto,
+      scopeSync,
+      dataDir,
+      dismissedRuns,
+      persistDismissedRuns,
+      shimInstalledCached,
+      rescan: runRescan,
+      publishSoon,
+      detach: (work) => detach(work),
+    }),
+  );
 
-    runDetail({ id }) {
-      refreshProjectNames();
-      const run = store.getRun(id);
-      return {
-        run: run ? toDto(run) : null,
-        findings: store.listFindings(id).map((finding) => ({
-          severity: finding.severity,
-          message: finding.message,
-          filePath: finding.filePath,
-          line: finding.line,
-          target: finding.target,
+  // ------------------------------------------------------------- simulators
+
+  /**
+   * The Simulators half, installed with everything it cannot own itself.
+   *
+   * It registers its own RPC contract, HTTP routes, agent tools, live service
+   * and prune schedule; the four things below are the ones the SDK allows only
+   * one of per plugin, plus the simulator list the tracker is already polling.
+   *
+   * A failure here is contained on purpose. Live mirroring is not what this
+   * plugin is for — a Mac with no simulator runtimes, or a `serve-sim` addon
+   * that will not load, must not stop builds from being tracked.
+   */
+  let simulatorCli: SimulatorCliRun | null = null;
+  let simulatorInstructions: string | null = null;
+  try {
+    await installSimulators(bb, {
+      db,
+      settings,
+      mountCli: (run) => {
+        simulatorCli = run;
+      },
+      contributeInstructions: (text) => {
+        simulatorInstructions = text;
+      },
+      // The tracker polls `simctl list` anyway, to turn `id=<UDID>` in a build
+      // row into "iPhone 17 Pro · iOS 26.5". Reusing that answer is why the
+      // merged plugin spawns one simctl poller instead of two.
+      bootedSimulators: () =>
+        collector.getBootedSimulators().map((sim) => ({
+          udid: sim.udid,
+          name: sim.name,
+          os: sim.os,
         })),
-        tests: store.listTests(id).map((test) => ({
-          suite: test.suite,
-          name: test.name,
-          status: test.status,
-          durationMs: test.durationMs,
-          failureMessage: test.failureMessage,
-          target: test.target,
+      // The same rows the panel renders as build history, read for the one
+      // field the simulator picker cares about. No new query shape, no new
+      // index, and it is already sorted newest-first.
+      recentDestinations: (limit) =>
+        store.listRuns({ limit, includeNoise: true }).map((run) => ({
+          destination: run.destination,
+          startedAt: run.startedAt,
+          threadId: run.threadId,
+          projectId: run.projectId,
         })),
-      };
-    },
-
-    trends(input) {
-      const since = Date.now() - (input.days ?? 30) * 86_400_000;
-      return store.trends(input.projectId ?? null, since);
-    },
-
-    chatStatus({ threadId, runId }) {
-      refreshProjectNames();
-
-      let scope: ThreadScope | null = null;
-      if (threadId) {
-        // Cached only — a scope miss used to cost two inline bb.sdk calls per
-        // chatStatus, and the UI polls this endpoint. The detached refresh
-        // publishes when the scope resolves, which makes the panel re-ask.
-        scope = scopes.get(threadId);
-        if (!scope) detach(() => refreshThreadScope(threadId, false));
-      }
-      const scopeDto = scope
-        ? {
-            threadId: scope.threadId,
-            path: scope.path,
-            branch: scope.branch,
-            worktree: shortName(scope.path),
-          }
-        : null;
-      // Thread-scoped, never machine-wide: an unresolved checkout must show
-      // nothing rather than another thread's build. See `scopeFilter`.
-      const inScope = scopeFilter<Run>(scope);
-
-      const unresolved = store.listUnresolved().filter(inScope);
-      const settled = store
-        .listRuns({ limit: 100 })
-        .filter((run) => run.status !== "running" && run.status !== "finishing")
-        .filter(inScope);
-      const finished = settled.slice(0, 5);
-      // Only ever the NEWEST settled run, and null once dismissed. Walking
-      // back to the one before would answer a question nobody asked: a run
-      // older than the one you just cleared is, by definition, staler news,
-      // and it would take a dozen clicks to get an empty card.
-      /**
-       * The newest run that actually CONCLUDED something.
-       *
-       * `ended` is the verdict-less terminal state — the run started, it
-       * stopped, and no source ever said how it went. Showing that as the
-       * thread's last result puts "— no result" in the prompt stack, which
-       * tells nobody anything and reads like a failure. Skipping to the last
-       * run we can actually speak for is strictly more informative, and if
-       * there is none the card simply stays away.
-       *
-       * The underlying gap is worth naming: `bb xcode shim` exists precisely
-       * to capture a real exit code and result bundle for every invocation,
-       * and it reports "on PATH: no" — so script-launched builds fall back to
-       * inference, and when Xcode also writes no log entry there is nothing
-       * left to infer from.
-       */
-      const newest =
-        settled.find(
-          (run) => !isNoiseRun(run) && VERDICT_STATUSES.has(run.status),
-        ) ?? null;
-      const lastSettled =
-        newest && !dismissedRuns.has(newest.id) ? newest : null;
-
-      const pinned = runId ? store.getRun(runId) : null;
-      const run = pinned ?? unresolved[0] ?? finished[0] ?? null;
-
-      const problems =
-        run !== null &&
-        (run.status === "failed" ||
-          run.errorCount > 0 ||
-          (run.testFailed ?? 0) > 0);
-      return {
-        run: run ? toDto(run) : null,
-        active: unresolved
-          .filter((entry) => entry.id !== run?.id)
-          .map(toDto),
-        recent: finished.filter((entry) => entry.id !== run?.id).map(toDto),
-        lastSettled: lastSettled ? toDto(lastSettled) : null,
-        scope: scopeDto,
-        findings: problems
-          ? store
-              .listFindings(run.id)
-              .filter((finding) => finding.severity === "error")
-              .slice(0, FINDING_LIMIT)
-              .map((finding) => ({
-                severity: finding.severity,
-                message: finding.message,
-                filePath: finding.filePath,
-                line: finding.line,
-                target: finding.target,
-              }))
-          : [],
-        recordedSnapshots: run
-          ? store.listTests(run.id).filter((test) => test.status === "recorded")
-              .length
-          : 0,
-        failedTests: problems
-          ? store
-              .listTests(run.id)
-              .filter((test) => test.status === "failed")
-              .slice(0, FINDING_LIMIT)
-              .map((test) => ({
-                suite: test.suite,
-                name: test.name,
-                status: test.status,
-                durationMs: test.durationMs,
-                failureMessage: test.failureMessage,
-                target: test.target,
-              }))
-          : [],
-      };
-    },
-
-    async dismissRun({ runId }) {
-      dismissedRuns.add(runId);
-      await persistDismissedRuns();
-      publishSoon();
-      return { ok: true };
-    },
-
-    async rescan() {
-      // Detached: a full sweep can spawn xcresulttool with a 60s timeout per
-      // bundle plus a sync JSON.parse of tens of MB — far too slow to hold an
-      // RPC handler (and the shared event loop) open for.
-      detach(async () => {
-        if (await collector.fullScan(Date.now(), detachRuns.signal)) publishSoon();
-      });
-      return { ok: true, rootCount: store.listRoots().length };
-    },
-  });
+    });
+  } catch (error) {
+    log.warn(`simulators unavailable: ${String(error)}`);
+  }
 
   // -------------------------------------------------------------- services
 
@@ -903,32 +585,41 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     // that work inside the schedule callback made the host measure a 27s
     // handler and could push the whole plugin into an error state. The
     // schedule only triggers the sweep; the collector owns its lifetime.
-    detach(
-      async () => {
-        if (await collector.fullScan(Date.now(), detachRuns.signal)) publishSoon();
-      },
-      (error) => log.warn(`scheduled discovery failed: ${String(error)}`),
-    );
+    runRescan();
   });
 
   const runPrune = async (): Promise<void> => {
     if (disposed) return;
     const now = Date.now();
     lastPruneAt = now;
-    await pruneShimBundles(dataDir, current.retentionDays * 86_400_000, now);
+    const bundles = await pruneShimBundles(
+      dataDir,
+      {
+        maxAgeMs: current.bundleRetentionDays * 86_400_000,
+        maxTotalBytes: current.bundleBudgetBytes,
+      },
+      now,
+    );
     if (disposed) return;
     const cutoff = now - current.retentionDays * 86_400_000;
     const removed = store.prune(cutoff);
     const orphans = store.pruneOrphans();
     // Roots were never pruned (stale ones make every sweep slower forever),
     // and the WAL was never checkpointed — the visible "4.8MB db" was 82% WAL.
-    db.prepare(`DELETE FROM root WHERE last_seen_at < ?`).run(cutoff);
-    db.prepare(`PRAGMA wal_checkpoint(TRUNCATE)`).get();
+    store.pruneRoots(cutoff);
+    store.checkpoint();
     await bb.storage.kv.set("last-prune-at", now);
-    if (removed > 0 || orphans > 0) {
-      log.info(`pruned ${removed} run(s) and ${orphans} orphaned row(s) past retention`);
-      publishSoon();
+    if (bundles.removed > 0) {
+      log.info(
+        `pruned ${bundles.removed} result bundle(s), freeing ${formatBytes(bundles.bytesFreed)} (${formatBytes(bundles.bytesRetained)} retained)`,
+      );
     }
+    if (removed > 0 || orphans > 0) {
+      log.info(
+        `pruned ${removed} run(s) and ${orphans} orphaned row(s) past retention`,
+      );
+    }
+    if (removed > 0 || orphans > 0 || bundles.removed > 0) publishSoon();
   };
 
   bb.background.schedule("prune", "23 4 * * *", () => {
@@ -939,485 +630,57 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   // ------------------------------------------------------------------- CLI
 
-
-  function shortName(path: string | null): string | null {
-    if (!path) return null;
-    const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
-    const index = trimmed.lastIndexOf("/");
-    return index === -1 ? trimmed : trimmed.slice(index + 1);
-  }
-
-  function describeRun(run: Run): string {
-    const name = run.scheme ?? shortName(run.container) ?? shortName(run.root) ?? "—";
-    const project = run.projectId
-      ? (projectNames.get(run.projectId) ?? run.projectId)
-      : "—";
-    const counts: string[] = [];
-    if (run.errorCount) counts.push(`${run.errorCount}E`);
-    if (run.warningCount) counts.push(`${run.warningCount}W`);
-    if (run.testFailed) counts.push(`${run.testFailed} failed`);
-    const suffix = counts.length ? `  [${counts.join(" ")}]` : "";
-    const at = run.branch ? ` @${run.branch}` : "";
-    const time =
-      run.status === "running"
-        ? `running ${formatDuration(Date.now() - run.startedAt)}`
-        : formatDuration(durationMs(run));
-    return `${run.status.padEnd(9)} ${run.kind.padEnd(7)} ${(name + at).padEnd(30)} ${project.padEnd(14)} ${time}${suffix}  ${run.id}`;
-  }
-
   bb.cli.register({
     name: "xcode",
-    summary: "Track Xcode builds, tests and other Xcode activity",
-    commands: [
-      { name: "status", summary: "What Xcode is doing right now", usage: "bb xcode status" },
-      {
-        name: "runs",
-        summary: "Recent builds and test runs",
-        usage: "bb xcode runs [--project <id>] [--kind build|test] [--limit N]",
-      },
-      { name: "show", summary: "Detail for one run", usage: "bb xcode show <run-id>" },
-      { name: "roots", summary: "Discovered DerivedData roots", usage: "bb xcode roots" },
-      { name: "rescan", summary: "Force a discovery + sweep", usage: "bb xcode rescan" },
-      {
-        name: "run",
-        summary:
-          "Start xcodebuild with live tracking, detached from this command",
-        usage: "bb xcode run -- xcodebuild -scheme App build",
-      },
-      {
-        name: "stop",
-        summary: "Stop a running tracked build",
-        usage: "bb xcode stop <run-id>",
-      },
-      {
-        name: "shim",
-        summary: "PATH shim so every xcodebuild records real pass/fail",
-        usage: "bb xcode shim [status|install|uninstall]",
-      },
-    ],
-    async run(argv, ctx) {
-      const [command = "status", ...rest] = argv;
-      refreshProjectNames();
-
-      switch (command) {
-        case "status": {
-          const open = store.listUnresolved();
-          if (open.length === 0) {
-            const last = store.listRuns({ limit: 1 })[0];
-            return {
-              exitCode: 0,
-              stdout: `No Xcode activity running.${last ? `\nLast: ${describeRun(last)}` : ""}\n`,
-            };
-          }
-          return {
-            exitCode: 0,
-            stdout: `${open.length} active:\n${open.map(describeRun).join("\n")}\n`,
-          };
-        }
-        case "runs": {
-          const flag = (name: string): string | null => {
-            const index = rest.indexOf(`--${name}`);
-            return index !== -1 && rest[index + 1] ? rest[index + 1]! : null;
-          };
-          const limitRaw = Number(flag("limit"));
-          const rows = store.listRuns({
-            projectId: flag("project"),
-            kind: (flag("kind") as Run["kind"] | null) ?? undefined,
-            limit: Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 25,
-          });
-          return {
-            exitCode: 0,
-            stdout: rows.length
-              ? `${rows.map(describeRun).join("\n")}\n`
-              : "No runs recorded yet.\n",
-          };
-        }
-        case "show":
-          return cliShow(rest[0]);
-        case "roots": {
-          const roots = store.listRoots();
-          if (!roots.length) {
-            return {
-              exitCode: 0,
-              stdout: "No DerivedData roots yet — they are learned from running builds.\n",
-            };
-          }
-          const lines = roots.map(
-            (root) =>
-              `${root.discoveredVia.padEnd(13)} ${
-                root.projectId
-                  ? (projectNames.get(root.projectId) ?? root.projectId)
-                  : "—"
-              }`.padEnd(32) + root.path,
-          );
-          return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
-        }
-        case "rescan": {
-          // Detached, like the rpc method: a sweep can spawn xcresulttool with
-          // a 60s timeout per bundle, and holding the CLI handler open for
-          // that is what put xcode on perf-watch's slow-handler list.
-          detach(async () => {
-            if (await collector.fullScan(Date.now(), detachRuns.signal)) publishSoon();
-          });
-          return {
-            exitCode: 0,
-            stdout: `Scanning in the background. ${store.listRoots().length} DerivedData root(s) known so far.\n`,
-          };
-        }
-        case "run":
-          return cliRun(rest, ctx);
-        case "stop":
-          return cliStop(rest[0]);
-        case "shim":
-          return cliShim(rest[0] ?? "status");
-        default:
+    summary: "Track Xcode builds and tests, and drive the simulators they run on",
+    commands: [...CLI_COMMANDS, ...SIMULATOR_CLI_COMMANDS],
+    run: (argv, ctx) => {
+      // `bb xcode sim <verb>` — one `cli.register` per plugin, so the
+      // simulator verbs hang off this dispatch rather than owning `bb sims`.
+      // They keep their own argv from the verb onwards, so every parser in
+      // `src/sim/cli.ts` is untouched by living one level deeper.
+      if (argv[0] === "sim" || argv[0] === "sims") {
+        if (simulatorCli === null) {
           return {
             exitCode: 1,
-            stderr: `Unknown command '${command}'. Try: status, runs, show, roots, rescan, run, stop, shim\n`,
+            stderr: "Simulators are not available on this server.\n",
           };
+        }
+        return simulatorCli(argv.slice(1), ctx);
       }
+      return cli.dispatch([...argv], ctx);
     },
   });
 
-  function cliShow(id: string | undefined): {
-    exitCode: number;
-    stdout?: string;
-    stderr?: string;
-  } {
-    if (!id) return { exitCode: 1, stderr: "Usage: bb xcode show <run-id>\n" };
-    const run = store.getRun(id);
-    if (!run) return { exitCode: 1, stderr: `No run with id '${id}'.\n` };
-
-    const lines = [
-      `id           ${run.id}`,
-      `status       ${run.status}`,
-      `kind         ${run.kind}`,
-      `scheme       ${run.scheme ?? "—"}`,
-      `project      ${run.projectId ? (projectNames.get(run.projectId) ?? run.projectId) : "—"}`,
-      `destination  ${destinationLabel(run.destination, collector.getSimulators()) ?? "—"}`,
-      `branch       ${run.branch ?? "—"}${run.worktree ? ` (${run.worktree})` : ""}`,
-      `root         ${run.root ?? "—"}`,
-      `started      ${new Date(run.startedAt).toISOString()}`,
-      `duration     ${formatDuration(durationMs(run))}`,
-      `counts       ${run.errorCount}E ${run.warningCount}W ${run.analyzerCount}A`,
-    ];
-    if (run.testTotal !== null) {
-      lines.push(
-        `tests        ${run.testTotal} total, ${run.testFailed ?? 0} failed, ${run.testSkipped ?? 0} skipped`,
-      );
-    }
-    if (run.cmdline) lines.push(`command      ${run.cmdline.slice(0, 500)}`);
-
-    const findings = store.listFindings(id).slice(0, 50);
-    if (findings.length) {
-      lines.push("", "issues:");
-      for (const finding of findings) {
-        const where = finding.filePath
-          ? `${finding.filePath}${finding.line ? `:${finding.line}` : ""}`
-          : "";
-        lines.push(`  ${finding.severity.padEnd(8)} ${where} ${finding.message}`);
-      }
-    }
-    const failures = store
-      .listTests(id)
-      .filter((test) => test.status === "failed")
-      .slice(0, 50);
-    if (failures.length) {
-      lines.push("", "failed tests:");
-      for (const test of failures) {
-        lines.push(
-          `  ${test.suite ? `${test.suite}/` : ""}${test.name}${test.failureMessage ? ` — ${test.failureMessage}` : ""}`,
-        );
-      }
-    }
-    return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
-  }
-
-  let lastLivePublishAt = 0;
-
-  /**
-   * Start a wrapped xcodebuild and return as soon as the child has spawned.
-   * DELIBERATELY DETACHED from the CLI request: holding the request open
-   * for a whole build meant bb's CLI proxy timeout (~5 min, measured live on
-   * a Packerly build) aborted ctx.signal, which SIGTERM'd xcodebuild mid-
-   * build and left an unfinalized result bundle. A build's lifetime belongs
-   * to the build; `bb xcode stop <id>` is the cancellation path.
-   */
-  async function cliRun(
-    args: string[],
-    ctx: { cwd?: string },
-  ): Promise<{ exitCode: number; stdout?: string; stderr?: string }> {
-    const separator = args.indexOf("--");
-    const commandArgs = separator === -1 ? args : args.slice(separator + 1);
-    if (commandArgs.length === 0) {
-      return {
-        exitCode: 1,
-        stderr: "Usage: bb xcode run -- xcodebuild -scheme App build\n",
-      };
-    }
-    const argv =
-      commandArgs[0] === "xcodebuild"
-        ? ["/usr/bin/xcodebuild", ...commandArgs.slice(1)]
-        : commandArgs;
-
-    let bundlePath: string | null = null;
-    const started = new Promise<void>((resolve) => {
-      void runWrapped({
-        argv,
-        cwd: ctx.cwd,
-        // Not `signal`: that SIGTERMs the child. A reload must leave the
-        // user's build running and only stop us watching it.
-        detachSignal: detachRuns.signal,
-        onStart: (info) => {
-          bundlePath = info.bundlePath;
-          resolve();
-        },
-        onEvent: (_event, progress) => {
-          // Throttled: xcodebuild can emit hundreds of events per build, and
-          // every publish makes each open panel refetch the full overview —
-          // N events × M panels of amplification.
-          const at = Date.now();
-          if (at - lastLivePublishAt < 500) return;
-          lastLivePublishAt = at;
-          publish({
-            at,
-            live: {
-              section: progress.currentSection,
-              opened: progress.sectionsOpened,
-              closed: progress.sectionsClosed,
-              errors: progress.errors,
-              warnings: progress.warnings,
-            },
-          });
-        },
-      })
-        .then(async (result) => {
-          // Lands whenever the build ends, which may be long after a reload.
-          // fullScan and foldWrappedExit both reach for storage on this
-          // instance's handle, so bail before touching any of it.
-          if (disposed) return;
-          engine.foldWrappedExit(
-            result.bundlePath,
-            {
-              exitCode: result.exitCode,
-              signal: result.signal,
-              errors: result.progress.errors,
-              warnings: result.progress.warnings,
-            },
-            Date.now(),
-          );
-          await collector.fullScan(Date.now(), detachRuns.signal);
-          if (disposed) return;
-          publishSoon();
-          log.info(
-            `wrapped build ${describeExit(result.exitCode, result.signal)}: ${result.bundlePath}`,
-          );
-        })
-        .catch((error: unknown) => {
-          resolve();
-          if (disposed) return;
-          log.warn(`wrapped build failed to run: ${String(error)}`);
-        });
-    });
-    await started;
-    if (!bundlePath) {
-      return { exitCode: 1, stderr: "Failed to start the build.\n" };
-    }
-
-    const lines = [
-      "Build started; the background probe will assign its run id.",
-      "It keeps running if this command disconnects.",
-      "Watch it with: bb xcode status (then stop it with: bb xcode stop <run-id>).",
-      "It also appears in the live row above the composer.",
-      "",
-      `result bundle: ${bundlePath}`,
-    ];
-    return { exitCode: 0, stdout: capOutput(`${lines.join("\n")}\n`) };
-  }
-
-  function cliStop(id: string | undefined): {
-    exitCode: number;
-    stdout?: string;
-    stderr?: string;
-  } {
-    if (!id) return { exitCode: 1, stderr: "Usage: bb xcode stop <run-id>\n" };
-    const run = store.getRun(id);
-    if (!run) return { exitCode: 1, stderr: `No run with id '${id}'.\n` };
-    if (run.status !== "running" || run.pid === null) {
-      return { exitCode: 1, stderr: `Run ${id} is not running.\n` };
-    }
-    try {
-      process.kill(run.pid, "SIGTERM");
-    } catch {
-      return { exitCode: 1, stderr: `Process ${run.pid} is already gone.\n` };
-    }
-    return { exitCode: 0, stdout: `Sent SIGTERM to ${run.pid} (${id}).\n` };
-  }
-
-  async function cliShim(
-    action: string,
-  ): Promise<{ exitCode: number; stdout?: string; stderr?: string }> {
-    const paths = shimPaths(dataDir);
-    switch (action) {
-      case "install": {
-        await installShim(dataDir);
-        shimInstalled = true;
-        shimCheckedAt = Date.now();
-        return {
-          exitCode: 0,
-          stdout:
-            `Shim installed at ${paths.script}\n\n` +
-            `Add to your shell profile, then restart your shell:\n\n` +
-            `  ${pathExportLine(paths.binDir)}\n\n` +
-            `Every xcodebuild build/test then records a result bundle and this\n` +
-            `plugin reports real pass/fail. Queries pass through untouched.\n`,
-        };
-      }
-      case "uninstall": {
-        const removed = await uninstallShim(dataDir);
-        shimInstalled = false;
-        shimCheckedAt = Date.now();
-        return {
-          exitCode: 0,
-          stdout: removed
-            ? "Shim removed. Drop the PATH line from your profile.\n"
-            : "Shim was not installed.\n",
-        };
-      }
-      default: {
-        const installed = await isShimInstalled(dataDir);
-        const active = (process.env.PATH ?? "").includes(paths.binDir);
-        const lines = [
-          `installed  ${installed ? "yes" : "no"}`,
-          `on PATH    ${active ? "yes" : "no (add the export line and restart your shell)"}`,
-          `script     ${paths.script}`,
-          `bundles    ${paths.bundleDir}`,
-        ];
-        if (!installed) {
-          lines.push(
-            "",
-            "Xcode writes no build log for CLI builds; pass/fail is only",
-            "recoverable from a result bundle. Install with: bb xcode shim install",
-          );
-        }
-        return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
-      }
-    }
-  }
-
-  function capOutput(text: string): string {
-    return Buffer.byteLength(text, "utf8") <= PLUGIN_CLI_OUTPUT_MAX_BYTES - 1024
-      ? text
-      : `${text.slice(0, 200_000)}\n… truncated …\n`;
-  }
-
   // ----------------------------------------------------------- agent tools
-
-  /**
-   * Scope for an agent tool call: cached when known, otherwise one refresh
-   * bounded to 800ms. Unlike chatStatus (polled, so it can answer scope-less
-   * and let the publish-driven refetch fill it in), a tool call is a single
-   * question — waiting a beat for the right scope is worth it, but waiting on
-   * a slow SDK round-trip under load is how this plugin ended up on the
-   * slow-handler list. On timeout the refresh keeps running detached and the
-   * tool answers unscoped, saying so.
-   */
-  const scopeBounded = async (threadId: string): Promise<ThreadScope | null> => {
-    const cached = scopes.get(threadId);
-    if (cached) return cached;
-    const refresh = refreshThreadScope(threadId, false);
-    return await Promise.race([
-      refresh,
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 800)),
-    ]);
-  };
-
-  const agentInstructions =
-    "When an Xcode build or test is needed, prefer `bb xcode run -- xcodebuild …` so bb can track it with a result bundle and a real pass/fail verdict. " +
-    "Use xcode_status instead of parsing build logs when checking whether a run passed. " +
-    "Live builds render themselves in the prompt stack above the composer, so never announce that a build started and never paste build status into chat — the user is already looking at it.";
 
   // Tool instructions only reach sessions where the provider is given that
   // native tool. Builds also arrive through repo scripts, xcodebuildmcp, and
   // provider-native shell tools, so make the card contract part of every
   // ordinary thread's resolved instructions as well.
-  bb.agents.contributeInstructions(() => agentInstructions);
+  // One call per plugin, so both halves are joined here. The simulator half
+  // contributes only when its tools were actually registered, which is why this
+  // reads the variable rather than the module constant.
+  bb.agents.contributeInstructions(() =>
+    simulatorInstructions === null
+      ? AGENT_INSTRUCTIONS
+      : `${AGENT_INSTRUCTIONS}\n\n${simulatorInstructions}`,
+  );
 
-  bb.agents.registerTool({
-    name: "xcode_status",
-    description:
-      "Report Xcode build/test activity: what is running now and how recent runs finished, scoped to this thread's checkout when possible. Use instead of grepping build logs.",
-    instructions: agentInstructions,
-    experimental_statusLabels: {
-      pending: "Checking Xcode activity",
-      completed: "Checked Xcode activity",
-    },
-    parameters: z.object({
-      limit: z.number().int().min(1).max(25).optional(),
-      machineWide: z
-        .boolean()
-        .optional()
-        .describe("Ignore this thread's checkout scope and report everything."),
-    }),
-    async execute({ limit, machineWide }, { threadId }) {
-      refreshProjectNames();
-      const scope = machineWide ? null : await scopeBounded(threadId);
-      // `machineWide` is the caller's explicit request; an unresolvable thread
-      // scope is not a licence to answer for the whole machine.
-      const inScope = scopeFilter<Run>(scope, machineWide);
-
-      const open = store.listUnresolved().filter(inScope);
-      const recent = store.listRuns({ limit: limit ?? 5 }).filter(inScope);
-      const header = scope
-        ? `Scope: this thread's checkout ${scope.path}${scope.branch ? ` @${scope.branch}` : ""}.`
-        : "Scope: whole machine (thread has no resolvable checkout).";
-      const parts: string[] = [
-        header,
-        open.length
-          ? `Active (${open.length}):\n${open.map(describeRun).join("\n")}`
-          : "Nothing is building right now.",
-      ];
-      if (recent.length) {
-        parts.push(`Recent:\n${recent.map(describeRun).join("\n")}`);
-      } else if (scope) {
-        parts.push(
-          "No recorded runs for this checkout yet. Pass machineWide: true to see all Xcode activity.",
-        );
-      }
-      return parts.join("\n\n");
-    },
+  const tools = createTools({
+    store,
+    collector,
+    dataDir,
+    wrapped,
+    refreshProjectNames: () => dto.refreshProjectNames(),
+    projectName: (id) => dto.projectName(id),
+    scopeFor: (threadId) => scopeSync.bounded(threadId),
+    showRun: (id) => cli.show(id),
   });
 
-  bb.agents.registerTool({
-    name: "xcode_last_failure",
-    description:
-      "Return the errors and failed tests from the most recent failed Xcode run, with file paths and line numbers.",
-    experimental_statusLabels: {
-      pending: "Reading last Xcode failure",
-      completed: "Read last Xcode failure",
-    },
-    parameters: z.object({
-      projectId: z.string().optional(),
-      machineWide: z
-        .boolean()
-        .optional()
-        .describe("Ignore this thread's checkout scope and search all runs."),
-    }),
-    async execute({ projectId, machineWide }, { threadId }) {
-      refreshProjectNames();
-      const scope = machineWide ? null : await scopeBounded(threadId);
-      const failed = store
-        .listRuns({ projectId: projectId ?? null, onlyProblems: true, limit: 25 })
-        .filter((run) => !scope || runMatchesScope(run, scope))[0];
-      if (!failed) {
-        return scope
-          ? "No failed Xcode runs recorded for this thread's checkout. Pass machineWide: true to search all runs."
-          : "No failed Xcode runs recorded.";
-      }
-      const detail = cliShow(failed.id);
-      return detail.stdout ?? detail.stderr ?? "No detail available.";
-    },
-  });
+  bb.agents.registerTool(tools.status);
+  bb.agents.registerTool(tools.lastFailure);
+  bb.agents.registerTool(tools.build);
 
   bb.onDispose(() => {
     // Order matters: flip the flag before detaching, so anything the tail
@@ -1431,6 +694,18 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     }
     detachRuns.abort();
   });
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value < 10 ? 1 : 0)}${units[unit]}`;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

@@ -16,6 +16,7 @@ import {
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { Icon } from "@/components/ui/icon";
 import {
   Select,
@@ -36,6 +37,7 @@ import { cn } from "@/lib/utils";
 
 import { XCODE_CHANNEL } from "../src/channel";
 import type { rpcContract } from "../src/contract";
+import { formatRelative } from "./format";
 import { RunDetailPanel } from "./RunDetailPanel";
 import { RunLog, type RunSummary, isActive } from "./RunLog";
 import { Trends } from "./Trends";
@@ -48,26 +50,14 @@ interface Overview {
   rootCount: number;
   lastScanAt: number | null;
   xcodeAvailable: boolean;
+  shimInstalled: boolean;
   shimActive: boolean;
+  verdictlessRuns: number;
   simulators: Array<{ udid: string; name: string; os: string; state: string }>;
 }
 
 const ALL = "__all__";
 type View = "activity" | "trends";
-
-function useWideViewport(): boolean {
-  const [wide, setWide] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= 1024,
-  );
-  useEffect(() => {
-    const query = window.matchMedia("(min-width: 1024px)");
-    const update = (): void => setWide(query.matches);
-    update();
-    query.addEventListener("change", update);
-    return () => query.removeEventListener("change", update);
-  }, []);
-  return wide;
-}
 
 function XcodePanelView({
   selectedId,
@@ -78,7 +68,10 @@ function XcodePanelView({
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const connection = useRealtimeConnectionState();
-  const wide = useWideViewport();
+  // The shared, listener-deduplicating hook rather than a private matchMedia
+  // effect: every row, tooltip and overlay in this panel already goes through
+  // it, so this adds no second browser listener.
+  const wide = useMediaQuery("(min-width: 1024px)");
 
   const [overview, setOverview] = useState<Overview | null>(null);
   const [loading, setLoading] = useState(true);
@@ -206,11 +199,33 @@ function XcodePanelView({
               </span>
               {activeCount} active
             </span>
-          ) : (
-            <span className="text-xs text-muted-foreground">
-              {overview ? `${overview.rootCount} roots` : ""}
-            </span>
-          )}
+          ) : overview ? (
+            // `total` and `lastScanAt` were both shipped in the payload and
+            // both discarded, leaving a bare root count that answers a question
+            // nobody has. How much history there is, and how fresh it is, are
+            // the two facts that make a quiet panel trustworthy rather than
+            // ambiguous — an empty list means "nothing built", not "not looking".
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="text-xs tabular-nums text-muted-foreground">
+                  {overview.total} run{overview.total === 1 ? "" : "s"}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>
+                <div className="flex flex-col gap-0.5">
+                  <span>
+                    {overview.rootCount} DerivedData root
+                    {overview.rootCount === 1 ? "" : "s"} watched
+                  </span>
+                  <span>
+                    {overview.lastScanAt
+                      ? `Last swept ${formatRelative(overview.lastScanAt)}`
+                      : "No sweep completed yet"}
+                  </span>
+                </div>
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
           <Button
             size="sm"
             variant="ghost"
@@ -288,7 +303,10 @@ function XcodePanelView({
                   />
                 </div>
               ) : (
-                <RunLog runs={runs} selectedId={effectiveId} onSelect={select} />
+                <>
+                  <ShimNudge overview={overview} />
+                  <RunLog runs={runs} selectedId={effectiveId} onSelect={select} />
+                </>
               )}
               </div>
             </div>
@@ -306,6 +324,103 @@ function XcodePanelView({
       )}
     </div>
   );
+}
+
+/**
+ * The one thing this panel should say that it was computing and discarding.
+ *
+ * `shimActive` has always been in the `overview` payload and has never been
+ * rendered — so the panel could show a column of runs reading "Ended" without
+ * ever mentioning that a one-line install is the difference between that and a
+ * real verdict. The only place it appeared was inside a single run's detail
+ * pane: visible after you had already been let down, and only if you went
+ * looking.
+ *
+ * It earns its place by being specific and by going away. It appears only when
+ * runs in view actually lack verdicts, it names how many, and dismissing it is
+ * remembered — a standing recommendation that cannot be silenced is an advert,
+ * and this panel is a log.
+ */
+function ShimNudge({ overview }: { overview: Overview | null }) {
+  const [dismissed, setDismissed] = useState(
+    () => readLocal(SHIM_NUDGE_KEY) === "1",
+  );
+  if (!overview || dismissed) return null;
+  if (overview.shimActive || overview.verdictlessRuns === 0) return null;
+
+  const { shimInstalled, verdictlessRuns } = overview;
+  const count = `${verdictlessRuns} run${verdictlessRuns === 1 ? "" : "s"}`;
+
+  return (
+    <div className="mb-1 flex items-start gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-2 text-xs">
+      <Icon
+        name="Info"
+        className="mt-px size-3.5 shrink-0 text-muted-foreground"
+        aria-hidden
+      />
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <p className="text-foreground">
+          {count} here ended without a pass/fail. Xcode writes no build log for
+          command-line builds, so the outcome only exists in a result bundle.
+        </p>
+        <p className="text-muted-foreground">
+          {shimInstalled ? (
+            <>
+              The shim is installed but not on this server&rsquo;s PATH — add the
+              line from{" "}
+              <code className="rounded bg-muted px-1 py-0.5">
+                bb xcode shim status
+              </code>{" "}
+              to your shell profile and restart your shell.
+            </>
+          ) : (
+            <>
+              Run{" "}
+              <code className="rounded bg-muted px-1 py-0.5">
+                bb xcode shim install
+              </code>{" "}
+              once to capture one for every build.
+            </>
+          )}
+        </p>
+      </div>
+      <button
+        type="button"
+        aria-label="Dismiss"
+        title="Dismiss"
+        onClick={() => {
+          setDismissed(true);
+          writeLocal(SHIM_NUDGE_KEY, "1");
+        }}
+        className="shrink-0 cursor-pointer text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <Icon name="X" className="size-3.5" aria-hidden />
+      </button>
+    </div>
+  );
+}
+
+const SHIM_NUDGE_KEY = "bb-xcode.shim-nudge-dismissed";
+
+/**
+ * Client-side only, and deliberately so. A dismissal that failed because
+ * storage was unavailable should hide the notice for this session rather than
+ * throw inside a render.
+ */
+function readLocal(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeLocal(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    /* private mode, or storage disabled */
+  }
 }
 
 /**

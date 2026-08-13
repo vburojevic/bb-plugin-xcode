@@ -120,7 +120,18 @@ export const rpcContract = defineRpcContract({
       rootCount: z.number(),
       lastScanAt: z.number().nullable(),
       xcodeAvailable: z.boolean(),
+      /** The shim script exists on disk. */
+      shimInstalled: z.boolean(),
+      /** Installed AND on the server's PATH, i.e. actually intercepting. */
       shimActive: z.boolean(),
+      /**
+       * Runs in this page that ended without any source stating an outcome.
+       *
+       * The number the shim nudge is allowed to quote. A prompt that says "3
+       * of these runs have no verdict" is a fact about the user's own history;
+       * one that just recommends installing something is an advert.
+       */
+      verdictlessRuns: z.number(),
       simulators: z.array(
         z.object({
           udid: z.string(),

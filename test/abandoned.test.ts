@@ -29,6 +29,13 @@ async function workspace(): Promise<string> {
   return dir;
 }
 
+/**
+ * `findTool: null` on purpose. Detecting an abandoned bundle reads one
+ * `Info.plist` off disk and needs no toolchain — but it used to sit behind an
+ * `xcresulttool` gate at the top of `sweepBundles`, so a machine with no Xcode
+ * selected silently lost the rescue entirely. Pinning the tool to absent here
+ * is what keeps that gate from coming back, and is why this file runs in CI.
+ */
 function harness(): { store: Store; engine: Engine; collector: Collector } {
   const db = new Database(":memory:") as unknown as Db;
   for (const statement of MIGRATIONS) db.prepare(statement).run();
@@ -45,6 +52,7 @@ function harness(): { store: Store; engine: Engine; collector: Collector } {
       listProjects: async () => [],
       log: { debug: () => undefined, warn: () => undefined },
       dataDir: join(tmpdir(), "xc-abandoned-datadir"),
+      findTool: async () => null,
     },
     { scanProjects: false, extraRoots: [] },
   );

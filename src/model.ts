@@ -205,7 +205,6 @@ export function statusTransitionAllowed(
   if (next.rank < current.rank) return false;
 
   const currentTerminal = TERMINAL_STATUSES.has(current.status);
-  const nextTerminal = TERMINAL_STATUSES.has(next.status);
 
   if (!currentTerminal) {
     // running → finishing → any terminal; also running → running (no-op ok).
@@ -214,11 +213,9 @@ export function statusTransitionAllowed(
   }
 
   // Terminal already. Same-rank upgrades allowed only from the verdict-less
-  // "ended" to a real verdict.
-  if (current.status === "ended" && VERDICT_STATUSES.has(next.status)) {
-    return true;
-  }
-  return currentTerminal && nextTerminal && false;
+  // "ended" to a real verdict — a source of equal authority may fill a silence,
+  // never contradict a stated outcome.
+  return current.status === "ended" && VERDICT_STATUSES.has(next.status);
 }
 
 /** Duration is always derived, never stored from a source's own log span. */

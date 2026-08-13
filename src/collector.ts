@@ -42,7 +42,26 @@ export interface CollectorDeps {
   listProjects(): Promise<CollectorProject[]>;
   log: { debug(m: string): void; warn(m: string): void };
   dataDir: string;
+  /**
+   * Resolve a developer tool. Injectable so the sweep can be exercised on a
+   * machine with no Xcode — which is also what keeps the suite runnable in CI.
+   */
+  findTool?(name: string): Promise<string | null>;
 }
+
+/**
+ * How often the simulator list is re-read, while something is building and
+ * while nothing is.
+ *
+ * `simctl list` is a real spawn (a few hundred ms), and the 20s cadence ran
+ * forever regardless of whether the machine had built anything in a week —
+ * three subprocesses a minute, in perpetuity, to keep a list nobody was
+ * looking at fresh. The list still matters when idle (the panel shows booted
+ * devices, and a finished run's `id=UDID` destination has to keep resolving
+ * to a name), so this slows down rather than stopping.
+ */
+const SIM_REFRESH_BUSY_MS = 20_000;
+const SIM_REFRESH_IDLE_MS = 10 * 60_000;
 
 export interface CollectorSettings {
   scanProjects: boolean;
@@ -97,8 +116,9 @@ export class Collector {
     return this.simulators.filter((sim) => sim.state === "Booted");
   }
 
-  private async refreshSimulators(now: number): Promise<void> {
-    if (now - this.lastSimRefreshAt < 20_000) return;
+  private async refreshSimulators(now: number, busy: boolean): Promise<void> {
+    const interval = busy ? SIM_REFRESH_BUSY_MS : SIM_REFRESH_IDLE_MS;
+    if (now - this.lastSimRefreshAt < interval) return;
     this.lastSimRefreshAt = now;
     // The FULL list, not just booted: a run's `id=UDID` destination must still
     // resolve to a name after that simulator shuts down.
@@ -189,7 +209,8 @@ export class Collector {
     // first `xcrun --find` completed, so every overview call arriving before
     // that spawned its own cold xcrun (~300-800ms each — the measured
     // 513ms/call average).
-    return (this.toolPromise ??= findDeveloperTool("xcresulttool").then((tool) => {
+    const find = this.deps.findTool ?? findDeveloperTool;
+    return (this.toolPromise ??= find("xcresulttool").then((tool) => {
       this.xcresultTool = tool;
       return tool;
     }));
@@ -243,7 +264,9 @@ export class Collector {
     this.lastActivities = activities;
     this.lastScanAt = now;
     if (signal?.aborted) return false;
-    await this.refreshSimulators(now).catch(() => undefined);
+    await this.refreshSimulators(now, activities.length > 0).catch(
+      () => undefined,
+    );
 
     let changed = this.deps.engine.foldSnapshot(activities, now);
     if (this.deps.engine.expireFinishing(now)) changed = true;
@@ -342,34 +365,31 @@ export class Collector {
    * logs.
    */
   async sweepBundles(now = Date.now(), signal?: AbortSignal): Promise<boolean> {
-    const tool = await this.resolveTool();
-    if (!tool) return false;
-
     const candidates = new Set<string>(await listShimBundles(this.deps.dataDir));
-    const runs = this.deps.store.listRuns({ limit: 100 });
-    const claimers = new Map<string, (typeof runs)[number]>();
-    for (const run of runs) {
-      if (!run.bundlePath) continue;
-      claimers.set(run.bundlePath, run);
-      // `detailed` means "we already extracted its contents", which is not the
-      // same question as "has this bundle been scanned". The seen key is the
-      // authority on the latter, and keeping them separate is what lets a
-      // deliberate re-queue actually re-read: a one-time repair that clears
-      // the key was otherwise silently skipped here for every run that had
-      // parsed successfully — i.e. exactly the ones a wrong interpretation
-      // had already ruined.
-      if (
-        !run.detailed ||
-        !this.deps.store.hasSeen(`bundle-scanned:${run.bundlePath}`)
-      ) {
-        candidates.add(run.bundlePath);
-      }
+    // Answered in SQL rather than by scanning the newest 100 runs: `detailed`
+    // means "we already extracted its contents", which is not the same
+    // question as "has this bundle been scanned". The seen key is the
+    // authority on the latter, and keeping them separate is what lets a
+    // deliberate re-queue actually re-read.
+    for (const path of this.deps.store.listUnscannedBundlePaths()) {
+      candidates.add(path);
     }
     for (const { path: root } of this.deps.store.listRoots()) {
       for (const bundle of await findTestResultBundles(root)) {
         candidates.add(bundle);
       }
     }
+
+    /**
+     * `xcresulttool`, resolved only once a bundle actually needs parsing.
+     *
+     * The tool used to gate this whole method, which meant a machine without
+     * Xcode selected also lost the abandoned-bundle rescue below — a check
+     * that reads one `Info.plist` off disk and needs no toolchain at all. A
+     * killed build stayed at the verdict-less `ended` for want of a parser it
+     * was never going to call.
+     */
+    let tool: string | null | undefined;
 
     let changed = false;
     for (const bundle of candidates) {
@@ -380,7 +400,9 @@ export class Collector {
       // parsing it wastes a 60s-class xcresulttool spawn AND — the measured
       // failure — burns through the corrupt-bundle retry budget while the
       // build is still writing, blacklisting the real bundle before it lands.
-      const claimer = claimers.get(bundle);
+      // Looked up by indexed path, so a long build cannot age out of the
+      // window and lose this protection precisely when it matters most.
+      const claimer = this.deps.store.getRunByBundlePath(bundle);
       if (claimer && claimer.status === "running") continue;
 
       // Root Info.plist only exists once xcodebuild finalizes the bundle
@@ -411,7 +433,7 @@ export class Collector {
         // bundle is marked scanned (pre-fix data, or a race). One retry per
         // load — the attempts bound below re-fences genuinely corrupt ones.
         const poisoned =
-          claimer !== undefined &&
+          claimer !== null &&
           !claimer.detailed &&
           claimer.statusRank < 2 &&
           !this.reparsedBundles.has(bundle);
@@ -420,6 +442,9 @@ export class Collector {
         this.deps.store.clearSeen(`bundle-scanned:${bundle}`);
       }
 
+      // First bundle that genuinely needs reading pays for the lookup.
+      tool ??= await this.resolveTool();
+      if (!tool) continue;
 
       const build = parseBuildResults(
         await xcresultJson(tool, ["get", "build-results", "--path", bundle]),

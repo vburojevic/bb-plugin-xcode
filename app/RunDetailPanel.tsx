@@ -66,7 +66,20 @@ interface Finding {
 interface TestResult {
   suite: string | null;
   name: string;
-  status: "passed" | "failed" | "skipped" | "expected-failure" | "unknown";
+  /**
+   * `recorded` is ours: a snapshot baseline written in record mode. The
+   * contract has always been able to return it and this type could not name
+   * it, so the pane rendered a written baseline as an anonymous grey row with
+   * a failure message attached — exactly the reading the reclassification
+   * exists to prevent.
+   */
+  status:
+    | "passed"
+    | "failed"
+    | "skipped"
+    | "expected-failure"
+    | "recorded"
+    | "unknown";
   durationMs: number | null;
   failureMessage: string | null;
   target: string | null;
@@ -351,40 +364,64 @@ function TestsTab({ tests, run }: { tests: TestResult[]; run: DetailRun }) {
     );
   }
 
+  const recorded = tests.filter((test) => test.status === "recorded").length;
+
   return (
-    <ul className="flex flex-col gap-1" role="list">
-      {tests.map((test, index) => (
-        <li
-          key={`${test.suite ?? ""}/${test.name}/${index}`}
-          className={cn(
-            "flex flex-col gap-1 rounded-md px-2 py-1.5",
-            test.status === "failed" && "border border-border",
-          )}
-        >
-          <div className="flex items-baseline gap-2">
-            <span
-              className={cn(
-                "min-w-0 flex-1 truncate text-sm",
-                test.status === "failed" ? "text-foreground" : "text-muted-foreground",
-              )}
-            >
-              {test.suite ? (
-                <span className="text-muted-foreground">{test.suite}/</span>
+    <>
+      {recorded > 0 ? (
+        // Said once, above the list, rather than left for the reader to infer
+        // from a dozen rows carrying a message that begins "Record mode is on".
+        <p className="mb-2 rounded-md border border-border bg-muted/40 px-2.5 py-2 text-xs text-muted-foreground">
+          <span className="text-foreground">
+            {recorded} snapshot baseline{recorded === 1 ? " was" : "s were"}{" "}
+            recorded, not failed.
+          </span>{" "}
+          swift-snapshot-testing reports a written baseline by failing the test,
+          because record mode has nothing to assert against yet. These are
+          excluded from the failure count.
+        </p>
+      ) : null}
+      <ul className="flex flex-col gap-1" role="list">
+        {tests.map((test, index) => (
+          <li
+            key={`${test.suite ?? ""}/${test.name}/${index}`}
+            className={cn(
+              "flex flex-col gap-1 rounded-md px-2 py-1.5",
+              test.status === "failed" && "border border-border",
+            )}
+          >
+            <div className="flex items-baseline gap-2">
+              <span
+                className={cn(
+                  "min-w-0 flex-1 truncate text-sm",
+                  test.status === "failed"
+                    ? "text-foreground"
+                    : "text-muted-foreground",
+                )}
+              >
+                {test.suite ? (
+                  <span className="text-muted-foreground">{test.suite}/</span>
+                ) : null}
+                {test.name}
+              </span>
+              {test.status === "recorded" ? (
+                <Badge variant="secondary" className="shrink-0">
+                  recorded
+                </Badge>
               ) : null}
-              {test.name}
-            </span>
-            <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-              {formatDuration(test.durationMs)}
-            </span>
-          </div>
-          {test.failureMessage ? (
-            <p className="whitespace-pre-wrap break-words rounded bg-muted px-2 py-1.5 text-xs text-foreground">
-              {test.failureMessage}
-            </p>
-          ) : null}
-        </li>
-      ))}
-    </ul>
+              <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                {formatDuration(test.durationMs)}
+              </span>
+            </div>
+            {test.failureMessage ? (
+              <p className="whitespace-pre-wrap break-words rounded bg-muted px-2 py-1.5 text-xs text-foreground">
+                {test.failureMessage}
+              </p>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </>
   );
 }
 

@@ -84,10 +84,45 @@ export interface EngineHooks {
   log(message: string): void;
 }
 
+/**
+ * How far an observed start time may sit from the start time of the run we
+ * adopted for that pid and still be the same process.
+ *
+ * `ps etime` has whole-second resolution and `startedAt` is derived as
+ * `now - elapsed`, so the same process reports a start time that jitters by a
+ * second or so between samples. Ten seconds is far beyond that jitter and far
+ * below any plausible pid recycle, which always happens after a restart.
+ */
+export const ADOPTION_SLACK_MS = 10_000;
+
+/**
+ * A `running` row older than this cannot be believed.
+ *
+ * Nothing should reach it — the miss counter retires a process that stops
+ * being observed, and the identity check below retires one whose pid was
+ * reused. It is the backstop for whatever comes next, because the one state
+ * this plugin must never present is a build that has been "running" for a day.
+ */
+export const RUNNING_MAX_AGE_MS = 12 * 3_600_000;
+
 interface LiveEntry {
   runId: string;
   misses: number;
   lastSeenAt: number;
+  /**
+   * The start time this pid is expected to report, set only when the entry was
+   * adopted from the store at hydrate rather than observed directly.
+   *
+   * A pid is a stable identity *within* one instance's lifetime, because the
+   * tracker drops a pid the moment it leaves the snapshot. Across a restart it
+   * is not: a run left `running` by a killed bb server keeps its pid in the
+   * store, and macOS hands pids out again. Re-adopting blind meant the first
+   * unrelated process to land on that pid kept the old run alive forever —
+   * `hasOpenRuns` stayed true, so the 30s sweep became a 4s sweep for the life
+   * of the process — while the build that was actually running never got a row
+   * at all. Cleared once the identity is confirmed.
+   */
+  expectedStartedAt?: number;
 }
 
 export class Engine {
@@ -99,18 +134,29 @@ export class Engine {
     private readonly hooks: EngineHooks,
   ) {}
 
-  /** Re-adopt unresolved runs after a reload instead of killing them. */
+  /**
+   * Re-adopt unresolved runs after a reload instead of killing them.
+   *
+   * Adoption is provisional: the pid is remembered together with the start
+   * time it must report to prove it is still the same process. See
+   * `LiveEntry.expectedStartedAt`.
+   */
   hydrate(now: number): void {
     for (const run of this.store.listUnresolved()) {
       if (run.status === "running" && run.pid !== null) {
-        this.live.set(run.pid, { runId: run.id, misses: 0, lastSeenAt: now });
+        this.live.set(run.pid, {
+          runId: run.id,
+          misses: 0,
+          lastSeenAt: now,
+          expectedStartedAt: run.startedAt,
+        });
       }
     }
   }
 
   /** True while anything is running or awaiting its verdict. */
   hasOpenRuns(): boolean {
-    return this.store.listUnresolved().length > 0;
+    return this.store.hasUnresolved();
   }
 
   liveWorkerCount(runId: string, activities: readonly LiveActivity[]): number | null {
@@ -142,9 +188,25 @@ export class Engine {
       seenPids.add(activity.pid);
       const tracked = this.live.get(activity.pid);
       if (tracked) {
-        tracked.misses = 0;
-        tracked.lastSeenAt = now;
-        continue;
+        // A provisionally adopted pid has to prove it is still the process the
+        // stored run described. A mismatch means the pid was recycled while
+        // this plugin was down: retire the orphan and let the loop fall
+        // through to mint a run for the build that is genuinely there.
+        const expected = tracked.expectedStartedAt;
+        if (
+          expected !== undefined &&
+          Math.abs(activity.startedAt - expected) > ADOPTION_SLACK_MS
+        ) {
+          this.live.delete(activity.pid);
+          this.retire(tracked, now, "pid reused across a restart");
+          changed = true;
+        } else {
+          // Identity confirmed; it is an ordinary tracked pid from here on.
+          delete tracked.expectedStartedAt;
+          tracked.misses = 0;
+          tracked.lastSeenAt = now;
+          continue;
+        }
       }
 
       const root = activity.derivedDataPath ?? activity.roots[0] ?? null;
@@ -200,33 +262,60 @@ export class Engine {
       if (entry.misses < MISSES_BEFORE_FINISHING) continue;
 
       this.live.delete(pid);
-      const run = this.store.getRun(entry.runId);
-      if (!run) continue;
-      if (
-        statusTransitionAllowed(
-          { status: run.status, rank: run.statusRank },
-          { status: "finishing", rank: RANK.observed },
-        )
-      ) {
-        run.status = "finishing";
-        run.statusRank = RANK.observed;
-        run.endedAt ??= entry.lastSeenAt;
-        this.store.updateRun(run);
-        this.hooks.log(`run finishing: ${run.id}`);
-        changed = true;
-      }
+      if (this.retire(entry, now)) changed = true;
     }
 
     return changed;
   }
 
   /**
-   * Time out `finishing` runs into the terminal, verdict-less `ended`.
-   * The panel then says "Ended" (with the shim hint) instead of spinning.
+   * Move a run out of `running` because its process is no longer there.
+   *
+   * The end time is when the process was last SEEN, never "now", so the
+   * detection grace is not billed to the build. For a run orphaned by a
+   * restart that moment is the boot, which is the latest instant anything can
+   * honestly vouch for.
+   */
+  private retire(entry: LiveEntry, now: number, why?: string): boolean {
+    const run = this.store.getRun(entry.runId);
+    if (!run) return false;
+    if (
+      !statusTransitionAllowed(
+        { status: run.status, rank: run.statusRank },
+        { status: "finishing", rank: RANK.observed },
+      )
+    ) {
+      return false;
+    }
+    run.status = "finishing";
+    run.statusRank = RANK.observed;
+    run.endedAt ??= Math.min(entry.lastSeenAt, now);
+    this.store.updateRun(run);
+    this.hooks.log(`run finishing: ${run.id}${why ? ` (${why})` : ""}`);
+    return true;
+  }
+
+  /**
+   * Time out `finishing` runs into the terminal, verdict-less `ended`, and
+   * retire any `running` run too old to be believed.
+   *
+   * The panel then says "Ended" (with the shim hint) instead of spinning. The
+   * age cap is a backstop, not the main defence — see `RUNNING_MAX_AGE_MS`.
    */
   expireFinishing(now: number): boolean {
     let changed = false;
     for (const run of this.store.listUnresolved()) {
+      if (run.status === "running") {
+        if (now - run.startedAt < RUNNING_MAX_AGE_MS) continue;
+        if (run.pid !== null) this.live.delete(run.pid);
+        run.status = "ended";
+        run.statusRank = RANK.observed;
+        run.endedAt ??= now;
+        this.store.updateRun(run);
+        this.hooks.log(`run abandoned after ${RUNNING_MAX_AGE_MS}ms: ${run.id}`);
+        changed = true;
+        continue;
+      }
       if (run.status !== "finishing") continue;
       const since = run.endedAt ?? run.startedAt;
       if (now - since < FINISHING_TIMEOUT_MS) continue;
@@ -259,9 +348,7 @@ export class Engine {
     },
     now: number,
   ): boolean {
-    const target = this.store
-      .listRuns({ limit: 50 })
-      .find((run) => run.bundlePath === bundlePath);
+    const target = this.store.getRunByBundlePath(bundlePath);
     if (!target) return false;
 
     const verdict: RunStatus =
@@ -338,8 +425,10 @@ export class Engine {
     if (!looksLikeBuildLauncher(outcome.command)) return false;
 
     const contained = this.store
-      .listRuns({ limit: 500, includeNoise: true })
-      .filter((run) => run.threadId === outcome.threadId)
+      // Attribution in SQL against `run_thread_idx`, not a scan of the newest
+      // 500 rows machine-wide: a thread whose build sat outside that window
+      // simply never got its verdict.
+      .listRuns({ limit: 200, includeNoise: true, threadId: outcome.threadId })
       .filter((run) => !VERDICT_STATUSES.has(run.status))
       .filter((run) => run.startedAt >= outcome.startedAt - LAUNCH_SLACK_MS)
       .filter(
@@ -588,9 +677,7 @@ export class Engine {
 
     // Prefer the run that already recorded this bundle path (wrapper/`bb
     // xcode run` case), else window-match.
-    const byPath = this.store
-      .listRuns({ limit: 50 })
-      .find((run) => run.bundlePath === bundlePath);
+    const byPath = this.store.getRunByBundlePath(bundlePath);
     const target =
       byPath ??
       this.store

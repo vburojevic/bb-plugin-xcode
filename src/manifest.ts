@@ -13,7 +13,7 @@
  */
 
 import { isRecord, parsePlist, type PlistValue } from "./plist";
-import type { ManifestEntry, RunKind, RunStatus } from "./types";
+import type { ManifestEntry, RunStatus } from "./types";
 
 /**
  * Offset between Apple's reference date (2001-01-01 UTC) and the Unix epoch.

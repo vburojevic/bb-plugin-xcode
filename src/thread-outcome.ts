@@ -40,14 +40,19 @@ export interface BackgroundCommandOutcome {
 
 const EXIT_CODE = /\bexit code\s+(-?\d+)\b/i;
 
-export function backgroundCommandOutcomes(
-  events: readonly ThreadEventLike[],
-): BackgroundCommandOutcome[] {
-  const commands = new Map<
-    string,
-    { command: string; cwd: string; startedAt: number }
-  >();
+/** A `commandExecution` start, keyed by the tool-call id a task links back to. */
+export interface CommandStart {
+  id: string;
+  seq: number;
+  command: string;
+  cwd: string;
+  startedAt: number;
+}
 
+function commandStarts(
+  events: readonly ThreadEventLike[],
+): Map<string, CommandStart> {
+  const commands = new Map<string, CommandStart>();
   for (const event of events) {
     if (event.type !== "item/started") continue;
     const item = event.data.item;
@@ -59,11 +64,42 @@ export function backgroundCommandOutcomes(
       continue;
     }
     commands.set(item.id, {
+      id: item.id,
+      seq: event.seq,
       command: item.command,
       cwd: item.cwd ?? "",
       startedAt: event.createdAt,
     });
   }
+  return commands;
+}
+
+/**
+ * Command starts in this window that have not yet reported a task completion.
+ *
+ * A reader that pages forward has to know where it may safely resume from: a
+ * launcher whose exit has not arrived yet is still needed to interpret that
+ * exit when it does, and skipping past it would strand the verdict silently.
+ * Returned oldest-first by sequence.
+ */
+export function unresolvedCommandStarts(
+  events: readonly ThreadEventLike[],
+): CommandStart[] {
+  const completed = new Set<string>();
+  for (const event of events) {
+    if (event.type !== "item/backgroundTask/completed") continue;
+    const parent = event.data.item?.parentToolCallId;
+    if (parent) completed.add(parent);
+  }
+  return [...commandStarts(events).values()]
+    .filter((start) => !completed.has(start.id))
+    .sort((a, b) => a.seq - b.seq);
+}
+
+export function backgroundCommandOutcomes(
+  events: readonly ThreadEventLike[],
+): BackgroundCommandOutcome[] {
+  const commands = commandStarts(events);
 
   const outcomes: BackgroundCommandOutcome[] = [];
   const seenTasks = new Set<string>();

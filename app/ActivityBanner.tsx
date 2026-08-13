@@ -63,7 +63,7 @@ import type { rpcContract } from "../src/contract";
 import { isNoiseRun } from "../src/model";
 
 import { XcodeActivityRow } from "./ActivityRow";
-import { activityMetaClass, runActivityState } from "./activity-styles";
+import { activityMetaClass } from "./activity-styles";
 import { RunDetail } from "./RunDetail";
 import { isLive, statusClass, type RunDto } from "./status-types";
 import { useChatStatus, useLiveTick } from "./useChatStatus";

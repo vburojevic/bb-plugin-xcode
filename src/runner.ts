@@ -7,7 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,9 +21,22 @@ import {
   type StreamProgress,
 } from "./stream";
 
+/** Distinguishes bundles minted within the same millisecond by one process. */
+let bundleCounter = 0;
+
 export interface RunnerOptions {
   argv: readonly string[];
   cwd?: string;
+  /**
+   * Where the result bundle is written when the argv does not name one.
+   *
+   * Defaults to the scratch directory, which is what it used to always do —
+   * and the reason wrapped builds escaped retention entirely: their bundles
+   * landed in a tmp directory nothing owned, to be collected whenever the OS
+   * felt like it. Pointing this at the shim's bundle directory puts every
+   * bundle this plugin causes to exist under one policy.
+   */
+  bundleDir?: string;
   /** Called on every parsed event; keep it cheap, it runs on the tail loop. */
   onEvent?: (event: StreamEvent, progress: StreamProgress) => void;
   /** Called once the child is spawned, with the paths it will write. */
@@ -66,7 +79,15 @@ function tailOf(text: string, limit: number): string {
 export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> {
   const workDir = await mkdtemp(join(tmpdir(), "bb-xcode-"));
   const streamPath = join(workDir, "stream.ndjson");
-  const defaultBundle = join(workDir, "result.xcresult");
+  // The stream file is scratch and dies with the workdir; the bundle is the
+  // artifact and outlives it, so the two must not share a directory.
+  const stamp = `${Date.now().toString(36)}-${process.pid}-${bundleCounter++}`;
+  const defaultBundle = options.bundleDir
+    ? join(options.bundleDir, `run-${stamp}.xcresult`)
+    : join(workDir, "result.xcresult");
+  if (options.bundleDir) {
+    await mkdir(options.bundleDir, { recursive: true });
+  }
   await writeFile(streamPath, "");
 
   const injected = injectStreamFlags(options.argv, defaultBundle, streamPath);
@@ -156,6 +177,14 @@ export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> 
   await tail.catch(() => undefined);
   options.signal?.removeEventListener("abort", onAbort);
   options.detachSignal?.removeEventListener("abort", onDetach);
+
+  // Nothing reads the stream file after the tail stops. Leaving the scratch
+  // directory behind meant one abandoned `bb-xcode-*` per wrapped build,
+  // forever, waiting on whenever the OS decides to sweep its temp directory.
+  // Only safe now that the bundle is written somewhere else.
+  if (options.bundleDir) {
+    await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+  }
 
   return {
     exitCode: exit.code,

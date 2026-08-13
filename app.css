@@ -280,3 +280,289 @@ span.bbx-dot > span {
     }
   }
 }
+
+/* ===========================================================================
+ * Simulators
+ *
+ * Appended verbatim from the plugin this half was merged in from. Every rule
+ * below is prefixed `bbxs-`, so the two stylesheets share a file without
+ * sharing a selector. The reasoning in the block comment that follows is why
+ * these rules are authored CSS rather than Tailwind classes, and it still
+ * applies here.
+ * ======================================================================== */
+/*
+ * Authored CSS, imported by `app.tsx` and preserved unscoped.
+ *
+ * Two reasons anything lives here rather than in a Tailwind class.
+ *
+ * 1. **The plugin Tailwind build silently drops arbitrary values containing
+ *    commas.** `color-mix(in oklab,a,b)` written as `[...]` compiles to
+ *    nothing, with no error. Every mix in this plugin is therefore authored
+ *    here. Comma-free arbitraries — `w-[26rem]`, `text-[13px]`,
+ *    `calc(100%-1rem)`, `var(--x)` — are fine in JSX.
+ *
+ * 2. **Compiled plugin CSS is `@scope`-wrapped and matches DESCENDANTS only,
+ *    never the scope root itself.** A Tailwind class on the element that *is*
+ *    the root compiles, ships, and does nothing. Imported CSS has no such
+ *    limit, so anything that has to work on a root element is here.
+ *
+ * Colour is one variable and one class swap: a tone sets `--bbxs` from a host
+ * token, and `--bbxs-ink` is that hue mixed 55/45 toward the foreground so text
+ * stays legible in both themes without a second token per tone.
+ */
+
+/* ---------------------------------------------------------------------------
+ * Tones
+ * ------------------------------------------------------------------------ */
+
+.bbxs-tone {
+  --bbxs: var(--muted-foreground);
+  --bbxs-ink: color-mix(in oklab, var(--bbxs) 55%, var(--foreground) 45%);
+  --bbxs-wash: color-mix(in oklab, var(--bbxs) 12%, transparent);
+  --bbxs-edge: color-mix(in oklab, var(--bbxs) 40%, var(--border));
+}
+
+.bbxs-tone-live {
+  --bbxs: var(--success, oklch(0.72 0.16 150));
+}
+
+.bbxs-tone-stalled {
+  --bbxs: var(--warning, oklch(0.78 0.15 80));
+}
+
+.bbxs-tone-dead {
+  --bbxs: var(--destructive);
+}
+
+/*
+ * `exposed` deliberately does not borrow `--primary`. That is the token bb
+ * spends on ordinary affirmative buttons, and rendering the highest-stakes
+ * state in the button colour makes it read as normal. It is a *filled* bar, so
+ * it differs in form and not only in token — and it outranks `live`, because a
+ * trust state outranks a liveness state.
+ */
+.bbxs-tone-exposed {
+  --bbxs: var(--warning, oklch(0.78 0.15 80));
+}
+
+.bbxs-ink {
+  color: var(--bbxs-ink);
+}
+
+.bbxs-wash {
+  background-color: var(--bbxs-wash);
+}
+
+.bbxs-filled {
+  background-color: color-mix(in oklab, var(--bbxs) 24%, var(--card));
+  border-color: color-mix(in oklab, var(--bbxs) 55%, var(--border));
+  color: var(--bbxs-ink);
+}
+
+/* ---------------------------------------------------------------------------
+ * The live dot
+ *
+ * Reduced motion is not "no signal": the dot stops breathing and stays lit
+ * rather than disappearing, because its job is to say the stream is live.
+ * ------------------------------------------------------------------------ */
+
+.bbxs-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 9999px;
+  background-color: var(--bbxs);
+  animation: bbxs-breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes bbxs-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bbxs-dot {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * The frame
+ *
+ * A focusable region with a visible ring, because arrow keys move a crosshair
+ * over it and typing while it holds focus routes to the device.
+ * ------------------------------------------------------------------------ */
+
+.bbxs-frame {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: color-mix(in oklab, var(--muted) 60%, var(--background));
+  outline: none;
+}
+
+.bbxs-frame:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--ring);
+}
+
+.bbxs-frame-img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  /* A simulator frame is a screenshot of a UI: keep the pixels honest rather
+     than letting the browser soften a 1px divider into something else. */
+  image-rendering: -webkit-optimize-contrast;
+}
+
+/* The aspect box shown before the first frame, and behind a 404 tile. There is
+   deliberately no spinner: a grid of twelve spinners is a screensaver, and a
+   spinner where the honest answer is "waiting for the first frame" reads as
+   broken. */
+.bbxs-skeleton {
+  background-color: var(--muted);
+  border-radius: var(--radius-md, 0.375rem);
+}
+
+/* A sentence over a dimmed frame — every non-streaming state, never a bare
+   spinner. */
+.bbxs-veil {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 1.5rem;
+  text-align: center;
+  background-color: color-mix(in oklab, var(--background) 78%, transparent);
+  backdrop-filter: blur(2px);
+}
+
+/* ---------------------------------------------------------------------------
+ * The composer banner frame
+ *
+ * The host mounts plugin banners under a `display: contents` wrapper and the
+ * prompt stack spaces itself with `margin-bottom: 8px`. A contents box
+ * generates no box, so that margin is discarded and a `chrome: "card"` banner
+ * sits flush against the card below. Owning the frame is what lets the plugin
+ * own the 8px.
+ * ------------------------------------------------------------------------ */
+
+.bbxs-stack-card {
+  margin-bottom: 0.5rem; /* -bottom, never -top: the native stack spaces downward */
+  overflow: hidden;
+  border-radius: var(--radius-lg, 0.5rem);
+  border: 1px solid var(--border);
+  background: var(--surface-raised-solid, var(--card));
+}
+
+/* ---------------------------------------------------------------------------
+ * Progress
+ *
+ * Determinate when the manifest gave a denominator, an indeterminate comet when
+ * it did not — degrading to a half-lit track rather than to nothing.
+ * ------------------------------------------------------------------------ */
+
+.bbxs-comet {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--muted);
+}
+
+.bbxs-comet::after {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  width: 35%;
+  background: linear-gradient(90deg, transparent, var(--bbxs, var(--primary)), transparent);
+  animation: bbxs-comet 1.4s ease-in-out infinite;
+}
+
+@keyframes bbxs-comet {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(340%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bbxs-comet::after {
+    animation: none;
+    width: 50%;
+    background: color-mix(in oklab, var(--bbxs, var(--primary)) 45%, transparent);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Scrolling
+ *
+ * A permanently-visible thin scrollbar, because a list cut by `max-height`
+ * looks exactly like a list that ended.
+ * ------------------------------------------------------------------------ */
+
+.bbxs-scroll {
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--foreground) 25%, transparent) transparent;
+}
+
+.bbxs-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.bbxs-scroll::-webkit-scrollbar-thumb {
+  background-color: color-mix(in oklab, var(--foreground) 25%, transparent);
+  border-radius: 9999px;
+}
+
+/* ---------------------------------------------------------------------------
+ * Diff tiles
+ * ------------------------------------------------------------------------ */
+
+/* The mask is painted over the head frame at 40%, which is why odiff is run
+   with `--diff-mask`: its default output is the comparison image with changed
+   pixels tinted, and overlaying that would render a washed-out second copy of
+   the frame rather than a highlight. */
+.bbxs-mask {
+  position: absolute;
+  inset: 0;
+  opacity: 0.4;
+  mix-blend-mode: normal;
+  pointer-events: none;
+}
+
+.bbxs-tile-crossfade {
+  transition: opacity 120ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bbxs-tile-crossfade {
+    transition: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Coarse pointers
+ *
+ * The frame must not pan, zoom or select under a finger — every touch is input
+ * for the device, not for the page.
+ * ------------------------------------------------------------------------ */
+
+@media (pointer: coarse) {
+  .bbxs-frame {
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+}

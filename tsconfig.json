@@ -24,16 +24,20 @@
       ]
     },
     "noEmit": true,
-    "skipLibCheck": false
+    "skipLibCheck": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
   },
   "include": [
     "server.ts",
     "app.tsx",
+    "vitest.config.ts",
     "types",
     "components",
     "lib",
     "hooks",
     "src",
-    "app"
+    "app",
+    "test"
   ]
 }

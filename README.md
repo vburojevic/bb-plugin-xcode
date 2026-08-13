@@ -62,18 +62,45 @@ it must never be the reason a build fails. `bb xcode shim uninstall` removes it.
 
 ```sh
 bb xcode status                 # what is running now
-bb xcode runs [--failed] [--kind test] [--all] [--limit N]
+bb xcode runs [--kind test] [--limit N]
 bb xcode show <run-id>          # issues + failed tests with file:line
 bb xcode roots                  # discovered DerivedData roots
 bb xcode rescan                 # force discovery + manifest sweep
 
 # Live progress + guaranteed result capture:
 bb xcode run -- xcodebuild -scheme App -destination 'platform=macOS' test
+
+# …or block until it reports:
+bb xcode run --wait -- xcodebuild -scheme App test
+bb xcode wait <run-id> [--timeout 600]
 ```
 
-The **Xcode** nav panel shows the live strip, history and trends. Agents get
-`xcode_status` and `xcode_last_failure` tools, so they can ask whether a build
-passed instead of grepping build output.
+`run` detaches on purpose: a build's lifetime belongs to the build, not to the
+command that asked for it. `--wait` and `wait` only change who is *watching* —
+if the request disconnects or the wait times out, the build carries on and
+`bb xcode status` still finds it. Both exit non-zero on a failed build, so they
+compose with `&&`.
+
+The **Xcode** nav panel shows the live strip, history and trends.
+
+### For agents
+
+| Tool | Answers |
+|---|---|
+| `xcode_build` | Runs xcodebuild, **waits**, returns a verdict with errors and failed tests |
+| `xcode_status` | What is running now, and how this thread's recent runs finished |
+| `xcode_last_failure` | Errors and failed tests from the last failure, with file:line |
+
+`xcode_build` exists because the alternative is worse. Telling a model to start
+a detached build and then check on it is telling it to write a poll loop — and
+`src/engine.ts` then has to recognise those loops (`WATCHER_RE`) and refuse to
+believe their exit codes, because `until ! bb xcode status; do sleep 5; done`
+exits 0 whether the build passed or failed. One blocking call removes the
+entire problem.
+
+Everything an agent tool answers is scoped to the thread's own checkout, in
+SQL. A thread with no resolvable checkout is told exactly that rather than
+being handed the machine's activity.
 
 ## Things Xcode does that this had to work around
 
@@ -112,6 +139,24 @@ Each of these was confirmed by experiment on Xcode 26.6, not from docs.
   3-tick grace period reported a 5s build as 10.6s; runs end at the moment they
   were last *seen*.
 
+## Retention
+
+Two separate budgets, because they are two very different things.
+
+| Setting | Default | What it holds |
+|---|---|---|
+| Keep history for | 30 days | Run rows, issues, per-test results — kilobytes |
+| Keep result bundles for | 2 days | `.xcresult` directory trees — hundreds of MB each |
+| Result bundle disk budget | 5 GB | Hard ceiling; oldest bundles evicted first |
+
+Everything the tracker needs is extracted from a bundle on the first sweep, so
+a bundle only has to outlive the gap between the build finishing and the sweep
+reading it. Pointing a month of *history* retention at *bundles* — which is
+what a single shared setting did — meant following the shim instructions above
+could quietly cost tens of gigabytes. Age alone is not enough either: an
+afternoon of snapshot-test runs passes any sane budget well inside two days,
+which is what the disk ceiling is for.
+
 ## Known limits
 
 - **Live process observation is server-host-local.** The plugin SDK has no
@@ -129,16 +174,44 @@ Each of these was confirmed by experiment on Xcode 26.6, not from docs.
 
 ```sh
 npm install
-npm test          # 64 unit tests over the pure parsing/correlation logic
-npm run typecheck
+npm test          # 170 unit tests over the pure parsing/reconciliation logic
+npm run typecheck # includes test/, so fixtures cannot drift from the types
+npm run check     # both, as CI runs them
 bb plugin dev     # rebuild + reload on save
 ```
+
+The suite runs on Linux in CI. That is a constraint, not a convenience: every
+`ps`, `xcrun` and `xcresulttool` call is injected as fixture text, so the whole
+reconciliation layer is testable without a Mac, and a Linux runner is what keeps
+it honest.
 
 Architecture (v2): **one run, one identity, monotonic enrichment.** A run is
 born from a process observation; every other source (log store, result bundle)
 may only *enrich* it, carrying a confidence rank (observed < logged < verified)
 that can never go backward. The lifecycle is explicit — running → finishing →
 passed/warnings/failed/cancelled, or a timeout to the honest terminal `ended`.
-`src/model.ts` states the rules, `src/engine.ts` is the single writer that
-applies them, `src/collector.ts` owns all I/O, `server.ts` is wiring. The
-engine is tested against a real in-memory SQLite (`test/engine.test.ts`).
+
+| Module | Owns |
+|---|---|
+| `src/model.ts` | The rules: rank lattice, lifecycle, what counts as noise |
+| `src/engine.ts` | The single writer that applies them |
+| `src/store.ts` | Every read and write, with the SQL scope filter |
+| `src/collector.ts` | All I/O — `ps`, manifests, `xcresulttool`, discovery |
+| `src/wrapped.ts` | Launching a build we can speak for |
+| `src/cli.ts`, `src/tools.ts` | The two agent-facing surfaces |
+| `src/rpc.ts`, `src/dto.ts` | The two frontend-facing ones |
+| `src/scope-sync.ts`, `src/thread-sync.ts` | Talking to bb about threads |
+| `server.ts` | Wiring, and nothing else |
+
+Identity is the thing to be careful with. A run is keyed by pid *within one
+instance's lifetime*, because the tracker drops a pid the moment it leaves the
+snapshot — but not across a restart, where the OS may have handed that pid to
+something else. A re-adopted run therefore has to prove itself by reporting the
+start time the store expects (`ADOPTION_SLACK_MS`), or it is retired and the
+build genuinely holding the pid gets its own row. A bundle path, by contrast,
+*is* an identity, and is indexed as one.
+
+The engine, the store and the thread reconciler are tested against a real
+in-memory SQLite. `test/store-scope.test.ts` asserts the SQL and in-memory
+scope predicates agree on the same fixtures, because two implementations of
+one rule is how a thread quietly stops seeing its own builds.

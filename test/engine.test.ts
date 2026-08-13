@@ -1,7 +1,12 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { Engine, MISSES_BEFORE_FINISHING, domainCompatible } from "../src/engine";
+import {
+  Engine,
+  MISSES_BEFORE_FINISHING,
+  RUNNING_MAX_AGE_MS,
+  domainCompatible,
+} from "../src/engine";
 import {
   FINISHING_TIMEOUT_MS,
   RANK,
@@ -26,6 +31,8 @@ function activity(overrides: Partial<LiveActivity> = {}): LiveActivity {
     startedAt: 1_000_000,
     roots: ["/tmp/dd"],
     workerCount: 2,
+    phase: null,
+    currentFile: null,
     isDaemon: false,
     kind: "build",
     scheme: "Demo",
@@ -129,6 +136,63 @@ describe("lifecycle: running → finishing → ended", () => {
     expect(store.listRuns({})).toHaveLength(1);
     expect(store.listRuns({})[0]!.status).toBe("running");
   });
+
+  it("tolerates etime jitter in a re-adopted run's reported start", () => {
+    engine.foldSnapshot([activity()], 1_000_000);
+    const second = new Engine(store, hooks);
+    second.hydrate(1_010_000);
+    // `startedAt` is `now - etime` at whole-second resolution, so the same
+    // process legitimately reports a start a second or two either way.
+    second.foldSnapshot([activity({ startedAt: 1_002_000 })], 1_012_000);
+    expect(store.listRuns({})).toHaveLength(1);
+    expect(store.listRuns({})[0]!.status).toBe("running");
+  });
+
+  it("does not let a recycled pid keep a dead run alive forever", () => {
+    engine.foldSnapshot([activity()], 1_000_000);
+    const orphan = store.listRuns({ limit: 1 })[0]!.id;
+
+    // bb restarts. The build is long gone, but the row still says `running`
+    // and still names pid 100 — which the OS has since handed to a new build.
+    const second = new Engine(store, hooks);
+    second.hydrate(9_000_000);
+    second.foldSnapshot([activity({ startedAt: 8_900_000 })], 9_000_000);
+
+    const runs = store.listRuns({});
+    expect(runs).toHaveLength(2);
+    // The orphan is retired rather than pinned at `running`…
+    expect(store.getRun(orphan)!.status).toBe("finishing");
+    // …and the build that is genuinely there gets its own row.
+    const fresh = runs.find((run) => run.id !== orphan)!;
+    expect(fresh.status).toBe("running");
+    expect(fresh.startedAt).toBe(8_900_000);
+  });
+
+  it("retires the orphan without billing it the downtime", () => {
+    engine.foldSnapshot([activity()], 1_000_000);
+    const orphan = store.listRuns({ limit: 1 })[0]!.id;
+    const second = new Engine(store, hooks);
+    second.hydrate(9_000_000);
+    second.foldSnapshot([activity({ startedAt: 8_900_000 })], 9_000_000);
+    // Boot is the latest moment anything can honestly vouch for; never "now"
+    // if that is later still.
+    expect(store.getRun(orphan)!.endedAt).toBe(9_000_000);
+  });
+
+  it("abandons a running run too old to be believed", () => {
+    engine.foldSnapshot([activity()], 1_000_000);
+    const id = store.listRuns({ limit: 1 })[0]!.id;
+
+    expect(engine.expireFinishing(1_000_000 + RUNNING_MAX_AGE_MS - 1)).toBe(
+      false,
+    );
+    expect(store.getRun(id)!.status).toBe("running");
+
+    expect(engine.expireFinishing(1_000_000 + RUNNING_MAX_AGE_MS + 1)).toBe(
+      true,
+    );
+    expect(store.getRun(id)!.status).toBe("ended");
+  });
 });
 
 describe("status lattice", () => {
@@ -161,7 +225,7 @@ describe("status lattice", () => {
 });
 
 describe("manifest folding", () => {
-  const manifestEntry = (overrides = {}) => ({
+  const manifestEntry = () => ({
     uniqueIdentifier: "uuid-1",
     title: "Building workspace X with scheme Demo",
     scheme: "Demo",
@@ -648,6 +712,35 @@ describe("foldWrappedExit", () => {
     );
     expect(store.getRun(id)!.status).toBe("passed");
   });
+
+  /**
+   * A long build on a busy machine is not an edge case: agents build in
+   * parallel, and a 20-minute test suite can easily have a hundred shorter
+   * runs start and finish inside it. Looking the bundle's owner up by scanning
+   * the newest 50 rows lost exactly those runs — the ones that took longest.
+   */
+  it("finds its run however far it has fallen down the recent list", () => {
+    const id = startWrapped();
+    retire(1_002_000);
+    for (let i = 0; i < 120; i++) {
+      engine.foldSnapshot(
+        [activity({ pid: 5_000 + i, startedAt: 2_000_000 + i * 1_000 })],
+        2_000_000 + i * 1_000,
+      );
+    }
+    expect(store.listRuns({ limit: 50 }).some((run) => run.id === id)).toBe(
+      false,
+    );
+
+    expect(
+      engine.foldWrappedExit(
+        BUNDLE,
+        { exitCode: 0, signal: null, errors: 0, warnings: 0 },
+        2_200_000,
+      ),
+    ).toBe(true);
+    expect(store.getRun(id)!.status).toBe("passed");
+  });
 });
 
 describe("foldThreadCommandExit", () => {
@@ -667,6 +760,7 @@ describe("foldThreadCommandExit", () => {
     expect(
       engine.foldThreadCommandExit(
         {
+          taskId: "task_build",
           threadId: "thr_build",
           command: "cd /tmp/proj && ./scripts/build_app.sh build",
           cwd: "",
@@ -686,6 +780,7 @@ describe("foldThreadCommandExit", () => {
     retire(1_002_000);
     engine.foldThreadCommandExit(
       {
+        taskId: "task_build",
         threadId: "thr_build",
         command: "xcodebuildmcp simulator build --scheme Demo",
         cwd: "/tmp/proj",
@@ -711,6 +806,7 @@ describe("foldThreadCommandExit", () => {
     expect(
       engine.foldThreadCommandExit(
         {
+          taskId: "task_build",
           threadId: "thr_build",
           command:
             './scripts/build_app.sh build --env dev --sim local > /tmp/b.log 2>&1; echo "EXIT=$?"',
@@ -737,6 +833,7 @@ describe("foldThreadCommandExit", () => {
     expect(
       engine.foldThreadCommandExit(
         {
+          taskId: "task_build",
           threadId: "thr_build",
           command:
             'until ! pgrep -f xcodebuild > /dev/null; do sleep 5; done; echo "build finished"',
@@ -758,6 +855,7 @@ describe("foldThreadCommandExit", () => {
 
     engine.foldThreadCommandExit(
       {
+        taskId: "task_build",
         threadId: "thr_build",
         command:
           'until ! bb xcode status 2>/dev/null | grep -q "^Active (1)"; do sleep 5; done',
@@ -780,6 +878,7 @@ describe("foldThreadCommandExit", () => {
     expect(
       engine.foldThreadCommandExit(
         {
+          taskId: "task_build",
           threadId: "thr_build",
           command: "./scripts/build_app.sh build",
           cwd: "",
@@ -804,6 +903,7 @@ describe("foldThreadCommandExit", () => {
     expect(
       engine.foldThreadCommandExit(
         {
+          taskId: "task_build",
           threadId: "thr_build",
           command: "./scripts/build_app.sh build &",
           cwd: "",
@@ -831,6 +931,7 @@ describe("foldThreadCommandExit", () => {
 
     engine.foldThreadCommandExit(
       {
+        taskId: "task_build",
         threadId: "thr_build",
         command: "./scripts/build_app.sh build-all",
         cwd: "",
@@ -856,6 +957,7 @@ describe("foldThreadCommandExit", () => {
 
     engine.foldThreadCommandExit(
       {
+        taskId: "task_build",
         threadId: "thr_build",
         command: "./scripts/build_app.sh build-all",
         cwd: "",
@@ -877,6 +979,7 @@ describe("foldThreadCommandExit", () => {
 
     engine.foldThreadCommandExit(
       {
+        taskId: "task_build",
         threadId: "thr_build",
         command: "./scripts/build_app.sh build --env dev --sim local",
         cwd: "",
@@ -900,6 +1003,7 @@ describe("foldThreadCommandExit", () => {
     expect(
       engine.foldThreadCommandExit(
         {
+          taskId: "task_build",
           threadId: "thr_build",
           command: "xcodebuildmcp simulator build --scheme Demo",
           cwd: "/tmp/proj",
