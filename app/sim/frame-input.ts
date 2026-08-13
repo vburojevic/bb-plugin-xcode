@@ -33,6 +33,36 @@ export function toNormalized(rect: Rect, clientX: number, clientY: number): { x:
   };
 }
 
+/**
+ * The rectangle the picture actually occupies inside its element.
+ *
+ * Both the `<img>` and the `<canvas>` are `object-fit: contain` inside a box
+ * that is whatever shape the panel is. When the panel is wider than the device
+ * — a nav panel on a wide window, every time — the frame is letterboxed, and
+ * `getBoundingClientRect` describes the element, not the picture. Normalising
+ * against the element then maps a tap to the wrong point on the device: on a
+ * 1080x871 box showing a 1320x2868 screen, a tap at 45% of the element lands at
+ * 36% of the device, and every horizontal coordinate is wrong by more the wider
+ * the panel gets.
+ *
+ * Returns the element rect unchanged when the screen size is unknown, which is
+ * the honest fallback: the first frames arrive before the dimension push does.
+ */
+export function contentRect(rect: Rect, screen: { width: number; height: number } | null): Rect {
+  if (screen === null || screen.width <= 0 || screen.height <= 0) return rect;
+  if (rect.width <= 0 || rect.height <= 0) return rect;
+
+  const scale = Math.min(rect.width / screen.width, rect.height / screen.height);
+  const width = screen.width * scale;
+  const height = screen.height * scale;
+  return {
+    left: rect.left + (rect.width - width) / 2,
+    top: rect.top + (rect.height - height) / 2,
+    width,
+    height,
+  };
+}
+
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.min(1, Math.max(0, value));

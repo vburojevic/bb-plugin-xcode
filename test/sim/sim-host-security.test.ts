@@ -291,8 +291,11 @@ describe("the stream token", () => {
     );
   });
 
-  it("recognises only the exact stream path", () => {
+  it("recognises only the exact stream paths", () => {
     expect(isStreamRoute(STREAM_PATH)).toBe(true);
+    // H.264 is the fast path and the same kind of secret: pixels, not control.
+    expect(isStreamRoute(`/helper/${UDID}/stream.avcc`)).toBe(true);
+    expect(isStreamRoute(`/helper/${UDID}/stream.hevc`)).toBe(false);
     expect(isStreamRoute(`/helper/${UDID}/stream.mjpeg/../ws`)).toBe(false);
     expect(isStreamRoute(`/helper/${UDID}/streamXmjpeg`)).toBe(false);
     expect(isStreamRoute("/exec")).toBe(false);

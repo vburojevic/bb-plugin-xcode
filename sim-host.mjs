@@ -58,6 +58,7 @@ const ALLOW = [
   { method: "POST", pattern: /^\/grid\/api\/start$/ },
   { method: "POST", pattern: /^\/grid\/api\/shutdown$/ },
   { method: "GET", pattern: new RegExp(`^/helper/${UDID}/stream\\.mjpeg$`) },
+  { method: "GET", pattern: new RegExp(`^/helper/${UDID}/stream\\.avcc$`) },
   { method: "GET", pattern: new RegExp(`^/helper/${UDID}/config$`) },
   { method: "GET", pattern: new RegExp(`^/helper/${UDID}/health$`) },
   { method: "GET", pattern: new RegExp(`^/helper/${UDID}/ax$`) },
@@ -80,7 +81,7 @@ const WS_ALLOW = new RegExp(`^/helper/${UDID}/ws$`);
  * where the master secret would also let them drive it over the HID socket,
  * read the accessibility tree, and shut the device down.
  */
-const STREAM_ONLY = new RegExp(`^/helper/${UDID}/stream\\.mjpeg$`);
+const STREAM_ONLY = new RegExp(`^/helper/${UDID}/stream\\.(mjpeg|avcc)$`);
 
 export function isStreamRoute(path) {
   return STREAM_ONLY.test(path);

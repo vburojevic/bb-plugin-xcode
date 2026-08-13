@@ -938,9 +938,16 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
       }
       if (!booted) return context.text("That simulator is not running.", 409);
 
+      // `codec=avcc` is the H.264 stream; anything else keeps the JPEG one, so
+      // an older panel asking for no codec at all still gets a picture.
+      const codec = context.req.query("codec") === "avcc" ? "avcc" : "mjpeg";
+
       let upstream;
       try {
-        upstream = await simhost.open(address, { method: "GET", path: simhost.streamPath(udid) });
+        upstream = await simhost.open(address, {
+          method: "GET",
+          path: simhost.streamPath(udid, codec),
+        });
       } catch (error) {
         return context.text(`The capture host refused the stream: ${describe(error)}`, 502);
       }

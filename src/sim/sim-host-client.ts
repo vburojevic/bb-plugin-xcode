@@ -307,7 +307,14 @@ export async function grabFrame(
   });
 }
 
-/** The URL a proxy uses. Only the plugin's own routes ever compose one. */
-export function streamPath(udid: string): string {
-  return `/helper/${udid}/stream.mjpeg`;
+/**
+ * The upstream path a proxy pulls from. Only the plugin's own routes compose one.
+ *
+ * `.avcc` is hardware-encoded H.264 and `.mjpeg` is serve-sim's software JPEG
+ * fallback — 200 KB/s against 3.55 MB/s for the same motion on the same device.
+ * The proxy carries both because the 18× matters most exactly where the proxy
+ * is required: a viewer on the other end of a `bb connect` tunnel.
+ */
+export function streamPath(udid: string, codec: "avcc" | "mjpeg" = "mjpeg"): string {
+  return `/helper/${udid}/stream.${codec}`;
 }

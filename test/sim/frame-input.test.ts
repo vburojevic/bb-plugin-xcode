@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { keyStep, pointerStep, toNormalized, wheelStep } from "../../app/sim/frame-input.js";
+import { contentRect, keyStep, pointerStep, toNormalized, wheelStep } from "../../app/sim/frame-input.js";
 
 const RECT = { left: 100, top: 50, width: 200, height: 400 };
 
@@ -111,5 +111,54 @@ describe("the wheel", () => {
   it("says nothing when nothing moved", () => {
     expect(wheelStep(RECT, 0, 0)).toBeNull();
     expect(wheelStep({ left: 0, top: 0, width: 0, height: 0 }, 0, 10)).toBeNull();
+  });
+});
+
+describe("the letterbox", () => {
+  const screen = { width: 1320, height: 2868 };
+
+  it("maps a tap to the picture, not to the element around it", () => {
+    // The measured case: a 1080x871 panel showing a 1320x2868 device. The
+    // picture is 401px wide, centred, and 679px of the element is background.
+    const element = { left: 0, top: 0, width: 1080, height: 871 };
+    // Height-limited: the picture is 401px wide and fills the 871px height,
+    // leaving 679px of the element as background.
+    const content = contentRect(element, screen);
+    expect(Math.round(content.width)).toBe(401);
+    expect(Math.round(content.height)).toBe(871);
+    expect(Math.round(content.left)).toBe(340);
+
+    // Dead centre stays dead centre either way.
+    expect(toNormalized(content, element.width / 2, element.height / 2).x).toBeCloseTo(0.5, 5);
+
+    // But the element's own edges are outside the picture entirely, and used to
+    // read as 0 and 1 — a tap on background driving the device's far corner.
+    expect(toNormalized(content, 1, 1).x).toBe(0);
+    expect(toNormalized(content, 1079, 870).x).toBe(1);
+  });
+
+  it("letterboxes on whichever axis is tighter", () => {
+    // Panel taller than the device: bars top and bottom instead.
+    const wide = contentRect({ left: 0, top: 0, width: 400, height: 2000 }, screen);
+    expect(Math.round(wide.width)).toBe(400);
+    expect(Math.round(wide.top)).toBe(565);
+
+    // An exact match adds nothing.
+    const exact = contentRect({ left: 0, top: 0, width: 660, height: 1434 }, screen);
+    expect(exact).toEqual({ left: 0, top: 0, width: 660, height: 1434 });
+  });
+
+  it("returns the element untouched when the screen size is not known yet", () => {
+    // The first frames arrive before the dimension push; guessing an aspect
+    // there would be worse than mapping against the element.
+    const element = { left: 5, top: 7, width: 100, height: 200 };
+    expect(contentRect(element, null)).toBe(element);
+    expect(contentRect(element, { width: 0, height: 0 })).toBe(element);
+    expect(contentRect({ left: 0, top: 0, width: 0, height: 0 }, screen)).toEqual({
+      left: 0,
+      top: 0,
+      width: 0,
+      height: 0,
+    });
   });
 });

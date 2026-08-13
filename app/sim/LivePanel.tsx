@@ -10,12 +10,14 @@
  * sentence lives in an `aria-live` region so *"iPhone 17 Pro shut down"* is
  * heard and not only seen.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { liveVeil, metaLine, TONE_CLASS } from "./copy";
 import type { Action } from "./copy";
-import { keyStep, pointerStep, toNormalized, wheelStep } from "./frame-input";
+import { contentRect, keyStep, pointerStep, toNormalized, wheelStep } from "./frame-input";
+import { describeSource, streamSources, type StreamSource } from "./stream-sources";
+import { canDecodeH264, useVideoStream } from "./useVideoStream";
 import type { DeviceList, LiveState } from "./useLive";
 import type { Step } from "../../src/sim/steps.js";
 
@@ -58,6 +60,15 @@ export function LivePanel({
   controls,
 }: LivePanelProps) {
   const [streamFailed, setStreamFailed] = useState(false);
+  /**
+   * Which stream is actually feeding the frame.
+   *
+   * Shown next to the meta line because the fallback is deliberately silent —
+   * and a silent fallback is why "it is slow" took three rounds of measuring to
+   * explain. If someone is on MJPEG, the first thing they should see is that
+   * they are on MJPEG.
+   */
+  const [source, setSource] = useState<StreamSource | null>(null);
   // A new device, or a new stream, is a fresh chance for it to work.
   useEffect(() => setStreamFailed(false), [state?.streamUrl]);
 
@@ -94,6 +105,7 @@ export function LivePanel({
         onStall={onStall}
         onStep={onStep}
         onStreamFailed={() => setStreamFailed(true)}
+        onSource={setSource}
       />
 
       {meta !== null ? (
@@ -105,6 +117,9 @@ export function LivePanel({
                   and does not belong as the primary label under a live video. */}
               <p tabIndex={0} className="truncate text-sm text-muted-foreground">
                 {meta}
+                {describeSource(source) === null ? null : (
+                  <span className="ml-2 text-xs opacity-60">{describeSource(source)}</span>
+                )}
               </p>
             </TooltipTrigger>
             <TooltipContent>
@@ -132,9 +147,19 @@ interface LiveFrameProps {
   onStall: () => void;
   onStep: (step: Step) => void;
   onStreamFailed: () => void;
+  /** Reports the rung in use, for the meta line. */
+  onSource: (source: StreamSource | null) => void;
 }
 
-function LiveFrame({ state, veil, onAction, onStall, onStep, onStreamFailed }: LiveFrameProps) {
+function LiveFrame({
+  state,
+  veil,
+  onAction,
+  onStall,
+  onStep,
+  onStreamFailed,
+  onSource,
+}: LiveFrameProps) {
   const proxiedUrl = state?.streamUrl ?? null;
   const directUrl = state?.directStreamUrl ?? null;
   const screen = state?.screen ?? null;
@@ -147,48 +172,71 @@ function LiveFrame({ state, veil, onAction, onStall, onStep, onStreamFailed }: L
 
   const visible = useDocumentVisible();
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [failed, setFailed] = useState(false);
   const [crosshair, setCrosshair] = useState<{ x: number; y: number } | null>(null);
 
   /**
-   * Direct first, proxied second.
+   * The source ladder: best codec first, best route second.
    *
-   * The direct URL points at the capture host's loopback port, which is only
-   * reachable for a viewer on the same machine as the bb server. Nothing here
-   * can know whether that is true — the panel may be a browser on another
-   * machine, or reached over a `bb connect` tunnel where a plain-HTTP image is
-   * blocked as mixed content — and asking the server is no better, because the
-   * server does not know where its own panel is being rendered either.
+   * Neither question can be answered in advance. H.264 needs WebCodecs and a
+   * host whose hardware can encode it; direct needs the viewer to be on this
+   * machine, which the server cannot know about its own panel and which a
+   * `bb connect` tunnel additionally forbids as mixed content. So the panel
+   * tries, and a failure advances it one rung — no probe, no configuration.
    *
-   * So it is discovered rather than declared: try direct, and let the `error`
-   * event, which arrives in milliseconds on the remote path, promote the proxy.
-   * There is no probe and no configuration to get wrong.
+   * `streamSources` puts codec above route because the measurement does:
+   * 24.9 fps at 200 KB/s over H.264 against 14.3 fps at 3.55 MB/s over MJPEG,
+   * on the same device under the same motion.
    */
-  const [useProxy, setUseProxy] = useState(false);
-  const streamUrl = (useProxy ? proxiedUrl : (directUrl ?? proxiedUrl)) ?? null;
-  const streamingDirectly = streamUrl !== null && streamUrl === directUrl;
+  const sources = useMemo(
+    () => streamSources({ direct: directUrl, proxied: proxiedUrl }, canDecodeH264()),
+    [directUrl, proxiedUrl],
+  );
+  const [rung, setRung] = useState(0);
+  const source = sources[rung] ?? null;
+  const streamUrl = source?.url ?? null;
+  const streamingDirectly = source?.route === "direct";
+  const decoding = source?.codec === "h264";
 
   const interactive = state?.kind === "streaming";
 
-  // MJPEG is unbounded. The stream is opened only while mounted and visible,
-  // and `src` is cleared on hide, which closes the connection.
+  // Either stream is unbounded, so both are opened only while mounted and
+  // visible; hiding drops the connection.
   const active = streamUrl !== null && visible && !failed;
 
-  // A new stream is a fresh chance for the direct path: a capture host restart
-  // rotates the token and the port, and the reason direct failed last time may
-  // have gone with it.
+  // A new stream is a fresh start at the top of the ladder: a capture host
+  // restart rotates the token and the port, and whatever made a rung fail last
+  // time may have gone with it.
   useEffect(() => {
     setFailed(false);
-    setUseProxy(false);
+    setRung(0);
   }, [proxiedUrl, directUrl]);
+
+  /** One rung down, or out of rungs and the veil has to say so. */
+  const advance = useCallback(() => {
+    setRung((current) => {
+      if (current + 1 < sources.length) return current + 1;
+      setFailed(true);
+      onStreamFailed();
+      return current;
+    });
+  }, [sources.length, onStreamFailed]);
+
+  useEffect(() => onSource(active ? source : null), [active, source, onSource]);
+
+  const video = useVideoStream(decoding ? streamUrl : null, canvasRef, active);
+  useEffect(() => {
+    if (video.failed) advance();
+  }, [video.failed, advance]);
 
   useEffect(() => {
     const element = imgRef.current;
     if (element === null) return;
     // Assigning "" is what actually drops the connection; removing the
     // attribute leaves the request in flight in some browsers.
-    element.src = active && streamUrl !== null ? streamUrl : "";
-  }, [active, streamUrl]);
+    element.src = !decoding && active && streamUrl !== null ? streamUrl : "";
+  }, [decoding, active, streamUrl]);
 
   /**
    * Presence, only while streaming directly.
@@ -212,12 +260,29 @@ function LiveFrame({ state, veil, onAction, onStall, onStep, onStreamFailed }: L
     return () => abort.abort();
   }, [streamingDirectly, active, proxiedUrl]);
 
-  useStallWatchdog(active && state?.kind === "streaming", imgRef, onStall);
+  useStallWatchdog(
+    active && state?.kind === "streaming",
+    imgRef,
+    onStall,
+    decoding ? video.frames : null,
+  );
 
   const gesture = useRef<{ x: number; y: number; at: number; id: number } | null>(null);
   const lastWheel = useRef(0);
 
-  const rectOf = useCallback((): DOMRect | null => imgRef.current?.getBoundingClientRect() ?? null, []);
+  /**
+   * The picture's rectangle, not the element's.
+   *
+   * Whichever element is mounted — a canvas measures identically to an image —
+   * narrowed to the area the frame actually covers. Both are
+   * `object-fit: contain`, so a panel wider than the device letterboxes the
+   * picture and every coordinate taken from the element box is wrong.
+   */
+  const rectOf = useCallback((): DOMRect | null => {
+    const box = (canvasRef.current ?? imgRef.current)?.getBoundingClientRect() ?? null;
+    if (box === null) return null;
+    return contentRect(box, screen) as DOMRect;
+  }, [screen]);
 
   const onPointerDown = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
@@ -307,6 +372,17 @@ function LiveFrame({ state, veil, onAction, onStall, onStep, onStreamFailed }: L
     >
       {veil.skeleton ? (
         <div className="bbxs-skeleton h-full w-full" aria-hidden />
+      ) : decoding ? (
+        // H.264 is decoded here and painted, so the element is a canvas. It
+        // carries the same class and aspect ratio as the image, and pointer
+        // maths reads `getBoundingClientRect` either way, so nothing else in
+        // this file has to know which one is on screen.
+        <canvas
+          ref={canvasRef}
+          aria-hidden
+          className="bbxs-frame-img h-full w-full"
+          style={aspect}
+        />
       ) : (
         <img
           ref={imgRef}
@@ -314,21 +390,10 @@ function LiveFrame({ state, veil, onAction, onStall, onStep, onStreamFailed }: L
           draggable={false}
           className="bbxs-frame-img h-full w-full"
           style={aspect}
-          onError={() => {
-            // The direct attempt failing is ordinary — it is how a viewer that
-            // is not on this machine finds that out — so it demotes to the
-            // proxy silently rather than saying anything.
-            if (streamingDirectly && proxiedUrl !== null) {
-              setUseProxy(true);
-              return;
-            }
-            // The proxy failing is the real thing. Both, and they are different
-            // facts: `failed` stops this element re-requesting a stream that
-            // just refused, `onStreamFailed` gets a sentence on screen in place
-            // of the broken-image glyph.
-            setFailed(true);
-            onStreamFailed();
-          }}
+          // Advancing is silent until the ladder runs out, at which point
+          // `advance` sets the sentence. A rung failing is ordinary — it is how
+          // a viewer that is not on this machine discovers that.
+          onError={advance}
         />
       )}
 
@@ -391,6 +456,14 @@ function useStallWatchdog(
   enabled: boolean,
   ref: React.RefObject<HTMLImageElement | null>,
   onStall: () => void,
+  /**
+   * Decoded-frame count when H.264 is in use; `null` on the MJPEG path.
+   *
+   * A canvas fires no `load` events, so the decoder's own counter is the
+   * signal. It is also the better one: it says a frame was *decoded and
+   * painted*, where `load` only ever said bytes arrived.
+   */
+  decodedFrames: number | null,
 ): void {
   useEffect(() => {
     if (!enabled) return;
@@ -415,5 +488,5 @@ function useStallWatchdog(
       clearInterval(timer);
       element?.removeEventListener("load", onLoad);
     };
-  }, [enabled, ref, onStall]);
+  }, [enabled, ref, onStall, decodedFrames]);
 }
