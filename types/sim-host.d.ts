@@ -1,0 +1,21 @@
+/**
+ * The capture host ships raw, unbundled, as `sim-host.mjs`.
+ *
+ * serve-sim resolves its native addon from `import.meta.url`-relative paths, so
+ * bundling that file breaks it — see `test/bundle.test.ts`. It stays JavaScript,
+ * and this is the declaration that lets the security suite import its pure
+ * predicates on any platform.
+ */
+declare module "*/sim-host.mjs" {
+  export const SECRET_HEADER: string;
+  export function createFilteredServer(
+    middleware: unknown,
+    secret: string,
+    onError?: (error: unknown) => void,
+  ): import("node:http").Server;
+  export function isDenied(path: string): boolean;
+  export function isAllowed(method: string, path: string): boolean;
+  export function isWebSocketAllowed(path: string): boolean;
+  export function scrubExecToken(text: string): string;
+  export function secretMatches(provided: unknown, expected: string): boolean;
+}

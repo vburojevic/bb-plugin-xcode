@@ -1,0 +1,4 @@
+// !$*UTF8*$!
+// A stub, not a real pbxproj. The onboarder never parses or rewrites one — it
+// only checks whether SnapshotPreviews is already referenced.
+{ archiveVersion = 1; objects = { }; rootObject = ""; }

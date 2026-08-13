@@ -1,0 +1,8 @@
+name: Ferrybox
+targets:
+  Ferrybox:
+    type: application
+    platform: iOS
+  FerryboxTests:
+    type: bundle.unit-test
+    platform: iOS

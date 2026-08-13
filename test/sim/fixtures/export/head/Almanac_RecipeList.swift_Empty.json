@@ -1,0 +1,9 @@
+{
+  "displayName": "Empty",
+  "diffThreshold": 0.050000012,
+  "scale": 3,
+  "simulator": {
+    "name": "iPhone 17 Pro",
+    "osVersion": "26.5"
+  }
+}

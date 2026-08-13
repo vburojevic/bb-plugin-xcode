@@ -1,0 +1,8 @@
+Almanac_RecipeList.swift_Empty.png
+Almanac_RecipeList.swift_2.png
+Almanac_Login.swift_Dark_Mode.png
+Almanac_Signup.swift_Dark_Mode.png
+MyModule_LoginView.swift_Dark_Mode.png
+Almanac_Settings.swift_New.png
+Almanac_Card.swift_Wide.png
+Almanac_Crash.swift_Boom.png
