@@ -127,7 +127,11 @@ export class LiveService {
   /** The child's address, if it is running. Callers that need it start it first. */
   address(): host.SimHostAddress | null {
     if (this.child === null || !this.child.isAlive()) return null;
-    return { port: this.child.port, secret: this.child.secret };
+    return {
+      port: this.child.port,
+      secret: this.child.secret,
+      streamToken: this.child.streamToken,
+    };
   }
 
   /**
@@ -301,7 +305,11 @@ export class LiveService {
     const handle = await this.ensureHost();
     if (this.session?.device.udid !== udid) return;
 
-    await host.startDevice({ port: handle.port, secret: handle.secret }, udid, this.session.abort.signal);
+    await host.startDevice(
+      { port: handle.port, secret: handle.secret, streamToken: handle.streamToken },
+      udid,
+      this.session.abort.signal,
+    );
     if (this.session?.device.udid !== udid) return;
 
     this.deps.driver.invalidateBooted();

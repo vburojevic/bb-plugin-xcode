@@ -135,7 +135,8 @@ interface LiveFrameProps {
 }
 
 function LiveFrame({ state, veil, onAction, onStall, onStep, onStreamFailed }: LiveFrameProps) {
-  const streamUrl = state?.streamUrl ?? null;
+  const proxiedUrl = state?.streamUrl ?? null;
+  const directUrl = state?.directStreamUrl ?? null;
   const screen = state?.screen ?? null;
   // A dynamic aspect ratio is an inline style, because a build-time Tailwind
   // utility cannot be computed at runtime anyway.
@@ -149,14 +150,37 @@ function LiveFrame({ state, veil, onAction, onStall, onStep, onStreamFailed }: L
   const [failed, setFailed] = useState(false);
   const [crosshair, setCrosshair] = useState<{ x: number; y: number } | null>(null);
 
+  /**
+   * Direct first, proxied second.
+   *
+   * The direct URL points at the capture host's loopback port, which is only
+   * reachable for a viewer on the same machine as the bb server. Nothing here
+   * can know whether that is true — the panel may be a browser on another
+   * machine, or reached over a `bb connect` tunnel where a plain-HTTP image is
+   * blocked as mixed content — and asking the server is no better, because the
+   * server does not know where its own panel is being rendered either.
+   *
+   * So it is discovered rather than declared: try direct, and let the `error`
+   * event, which arrives in milliseconds on the remote path, promote the proxy.
+   * There is no probe and no configuration to get wrong.
+   */
+  const [useProxy, setUseProxy] = useState(false);
+  const streamUrl = (useProxy ? proxiedUrl : (directUrl ?? proxiedUrl)) ?? null;
+  const streamingDirectly = streamUrl !== null && streamUrl === directUrl;
+
   const interactive = state?.kind === "streaming";
 
   // MJPEG is unbounded. The stream is opened only while mounted and visible,
-  // and `src` is cleared on hide, which closes the connection — which is also
-  // the server's viewer-presence signal.
+  // and `src` is cleared on hide, which closes the connection.
   const active = streamUrl !== null && visible && !failed;
 
-  useEffect(() => setFailed(false), [streamUrl]);
+  // A new stream is a fresh chance for the direct path: a capture host restart
+  // rotates the token and the port, and the reason direct failed last time may
+  // have gone with it.
+  useEffect(() => {
+    setFailed(false);
+    setUseProxy(false);
+  }, [proxiedUrl, directUrl]);
 
   useEffect(() => {
     const element = imgRef.current;
@@ -165,6 +189,28 @@ function LiveFrame({ state, veil, onAction, onStall, onStep, onStreamFailed }: L
     // attribute leaves the request in flight in some browsers.
     element.src = active && streamUrl !== null ? streamUrl : "";
   }, [active, streamUrl]);
+
+  /**
+   * Presence, only while streaming directly.
+   *
+   * Bytes now bypass the bb server, and the viewer-presence signal used to be a
+   * side effect of them passing through it. Without this the device session is
+   * torn down 60 seconds into being watched. Zero bytes; the open connection is
+   * the entire message.
+   */
+  useEffect(() => {
+    // Derived from the proxied URL rather than composed from a plugin id: the
+    // server already told us where its own routes live, and one source for
+    // that string is one string that cannot drift.
+    const presenceUrl = proxiedUrl?.replace("/http/stream?", "/http/presence?") ?? null;
+    if (!streamingDirectly || !active || presenceUrl === null) return;
+    const abort = new AbortController();
+    void fetch(presenceUrl, { signal: abort.signal }).catch(() => {
+      // Losing presence is not worth a sentence: the frame is still on screen,
+      // and the worst case is the idle teardown this was holding off.
+    });
+    return () => abort.abort();
+  }, [streamingDirectly, active, proxiedUrl]);
 
   useStallWatchdog(active && state?.kind === "streaming", imgRef, onStall);
 
@@ -269,9 +315,17 @@ function LiveFrame({ state, veil, onAction, onStall, onStep, onStreamFailed }: L
           className="bbxs-frame-img h-full w-full"
           style={aspect}
           onError={() => {
-            // Both, and they are different facts: `failed` stops this element
-            // re-requesting a stream that just refused, `onStreamFailed`
-            // gets a sentence on screen in place of the broken-image glyph.
+            // The direct attempt failing is ordinary — it is how a viewer that
+            // is not on this machine finds that out — so it demotes to the
+            // proxy silently rather than saying anything.
+            if (streamingDirectly && proxiedUrl !== null) {
+              setUseProxy(true);
+              return;
+            }
+            // The proxy failing is the real thing. Both, and they are different
+            // facts: `failed` stops this element re-requesting a stream that
+            // just refused, `onStreamFailed` gets a sentence on screen in place
+            // of the broken-image glyph.
             setFailed(true);
             onStreamFailed();
           }}

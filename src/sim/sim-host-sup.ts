@@ -77,6 +77,18 @@ export function newSecret(): string {
 export interface SimHostHandle {
   port: number;
   secret: string;
+  /**
+   * Authorises the MJPEG route and nothing else.
+   *
+   * It exists to be put in a URL. The panel streams straight from the capture
+   * host rather than through the bb server — the proxy hop cost 79% as much
+   * CPU as capturing and encoding the frames, all of it on the process every
+   * other plugin shares — and an `<img>` cannot set a header, so the
+   * credential has to travel in the query string where it lands in the DOM.
+   * Separating it is what keeps a leaked URL to "someone can watch" rather
+   * than "someone can drive".
+   */
+  streamToken: string;
   addonLoaded: boolean;
   addonError: string | null;
   /** Kill it, and mark the exit as ours so no restart is reported. */
@@ -143,6 +155,7 @@ function onLines(
  */
 export function startSimHost(deps: SpawnDeps, events: SimHostEvents): Promise<SimHostHandle> {
   const secret = newSecret();
+  const streamToken = newSecret();
   const spawnFn = deps.spawnFn ?? spawn;
 
   let child: ChildProcess;
@@ -152,6 +165,7 @@ export function startSimHost(deps: SpawnDeps, events: SimHostEvents): Promise<Si
         ...deps.env,
         ELECTRON_RUN_AS_NODE: "1",
         XCSIM_SECRET: secret,
+        XCSIM_STREAM_KEY: streamToken,
         // 0 asks the child to bind an ephemeral port and tell us which. We own
         // the port; there is nothing to discover from serve-sim's state files.
         XCSIM_PORT: "0",
@@ -198,6 +212,7 @@ export function startSimHost(deps: SpawnDeps, events: SimHostEvents): Promise<Si
       resolve({
         port: handshake.port,
         secret,
+        streamToken,
         addonLoaded: handshake.addon === true,
         addonError: handshake.addonError ?? null,
         stop,

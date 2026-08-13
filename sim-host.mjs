@@ -66,6 +66,26 @@ const ALLOW = [
 
 const WS_ALLOW = new RegExp(`^/helper/${UDID}/ws$`);
 
+/**
+ * The one route a **stream token** may open.
+ *
+ * The panel streams straight from this process rather than through the bb
+ * server — measured, the proxy hop cost 79% as much CPU as capturing and
+ * encoding the frames did, all of it on the process every other plugin shares.
+ * But an `<img>` cannot set a header, so a direct URL has to carry its
+ * credential in the query string, where it lands in the DOM.
+ *
+ * So it carries a different one. The stream token authorises exactly this
+ * regex and nothing else: a URL that leaks lets someone *watch* the simulator,
+ * where the master secret would also let them drive it over the HID socket,
+ * read the accessibility tree, and shut the device down.
+ */
+const STREAM_ONLY = new RegExp(`^/helper/${UDID}/stream\\.mjpeg$`);
+
+export function isStreamRoute(path) {
+  return STREAM_ONLY.test(path);
+}
+
 export function isDenied(path) {
   return DENY.some((pattern) => pattern.test(path));
 }
@@ -90,9 +110,23 @@ export function secretMatches(presented, expected) {
 export function presentedSecret(req, url) {
   const header = req.headers[SECRET_HEADER];
   if (typeof header === "string") return header;
-  // The query form exists for the one case that cannot set a header. Nothing
-  // in this plugin composes such a URL today.
+  // The query form exists for the one case that cannot set a header: an
+  // `<img>` streaming directly from this process. See `authorize`, which is
+  // what decides whether the value presented that way is good enough.
   return url.searchParams.get("k");
+}
+
+/**
+ * May this request proceed?
+ *
+ * The master secret opens every allowed route, by header or by query. The
+ * stream token opens the MJPEG route only, and only ever appears in a query
+ * string — it is issued precisely because that is where it will end up.
+ */
+export function authorize({ path, presented, secret, streamToken }) {
+  if (secretMatches(presented, secret)) return true;
+  if (typeof streamToken !== "string" || streamToken === "") return false;
+  return isStreamRoute(path) && secretMatches(presented, streamToken);
 }
 
 /**
@@ -171,7 +205,7 @@ function refuse(res, status, message) {
  * Taking the middleware as a parameter is what lets the security suite mount a
  * stub and assert every route on a machine that has never seen a simulator.
  */
-export function createFilteredServer(middleware, secret, onError = () => {}) {
+export function createFilteredServer(middleware, secret, onError = () => {}, streamToken = null) {
   const server = createServer((req, res) => {
     let url;
     try {
@@ -189,7 +223,7 @@ export function createFilteredServer(middleware, secret, onError = () => {}) {
       refuse(res, 404, "Not found");
       return;
     }
-    if (!secretMatches(presentedSecret(req, url), secret)) {
+    if (!authorize({ path, presented: presentedSecret(req, url), secret, streamToken })) {
       refuse(res, 401, "Unauthorized");
       return;
     }
@@ -216,6 +250,8 @@ export function createFilteredServer(middleware, secret, onError = () => {}) {
       socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       return;
     }
+    // Deliberately `secretMatches`, not `authorize`: the HID socket is the
+    // route that drives the device, and a stream token must never reach it.
     if (!secretMatches(presentedSecret(req, url), secret)) {
       socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       return;
@@ -245,6 +281,14 @@ async function main() {
   const secret = process.env.XCSIM_SECRET;
   if (typeof secret !== "string" || secret.length < 32) {
     fail("XCSIM_SECRET is missing or too short");
+    return;
+  }
+  // Optional: without it, direct streaming is simply unavailable and the panel
+  // keeps using the proxy. An old supervisor talking to a new host must not be
+  // a failure to start.
+  const streamToken = process.env.XCSIM_STREAM_KEY ?? null;
+  if (streamToken !== null && streamToken.length < 32) {
+    fail("XCSIM_STREAM_KEY is too short");
     return;
   }
   const requestedPort = Number.parseInt(process.env.XCSIM_PORT ?? "0", 10);
@@ -293,8 +337,11 @@ async function main() {
   }
 
   const middleware = simMiddleware({ basePath: "", device: undefined, proxyHelpers: false });
-  const server = createFilteredServer(middleware, secret, (line) =>
-    process.stderr.write(`[sim-host] ${line}\n`),
+  const server = createFilteredServer(
+    middleware,
+    secret,
+    (line) => process.stderr.write(`[sim-host] ${line}\n`),
+    streamToken,
   );
 
   server.on("error", (error) => {

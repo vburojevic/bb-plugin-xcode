@@ -118,6 +118,10 @@ describe("registrations", () => {
     // `server.ts` owns it. The harness stands in for that mount.
     expect(harness.registrations.cli).toBe("sim");
     expect(harness.registrations.httpRoutes).toEqual([
+      // Zero bytes. It exists because the panel streams straight from the
+      // capture host, which takes the frames — and with them the old presence
+      // signal — off this process entirely.
+      { method: "GET", path: "/presence", auth: "local" },
       { method: "GET", path: "/stream", auth: "local" },
       { method: "GET", path: "/image", auth: "local" },
     ]);
@@ -135,13 +139,22 @@ describe("registrations", () => {
     expect(harness.registrations.agentTools).not.toContain("simulator_expose");
   });
 
-  it("streams through the plugin's own route rather than the capture host's port", async () => {
-    // Three reasons, in order of weight: the per-boot secret never reaches the
-    // DOM; the URL is same-origin, so a panel reached over connect is not
-    // blocked as mixed content; and there is one auth model instead of two.
+  it("keeps a proxied stream for the viewers that need one", async () => {
+    // This route used to be the only way to see a frame, for three stated
+    // reasons: the per-boot secret never reached the DOM, the URL was
+    // same-origin so `bb connect` did not block it as mixed content, and there
+    // was one auth model instead of two.
+    //
+    // The first is now handled by a stream-scoped token that authorises the
+    // MJPEG route and nothing else, and the third is a cost knowingly paid: the
+    // proxy hop cost 79% as much CPU as capturing and encoding the frames did,
+    // on the process every other plugin shares. The second reason is real and
+    // is why this route still exists — a viewer on another machine has no
+    // loopback to talk to, and the panel falls back here.
     const harness = await load();
-    const route = harness.registrations.httpRoutes[0];
-    expect(route?.auth).toBe("local");
+    for (const route of harness.registrations.httpRoutes) {
+      expect(route.auth).toBe("local");
+    }
   });
 });
 

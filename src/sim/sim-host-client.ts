@@ -16,6 +16,8 @@ import type { IncomingMessage } from "node:http";
 export interface SimHostAddress {
   port: number;
   secret: string;
+  /** Opens the MJPEG route only; see `SimHostHandle.streamToken`. */
+  streamToken: string;
 }
 
 export class SimHostError extends Error {

@@ -40,6 +40,8 @@ export interface LiveState {
   crashes: number;
   slowBoot: boolean;
   streamUrl: string | null;
+  /** Loopback and token-scoped; only right for a viewer on this machine. */
+  directStreamUrl: string | null;
   generation: number;
   showDeviceChrome: boolean;
 }

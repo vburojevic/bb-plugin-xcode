@@ -100,6 +100,8 @@ export const liveStateSchema = z
      * panel works identically whether bb is reached locally or over connect.
      */
     streamUrl: z.string().nullable(),
+    /** Loopback, token-scoped, and only right for a viewer on this machine. */
+    directStreamUrl: z.string().nullable(),
     /** Bumped whenever the stream must be re-opened, e.g. after a host restart. */
     generation: z.number(),
     showDeviceChrome: z.boolean(),

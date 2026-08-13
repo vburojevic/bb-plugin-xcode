@@ -18,6 +18,7 @@ function state(over: Partial<LiveState> = {}): LiveState {
     crashes: 0,
     slowBoot: false,
     streamUrl: null,
+    directStreamUrl: null,
     generation: 0,
     showDeviceChrome: false,
     ...over,

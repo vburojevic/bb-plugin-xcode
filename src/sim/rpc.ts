@@ -54,16 +54,17 @@ import { executeStep, type Step } from "./steps.js";
 
 export type LiveStateDto = LiveState & {
   streamUrl: string | null;
+  directStreamUrl: string | null;
   showDeviceChrome: boolean;
 };
 
 /**
- * The stream is served by the plugin's own route rather than by the capture
- * host's loopback port.
+ * The proxied stream — the fallback, and still the only one that always works.
  *
- * Three reasons, in order of weight: the per-boot secret never reaches the DOM;
- * the URL is same-origin, so a panel reached over connect is not blocked as
- * mixed content; and there is one auth model instead of two.
+ * Same-origin, so a panel reached over `bb connect` is not blocked as mixed
+ * content, and a viewer on another machine has no loopback to talk to. The
+ * panel prefers `directStreamUrlFor` and lands here when that fails, which is
+ * exactly the remote case.
  */
 export function streamUrlFor(pluginId: string, state: LiveState): string | null {
   if (state.device === null) return null;
@@ -77,6 +78,36 @@ export function streamUrlFor(pluginId: string, state: LiveState): string | null 
     g: String(state.generation),
   });
   return `/api/v1/plugins/${pluginId}/http/stream?${params.toString()}`;
+}
+
+/**
+ * The direct stream, straight off the capture host's loopback port.
+ *
+ * Worth the second auth model: measured, proxying the MJPEG through the bb
+ * server cost 1.69s of CPU per 8s of streaming — 79% as much as capturing and
+ * JPEG-encoding the frames — and spent all of it on the process every other
+ * plugin and the whole UI share. The bytes are identical; the hop was pure
+ * copying.
+ *
+ * It carries `streamToken`, not the master secret, because an `<img>` cannot
+ * set a header and this URL therefore lives in the DOM. The token opens the
+ * MJPEG route and nothing else — no HID socket, no accessibility tree, no
+ * shutdown. See `authorize` in `sim-host.mjs`.
+ *
+ * `null` whenever the capture host is not up. The panel treats a non-null value
+ * as a *candidate*: it is wrong for every viewer that is not on this machine,
+ * and the only honest way to find that out is to try it.
+ */
+export function directStreamUrlFor(
+  state: LiveState,
+  address: { port: number; streamToken: string } | null,
+): string | null {
+  if (address === null || state.device === null) return null;
+  if (state.kind !== "streaming" && state.kind !== "waiting-frame" && state.kind !== "stalled") {
+    return null;
+  }
+  const params = new URLSearchParams({ k: address.streamToken, g: String(state.generation) });
+  return `http://127.0.0.1:${address.port}/helper/${state.device.udid}/stream.mjpeg?${params.toString()}`;
 }
 
 /**
@@ -118,6 +149,7 @@ export function toLiveStateDto(ctx: Ctx, state: LiveState): LiveStateDto {
   return {
     ...state,
     streamUrl: streamUrlFor(ctx.pluginId, state),
+    directStreamUrl: directStreamUrlFor(state, ctx.live.address()),
     showDeviceChrome: ctx.settings().showDeviceChrome,
   };
 }

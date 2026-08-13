@@ -855,13 +855,66 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // ---------------------------------------------------------------------------
 
   /**
+   * Viewer presence, with no pixels in it.
+   *
+   * Presence used to be a side effect of the proxied stream: the panel opened
+   * it only while mounted and visible, so an open connection *was* a viewer and
+   * closing one started the 60-second teardown. Streaming directly from the
+   * capture host keeps every byte off this process — which is the point — and
+   * takes that signal with it, so a watching user would have had the device
+   * session shut down underneath them a minute in.
+   *
+   * So presence is its own route now: one connection, zero bytes, held open for
+   * exactly as long as the frame is on screen. Everything downstream of
+   * `noteViewerOpened` is unchanged, and there is still no heartbeat and no
+   * timer running while nothing is being watched.
+   */
+  bb.http.route(
+    "GET",
+    "/presence",
+    async (context) => {
+      const udid = context.req.query("udid");
+      if (udid === undefined || !/^[0-9A-Fa-f-]{36}$/.test(udid)) {
+        return context.text("Not found", 404);
+      }
+      live.noteViewerOpened();
+      let counted = true;
+      const release = (): void => {
+        if (!counted) return;
+        counted = false;
+        try {
+          live.noteViewerClosed();
+        } catch {
+          // Teardown accounting must never throw into a socket handler.
+        }
+      };
+
+      // A body that never produces a chunk and never ends. `cancel` is what the
+      // browser calls when the panel drops the connection, which is the whole
+      // mechanism — there is nothing to read, only something to close.
+      const body = new ReadableStream<Uint8Array>({
+        cancel: release,
+      });
+      context.req.raw.signal?.addEventListener("abort", release, { once: true });
+
+      return new Response(body, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    },
+    { auth: "local" },
+  );
+
+  /**
    * The MJPEG stream, proxied from the capture host.
    *
-   * This route is also the **viewer-presence signal**: the panel opens it only
-   * while mounted and visible and clears `img.src` on hide, which closes the
-   * connection. So there is no heartbeat to maintain and no timer running while
-   * nothing is on screen — the device session is torn down 60 seconds after the
-   * last stream closes, and the capture host five minutes after that.
+   * The fallback path since direct streaming landed: it is what a viewer on
+   * another machine, or one reached over `bb connect`, still uses. It keeps its
+   * own presence accounting for that case.
    */
   bb.http.route(
     "GET",

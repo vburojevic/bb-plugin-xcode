@@ -15,9 +15,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AddressInfo } from "node:net";
 import { WebSocket } from "ws";
 import {
+  authorize,
   createFilteredServer,
   isAllowed,
   isDenied,
+  isStreamRoute,
   isWebSocketAllowed,
   scrubExecToken,
   SECRET_HEADER,
@@ -239,5 +241,60 @@ describe("secret comparison", () => {
     expect(secretMatches("short", SECRET)).toBe(false);
     expect(secretMatches(`${SECRET}x`, SECRET)).toBe(false);
     expect(secretMatches(null as unknown as string, SECRET)).toBe(false);
+  });
+});
+
+
+describe("the stream token", () => {
+  const MASTER = "m".repeat(43);
+  const STREAM = "s".repeat(43);
+  const STREAM_PATH = `/helper/${UDID}/stream.mjpeg`;
+
+  it("opens the MJPEG route and refuses every other one", () => {
+    // The whole reason it exists: this token travels in a query string, where
+    // it lands in the DOM, so a URL that leaks must buy "watch" and not "drive".
+    expect(
+      authorize({ path: STREAM_PATH, presented: STREAM, secret: MASTER, streamToken: STREAM }),
+    ).toBe(true);
+
+    for (const path of [
+      `/helper/${UDID}/ws`,
+      `/helper/${UDID}/ax`,
+      `/helper/${UDID}/config`,
+      `/helper/${UDID}/foreground`,
+      "/grid/api/shutdown",
+    ]) {
+      expect(
+        authorize({ path, presented: STREAM, secret: MASTER, streamToken: STREAM }),
+        path,
+      ).toBe(false);
+    }
+  });
+
+  it("leaves the master secret opening everything", () => {
+    for (const path of [STREAM_PATH, `/helper/${UDID}/ws`, "/grid/api/shutdown"]) {
+      expect(
+        authorize({ path, presented: MASTER, secret: MASTER, streamToken: STREAM }),
+        path,
+      ).toBe(true);
+    }
+  });
+
+  it("refuses everything when no stream token was issued", () => {
+    // An older supervisor spawns the host without one. Direct streaming is
+    // simply unavailable then; it must not become unauthenticated.
+    expect(
+      authorize({ path: STREAM_PATH, presented: STREAM, secret: MASTER, streamToken: null }),
+    ).toBe(false);
+    expect(authorize({ path: STREAM_PATH, presented: "", secret: MASTER, streamToken: "" })).toBe(
+      false,
+    );
+  });
+
+  it("recognises only the exact stream path", () => {
+    expect(isStreamRoute(STREAM_PATH)).toBe(true);
+    expect(isStreamRoute(`/helper/${UDID}/stream.mjpeg/../ws`)).toBe(false);
+    expect(isStreamRoute(`/helper/${UDID}/streamXmjpeg`)).toBe(false);
+    expect(isStreamRoute("/exec")).toBe(false);
   });
 });
