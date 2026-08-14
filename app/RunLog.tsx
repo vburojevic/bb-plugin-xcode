@@ -11,6 +11,7 @@ import { Fragment, useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 
 import {
+  type BuildPhase,
   type RunKind,
   type RunStatus,
   dayLabel,
@@ -19,6 +20,7 @@ import {
   formatRelative,
   formatTime,
   kindLabel,
+  phaseTail,
   runTitle,
 } from "./format";
 import { StatusGlyph, SweepBar } from "./primitives";
@@ -43,6 +45,7 @@ export interface RunSummary {
   testTotal: number | null;
   testFailed: number | null;
   workerCount: number | null;
+  phase?: BuildPhase | null;
 }
 
 export function isActive(run: RunSummary): boolean {
@@ -147,7 +150,12 @@ function NowRow({
     run.projectName,
     run.branch,
     run.destinationLabel ?? run.destination,
-    run.workerCount ? `${run.workerCount} compilers` : null,
+    // Worker count when there is work to count, otherwise what the build is
+    // doing. A resolve has no workers at all, and this is the row that is
+    // meant to answer "what is Xcode doing right now".
+    run.workerCount
+      ? `${run.workerCount} compilers`
+      : phaseTail(run.phase ?? null),
   ]
     .filter(Boolean)
     .join(" · ");

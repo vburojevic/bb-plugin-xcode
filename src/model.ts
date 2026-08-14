@@ -74,8 +74,32 @@ export function isNoiseRun(run: {
   scheme: string | null;
   root: string | null;
 }): boolean {
-  if (run.kind === "package" || run.kind === "index") return true;
   return run.kind === "unknown" && run.scheme === null && run.root === null;
+}
+
+/**
+ * Activity worth watching while it runs, and worth forgetting once it stops.
+ *
+ * This used to be folded into `isNoiseRun`, which conflated two different
+ * rules. A `-find` lookup is noise in every sense — nobody waits on one, and it
+ * concludes nothing. Package resolution is the opposite: nobody wants it in
+ * their build history, but somebody is absolutely waiting on it, sometimes for
+ * minutes. Measured here: a thread spent 7m37s resolving packages while the
+ * panel, having classified the whole invocation as noise, showed it doing
+ * nothing at all.
+ *
+ * So the split is by lifetime rather than by importance:
+ *
+ *  - live surfaces (the banner, `bb xcode status`) show ephemeral runs;
+ *  - history surfaces (the log, "last result", trends) drop them.
+ *
+ * Index builds ride along for the same reason: Xcode indexes constantly, and
+ * eight of twenty-five visible rows being index builds is what made the list
+ * useless before — but an index build that is running right now is a true
+ * answer to "why is my machine busy".
+ */
+export function isEphemeralRun(run: { kind: RunKind }): boolean {
+  return run.kind === "package" || run.kind === "index";
 }
 
 /**

@@ -14,6 +14,7 @@ import {
   formatDuration,
   formatLocation,
   kindLabel,
+  phaseLabel,
   runStatusLabel,
   runTitle,
   statusHint,
@@ -21,14 +22,6 @@ import {
 import { isLive, statusClass, type ChatStatus, type RunDto } from "./status-types";
 import { WorkerSwarm } from "./WorkerSwarm";
 
-/** Human wording for the live build phase. */
-const PHASE_LABEL: Record<NonNullable<RunDto["phase"]>, string> = {
-  compiling: "Compiling",
-  assets: "Compiling assets",
-  linking: "Linking",
-  signing: "Signing",
-  testing: "Running tests",
-};
 
 export function RunDetail({
   run,
@@ -105,7 +98,7 @@ export function RunDetail({
           <Fact label="Finished" value={formatClock(run.endedAt)} />
         ) : null}
         {live && run.phase ? (
-          <Fact label="Phase" value={PHASE_LABEL[run.phase]} />
+          <Fact label="Phase" value={phaseLabel(run.phase)!} />
         ) : null}
         {live && run.currentFile ? (
           <Fact label="Current file" value={run.currentFile} mono />

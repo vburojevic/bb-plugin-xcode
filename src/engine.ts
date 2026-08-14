@@ -123,6 +123,11 @@ interface LiveEntry {
    * at all. Cleared once the identity is confirmed.
    */
   expectedStartedAt?: number;
+  /**
+   * This run has been observed doing something more than preparing. Latches
+   * on, and is what stops `preparing` being reported again on the way out.
+   */
+  sawWork?: boolean;
 }
 
 export class Engine {
@@ -149,6 +154,12 @@ export class Engine {
           misses: 0,
           lastSeenAt: now,
           expectedStartedAt: run.startedAt,
+          // A run that predates this instance has a history we do not have, so
+          // it never gets to claim `preparing`. Observed live: a fresh engine
+          // adopting a test run mid-flight reported "preparing" for a minute
+          // straight, because the sample it happened to start on was a lull
+          // between targets and nothing had latched `sawWork` yet.
+          sawWork: true,
         });
       }
     }
@@ -161,6 +172,28 @@ export class Engine {
 
   liveWorkerCount(runId: string, activities: readonly LiveActivity[]): number | null {
     return this.liveActivity(runId, activities)?.workerCount ?? null;
+  }
+
+  /**
+   * The phase a surface should SHOW, which is not always the phase observed.
+   *
+   * "A build service with no workers" is what `preparing` is derived from, and
+   * that snapshot looks identical before the first compiler spawns and after
+   * the last one exits. Only the first is preparing; the second is a build
+   * between phases or on its way out. Once this run has been seen doing real
+   * work, the claim is withdrawn rather than restated — the row goes back to
+   * showing elapsed time, which is honest about not knowing.
+   */
+  livePhase(
+    runId: string,
+    activity: LiveActivity | null,
+  ): LiveActivity["phase"] {
+    const phase = activity?.phase ?? null;
+    if (phase !== "preparing") return phase;
+    for (const entry of this.live.values()) {
+      if (entry.runId === runId && entry.sawWork) return null;
+    }
+    return phase;
   }
 
   /** The live process snapshot backing a run, for phase and current file. */
@@ -205,6 +238,9 @@ export class Engine {
           delete tracked.expectedStartedAt;
           tracked.misses = 0;
           tracked.lastSeenAt = now;
+          if (activity.phase && activity.phase !== "preparing") {
+            tracked.sawWork = true;
+          }
           continue;
         }
       }
@@ -247,7 +283,12 @@ export class Engine {
         }),
       };
       this.store.insertRun(run);
-      this.live.set(activity.pid, { runId: run.id, misses: 0, lastSeenAt: now });
+      this.live.set(activity.pid, {
+        runId: run.id,
+        misses: 0,
+        lastSeenAt: now,
+        sawWork: Boolean(activity.phase && activity.phase !== "preparing"),
+      });
       this.hooks.log(`run started: ${run.kind} ${run.scheme ?? "?"} (${run.id})`);
       this.hooks.onRunStarted?.(run);
       changed = true;

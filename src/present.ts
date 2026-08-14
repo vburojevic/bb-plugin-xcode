@@ -8,6 +8,23 @@
 
 import { formatDuration } from "./duration";
 import { durationMs, type Run, type RunStatus } from "./model";
+import type { BuildPhase } from "./types";
+
+/** What a live phase is called in agent- and CLI-facing text. */
+const PHASE_TEXT: Record<BuildPhase, string> = {
+  preparing: "preparing the build",
+  resolving: "resolving packages",
+  compiling: "compiling",
+  assets: "compiling assets",
+  linking: "linking",
+  packaging: "generating symbols",
+  signing: "signing",
+  testing: "running tests",
+};
+
+export function phaseText(phase: BuildPhase | null | undefined): string | null {
+  return phase ? PHASE_TEXT[phase] : null;
+}
 
 /** Last path segment, with any trailing slash ignored. */
 export function shortName(path: string | null): string | null {
@@ -27,6 +44,15 @@ export function runName(run: Run): string {
 export interface PresentOptions {
   /** Resolve a bb project id to its display name. */
   projectName?(id: string): string | null;
+  /**
+   * What a live run is doing right now, from the process tree.
+   *
+   * Optional because history does not have one, and load-bearing because
+   * without it a long dependency fetch is indistinguishable from a hang. An
+   * agent that reads "running 7m 12s" and nothing else concludes the build is
+   * stuck and kills it; one that reads "resolving packages" waits.
+   */
+  phaseFor?(run: Run): BuildPhase | null;
   /** Injected so a fixture can pin "now" when formatting a live run. */
   now?: number;
 }
@@ -43,10 +69,11 @@ export function describeRun(run: Run, options: PresentOptions = {}): string {
   if (run.testFailed) counts.push(`${run.testFailed} failed`);
   const suffix = counts.length ? `  [${counts.join(" ")}]` : "";
   const at = run.branch ? ` @${run.branch}` : "";
-  const time =
-    run.status === "running"
-      ? `running ${formatDuration((options.now ?? Date.now()) - run.startedAt)}`
-      : formatDuration(durationMs(run));
+  const live = run.status === "running";
+  const doing = live ? phaseText(options.phaseFor?.(run)) : null;
+  const time = live
+    ? `running ${formatDuration((options.now ?? Date.now()) - run.startedAt)}${doing ? `, ${doing}` : ""}`
+    : formatDuration(durationMs(run));
   return `${run.status.padEnd(9)} ${run.kind.padEnd(7)} ${(name + at).padEnd(30)} ${project.padEnd(14)} ${time}${suffix}  ${run.id}`;
 }
 

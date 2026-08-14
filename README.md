@@ -102,9 +102,52 @@ Everything an agent tool answers is scoped to the thread's own checkout, in
 SQL. A thread with no resolvable checkout is told exactly that rather than
 being handed the machine's activity.
 
+## What a live build is doing
+
+The process tree is the only progress signal available while a build runs —
+llbuild's own task ledger stays inside one open transaction for the whole
+build, so every reader sees the *previous* build's state until this one ends.
+A counter frozen for the duration is worse than no counter.
+
+| Phase | Seen from |
+|---|---|
+| `preparing` | build service up, nothing executing — the graph is being computed |
+| `resolving` | `-resolvePackageDependencies`, or `git`/`unzip` under `SourcePackages` |
+| `compiling` | `swift-frontend`, `swiftc`, `clang`, `swift-plugin-server` |
+| `assets` | `actool`, `ibtool(d)`, `momc`, `mapc`, `xcstringstool`, `coremlc`, `metal` |
+| `linking` | `ld`, `libtool` |
+| `packaging` | `dsymutil`, `strip`, `lipo` |
+| `signing` | `codesign` |
+| `testing` | `xctest`, `swift-testing` |
+
+Several are alive at once as targets finish at different times, so the *latest*
+match wins — reporting "compiling" while the linker is already running
+understates how far along a build is.
+
+`preparing` is the only one that needs a guard, and it earns it. It is derived
+from "a build service with no workers", and that snapshot is identical before
+the first compiler spawns and after the last one exits. Measured live: a build
+that had already compiled, linked and signed kept re-entering that state
+between targets. So `Engine.livePhase` withdraws the claim once a run has been
+seen doing anything else, and a run adopted after a reload never gets to make
+it at all — its history is not ours to assume.
+
 ## Things Xcode does that this had to work around
 
 Each of these was confirmed by experiment on Xcode 26.6, not from docs.
+
+- **The build service was renamed.** `XCBBuildService` does not exist on Xcode
+  26.6 — `XCBuild.framework` has no XPCServices directory at all, and the
+  service is `SWBBuildService`, inside
+  `SwiftBuild.framework/…/PlugIns/SWBBuildService.bundle`. Command-line builds
+  survived the rename by accident, because workers are attributed by walking up
+  to the `xcodebuild` root and the service is just a link in that chain. An
+  Xcode.app build, where the service *is* the root, was invisible outright.
+- **`-resolvePackageDependencies` is not a metadata query.** It sat in the same
+  ignore-list as `-version` and `-list`, which return in milliseconds. Measured
+  here: 7m37s of fetching and unzipping prebuilt macros, during which the panel
+  showed the thread doing nothing at all. It is now a tracked run of kind
+  `package` — shown while it runs, dropped from history afterwards.
 
 - **Two different epochs.** `LogStoreManifest.plist` stores Apple reference-date
   seconds (2001-01-01); `xcresulttool` emits Unix-epoch seconds. Confusing them
@@ -166,7 +209,9 @@ which is what the disk ceiling is for.
 - **Xcode.app (IDE) builds are not fully validated.** Everything here was
   verified against `xcodebuild`; IDE attribution is designed to flow through
   child compiler args → DerivedData root → project, but was not exercised
-  against a live Xcode.app session.
+  against a live Xcode.app session. The `SWBBuildService` rename above was the
+  concrete reason they could not work at all on Xcode 26; that is fixed and
+  unit-tested, but still not confirmed against a real IDE build.
 - Builds shorter than the scan interval are missed by the probe, then picked up
   by the manifest sweep — they appear in history but never in the live strip.
 

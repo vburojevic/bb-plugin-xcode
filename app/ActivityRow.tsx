@@ -53,6 +53,7 @@ import {
   formatDuration,
   formatRelative,
   kindLabel,
+  phaseTail,
   runPhrase,
   runStatusLabel,
   runTitle,
@@ -88,11 +89,16 @@ export function XcodeActivityRow({
 
   // One trailing fact, chosen for what the state leaves unanswered: a live
   // build is "how hard is it working", a settled one "what did it leave".
+  //
+  // The phase is the last resort and the most important one. A build that is
+  // resolving packages has no compilers and no current file, so every branch
+  // above it returns null — which is precisely the state that used to render
+  // as a row doing nothing for minutes on end.
   const tail = live
     ? run.currentFile ??
       (run.workerCount
         ? `${run.workerCount} compiler${run.workerCount === 1 ? "" : "s"}`
-        : null)
+        : phaseTail(run.phase))
     : run.errorCount > 0
       ? `${run.errorCount} error${run.errorCount === 1 ? "" : "s"}`
       : (run.testFailed ?? 0) > 0
@@ -264,6 +270,11 @@ function elapsedProgress(
 ): number | null {
   if (!isLive(run) || run.typicalMs === null || elapsed === null) return null;
   if (run.typicalMs <= 0) return null;
+  // A resolve is not the shape the median was measured from. Those samples
+  // come from builds that had their packages already; comparing a dependency
+  // fetch against them would draw a confident fraction of the wrong thing.
+  // The sweep is the honest answer until real build work starts.
+  if (run.phase === "resolving") return null;
   return Math.min(99, Math.max(1, Math.round((elapsed / run.typicalMs) * 100)));
 }
 

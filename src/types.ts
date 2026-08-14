@@ -57,11 +57,31 @@ export interface ActivityAttribution {
   worktree?: string | null;
 }
 
-/** What a build is doing right now. Ordered coarse-to-late in `PHASE_ORDER`. */
+/**
+ * What a build is doing right now. Ordered coarse-to-late in `PHASE_ORDER`,
+ * and callers take the LATEST match, because a build routinely has several
+ * phases alive at once as targets finish at different times.
+ *
+ * `resolving` is first for a reason: it precedes everything, produces no
+ * compiler processes, and can run for many minutes on its own. Without it a
+ * package resolve is a build that appears to be doing nothing.
+ */
 export type BuildPhase =
+  /**
+   * The build service is up and nothing is executing yet: loading the
+   * workspace, evaluating settings, computing the task graph. Observed at 16s+
+   * on a real workspace, during which the row said nothing at all.
+   *
+   * The weakest claim here, and the only one that needs a guard — see
+   * `Engine.livePhase`. "No workers" looks identical before the first compiler
+   * spawns and after the last one exits, and only the first is preparing.
+   */
+  | "preparing"
+  | "resolving"
   | "compiling"
   | "assets"
   | "linking"
+  | "packaging"
   | "signing"
   | "testing";
 

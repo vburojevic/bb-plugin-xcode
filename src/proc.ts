@@ -27,23 +27,37 @@ export const PS_ARGS = ["-Aww", "-o", "pid=,ppid=,etime=,args="] as const;
 const TOOLCHAIN_BINARIES = new Set([
   "xcodebuild",
   "XCBBuildService",
+  "SWBBuildService",
   "swift-frontend",
   "swift-driver",
   "swiftc",
   "swift",
+  "swift-plugin-server",
   "clang",
   "clang++",
   "ld",
   "ld64",
   "libtool",
+  "lipo",
+  "dsymutil",
+  "strip",
   "actool",
   "ibtool",
+  "ibtoold",
+  "momc",
+  "mapc",
+  "xcstringstool",
+  "coremlc",
+  "copySceneKitAssets",
+  "metal",
+  "metallib",
   "xctest",
   "xctestrun",
   "swift-testing",
   "clang-stat-cache",
   "SwiftCompile",
   "swift-symbolgraph-extract",
+  "swift-api-digester",
 ]);
 
 /**
@@ -62,8 +76,22 @@ const DIRECT_ROOT = "xcodebuild";
  * it stays resident for the whole Xcode session, idle between builds. Treating
  * its mere existence as a running build pinned a permanent fake entry to the
  * panel, so it counts only while it has real compiler work underneath it.
+ *
+ * BOTH names, because Xcode renamed it. `XCBBuildService` lived in
+ * `XCBuild.framework`; on Xcode 26.6 that framework has no XPCServices
+ * directory at all and the service is `SWBBuildService`, inside
+ * `SwiftBuild.framework/…/PlugIns/SWBBuildService.bundle` — the open-source
+ * swift-build service. Verified on this machine: a live build's tree is
+ * `xcodebuild → SWBBuildService → swift-frontend…`, and no XCBBuildService
+ * process exists.
+ *
+ * Command-line builds survived the rename by accident, because workers are
+ * attributed by walking up to the `xcodebuild` root and the service in between
+ * is just another link in the chain. An Xcode.app build has no such ancestor —
+ * the service IS the root — so on Xcode 26 IDE builds were invisible outright.
+ * That is the concrete reason behind the README's "not fully validated" note.
  */
-const DAEMON_ROOT = "XCBBuildService";
+const DAEMON_ROOTS = new Set(["XCBBuildService", "SWBBuildService"]);
 
 /**
  * Processes that prove actual compilation is happening right now.
@@ -88,9 +116,12 @@ const DAEMON_ROOT = "XCBBuildService";
  * later phase is the truer answer, so callers take the highest match.
  */
 export const PHASE_ORDER = [
+  "preparing",
+  "resolving",
   "compiling",
   "assets",
   "linking",
+  "packaging",
   "signing",
   "testing",
 ] as const;
@@ -101,17 +132,44 @@ const PHASE_BY_BINARY = new Map<string, BuildPhase>([
   ["swiftc", "compiling"],
   ["clang", "compiling"],
   ["clang++", "compiling"],
+  ["clang-stat-cache", "compiling"],
   ["swift-symbolgraph-extract", "compiling"],
+  ["swift-api-digester", "compiling"],
+  // One per macro-providing module, resident for the build. It means macros
+  // are being expanded, which is compiling — but see WORKER_BINARIES for why
+  // it is not counted as a compiler.
+  ["swift-plugin-server", "compiling"],
   ["actool", "assets"],
   ["ibtool", "assets"],
+  ["ibtoold", "assets"],
+  ["momc", "assets"],
+  ["mapc", "assets"],
+  ["xcstringstool", "assets"],
+  ["coremlc", "assets"],
+  ["copySceneKitAssets", "assets"],
+  ["metal", "assets"],
+  ["metallib", "assets"],
   ["ld", "linking"],
   ["ld64", "linking"],
   ["libtool", "linking"],
+  ["dsymutil", "packaging"],
+  ["strip", "packaging"],
+  ["lipo", "packaging"],
   ["codesign", "signing"],
   ["xctest", "testing"],
   ["swift-testing", "testing"],
 ]);
 
+/**
+ * Processes counted as "N compilers" on a live row.
+ *
+ * Narrower than `PHASE_BY_BINARY` on purpose. `swift-plugin-server` says the
+ * build is expanding macros, but there is one per macro-providing module and
+ * they persist for the whole build — measured here, ten of them alongside ten
+ * `swift-frontend` processes. Counting both would have reported "20 compilers"
+ * for ten units of parallel work. `ibtoold` is likewise a daemon rather than a
+ * per-file worker. Both still set the phase; neither inflates the count.
+ */
 const WORKER_BINARIES = new Set([
   "swift-frontend",
   "swift-driver",
@@ -121,11 +179,38 @@ const WORKER_BINARIES = new Set([
   "ld",
   "ld64",
   "libtool",
+  "dsymutil",
+  "strip",
   "actool",
   "ibtool",
+  "momc",
+  "mapc",
+  "xcstringstool",
+  "coremlc",
+  "metal",
   "xctest",
   "swift-symbolgraph-extract",
 ]);
+
+/**
+ * Does this process mean packages are being resolved right now?
+ *
+ * Two shapes, both observed:
+ *
+ *  - the invocation IS a resolve: `xcodebuild -resolvePackageDependencies …`,
+ *    which a build script runs before building so failures surface early;
+ *  - a resolve is happening INSIDE a build, visible only through the work it
+ *    spawns — `unzip` of a prebuilt macro into `SourcePackages/prebuilts/`, or
+ *    `git` fetching a dependency into `SourcePackages/checkouts/`.
+ *
+ * The path is what makes the second arm safe: a build shells out to `git` and
+ * `unzip` for plenty of unrelated reasons, but not into `SourcePackages`.
+ */
+export function isResolvingPackages(args: string): boolean {
+  if (/\s-resolvePackageDependencies\b/.test(args)) return true;
+  if (!args.includes("/SourcePackages/")) return false;
+  return /\b(?:unzip|git|git-remote-http|git-remote-https|tar)\b/.test(args);
+}
 
 /**
  * Which action speaks for a multi-action invocation. A test outranks a build,
@@ -424,12 +509,21 @@ export function findRootActivities(procs: ObservedProcess[]): LiveActivity[] {
   const byPid = new Map<number, ObservedProcess>();
   for (const proc of procs) byPid.set(proc.pid, proc);
 
-  // Metadata queries are not builds: `xcodebuild -list` still spawns a real
-  // xcodebuild process (often for many seconds while packages resolve), and
-  // tracking it produced phantom "unknown" runs in the panel.
+  /**
+   * Metadata queries are not builds: `xcodebuild -list` still spawns a real
+   * xcodebuild process, and tracking it produced phantom "unknown" runs.
+   *
+   * `-resolvePackageDependencies` is NOT one of these, though it sat in this
+   * list. It is not a question about the project — it is minutes of fetching,
+   * cloning and unzipping that the developer is waiting on. Measured here:
+   * 7m37s of it, during which the panel showed the thread doing nothing at
+   * all, which is the exact question the panel exists to answer. It is now a
+   * tracked run of kind `package`, shown while it runs and dropped from
+   * history afterwards.
+   */
   const isQueryInvocation = (proc: ObservedProcess): boolean =>
     proc.comm === DIRECT_ROOT &&
-    /\s-(list|version|showsdks|showdestinations|showBuildSettings|showComponent|usage|help|exportLocalizations|resolvePackageDependencies)\b/.test(
+    /\s-(list|version|showsdks|showdestinations|showBuildSettings|showComponent|usage|help|exportLocalizations)\b/.test(
       proc.args,
     ) &&
     !Object.keys(ACTION_VERBS).some(
@@ -437,7 +531,7 @@ export function findRootActivities(procs: ObservedProcess[]): LiveActivity[] {
     );
 
   const isRootCandidate = (proc: ObservedProcess): boolean =>
-    (proc.comm === DIRECT_ROOT || proc.comm === DAEMON_ROOT) &&
+    (proc.comm === DIRECT_ROOT || DAEMON_ROOTS.has(proc.comm)) &&
     !isQueryInvocation(proc);
 
   const hasToolchainAncestor = (proc: ObservedProcess): boolean => {
@@ -483,6 +577,8 @@ export function findRootActivities(procs: ObservedProcess[]): LiveActivity[] {
       workers: number;
       phases: Set<BuildPhase>;
       currentFile: string | null;
+      /** A build service is attached, so the build has genuinely begun. */
+      hasBuildService: boolean;
     }
   >();
   for (const pid of rootPids) {
@@ -491,6 +587,7 @@ export function findRootActivities(procs: ObservedProcess[]): LiveActivity[] {
       workers: 0,
       phases: new Set(),
       currentFile: null,
+      hasBuildService: false,
     });
   }
   for (const proc of procs) {
@@ -499,21 +596,32 @@ export function findRootActivities(procs: ObservedProcess[]): LiveActivity[] {
     const bucket = rootsByPid.get(owner)!;
     if (proc.pid !== owner) {
       if (WORKER_BINARIES.has(proc.comm)) bucket.workers += 1;
+      if (DAEMON_ROOTS.has(proc.comm)) bucket.hasBuildService = true;
       const phase = PHASE_BY_BINARY.get(proc.comm);
       if (phase) bucket.phases.add(phase);
       bucket.currentFile ??= primarySourceFile(proc.args);
     }
+    // Checked for the root too, because a resolve announces itself in its own
+    // argv while its children are only `unzip` and `git`.
+    if (isResolvingPackages(proc.args)) bucket.phases.add("resolving");
     for (const root of derivedRootsFromArgs(proc.args)) bucket.roots.add(root);
   }
 
   return roots.flatMap((proc) => {
     const bucket = rootsByPid.get(proc.pid)!;
-    const isDaemon = proc.comm === DAEMON_ROOT;
+    const isDaemon = DAEMON_ROOTS.has(proc.comm);
 
     // An idle build daemon is not a build. Xcode keeps XCBBuildService resident
     // for the whole session, so without this it would report a build in
     // progress from the moment Xcode opens until it quits.
     if (isDaemon && bucket.workers === 0 && bucket.roots.size === 0) return [];
+
+    // A build service is up but nothing is executing: the graph is being
+    // computed. Only ever claimed when the phase set is otherwise empty, and
+    // only as the weakest entry in PHASE_ORDER, so any real work displaces it.
+    if ((bucket.hasBuildService || isDaemon) && bucket.workers === 0) {
+      bucket.phases.add("preparing");
+    }
 
     const attribution = parseXcodebuildArgs(proc.args);
     if (attribution.derivedDataPath) bucket.roots.add(attribution.derivedDataPath);

@@ -18,7 +18,7 @@ import { rpcContract } from "./src/contract";
 import { Collector, type CollectorProject } from "./src/collector";
 import { DtoMapper } from "./src/dto";
 import { Engine } from "./src/engine";
-import { VERDICT_STATUSES } from "./src/model";
+import { VERDICT_STATUSES, type Run } from "./src/model";
 import { createRpcHandlers } from "./src/rpc";
 import { ScopeSync } from "./src/scope-sync";
 import { pruneShimBundles, isShimInstalled } from "./src/shim";
@@ -29,6 +29,7 @@ import { CLI_COMMANDS as SIM_VERBS } from "./src/sim/cli";
 import { SETTINGS_DESCRIPTORS as SIMULATOR_SETTINGS } from "./src/sim/settings";
 import { ThreadSync } from "./src/thread-sync";
 import { AGENT_INSTRUCTIONS, createTools } from "./src/tools";
+import type { BuildPhase } from "./src/types";
 import type { WrappedDeps } from "./src/wrapped";
 
 /**
@@ -404,11 +405,29 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     await bb.storage.kv.set("dismissed-runs", retained);
   };
 
+  /**
+   * What a live run is doing right now, for the text surfaces.
+   *
+   * The panel gets this through the DTO; the CLI and the agent tools deal in
+   * `Run` rows, which carry no phase because it is derived from the process
+   * tree rather than stored. Without it, `bb xcode status` on a build that is
+   * seven minutes into a dependency fetch reads as a build that is seven
+   * minutes into nothing.
+   */
+  const phaseFor = (run: Run): BuildPhase | null =>
+    run.status === "running"
+      ? engine.livePhase(
+          run.id,
+          engine.liveActivity(run.id, collector.getLastActivities()),
+        )
+      : null;
+
   const cli = createCli({
     store,
     collector,
     dataDir,
     projectName: (id) => dto.projectName(id),
+    phaseFor,
     refreshProjectNames: () => dto.refreshProjectNames(),
     rescan: runRescan,
     wrapped,
@@ -674,6 +693,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     wrapped,
     refreshProjectNames: () => dto.refreshProjectNames(),
     projectName: (id) => dto.projectName(id),
+    phaseFor,
     scopeFor: (threadId) => scopeSync.bounded(threadId),
     showRun: (id) => cli.show(id),
   });

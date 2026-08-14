@@ -12,7 +12,7 @@ import type { Collector } from "./collector";
 import { destinationLabel } from "./destination";
 import { formatDuration } from "./duration";
 import { durationMs, type Run } from "./model";
-import { describeRun } from "./present";
+import { describeRun, type PresentOptions } from "./present";
 import {
   installShim,
   isShimInstalled,
@@ -21,6 +21,7 @@ import {
   uninstallShim,
 } from "./shim";
 import type { Store } from "./store";
+import type { BuildPhase } from "./types";
 import {
   resolveBuildArgv,
   startWrappedBuild,
@@ -44,6 +45,8 @@ export interface CliDeps {
   collector: Collector;
   dataDir: string;
   projectName(id: string): string | null;
+  /** What a live run is doing right now; null for anything settled. */
+  phaseFor(run: Run): BuildPhase | null;
   refreshProjectNames(): void;
   rescan(): void;
   wrapped: WrappedDeps;
@@ -96,7 +99,10 @@ export const CLI_COMMANDS = [
 ] as const;
 
 export function createCli(deps: CliDeps) {
-  const present = { projectName: (id: string) => deps.projectName(id) };
+  const present: PresentOptions = {
+    projectName: (id: string) => deps.projectName(id),
+    phaseFor: (run: Run) => deps.phaseFor(run),
+  };
 
   function show(id: string | undefined): CliResult {
     if (!id) return { exitCode: 1, stderr: "Usage: bb xcode show <run-id>\n" };

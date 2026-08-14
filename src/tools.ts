@@ -11,10 +11,11 @@
 import { z } from "zod";
 
 import type { Collector } from "./collector";
-import { describeRun, verdictSentence } from "./present";
+import { describeRun, verdictSentence, type PresentOptions } from "./present";
 import type { Run } from "./model";
 import { scopeFilter, type ThreadScope } from "./scopes";
 import type { Store } from "./store";
+import type { BuildPhase } from "./types";
 import {
   resolveBuildArgv,
   startWrappedBuild,
@@ -46,13 +47,18 @@ export interface ToolDeps {
   wrapped: WrappedDeps;
   refreshProjectNames(): void;
   projectName(id: string): string | null;
+  /** What a live run is doing right now; null for anything settled. */
+  phaseFor(run: Run): BuildPhase | null;
   /** Cached scope, or one bounded resolve. Never blocks on a slow SDK call. */
   scopeFor(threadId: string): Promise<ThreadScope | null>;
   showRun(id: string): { stdout?: string; stderr?: string };
 }
 
 export function createTools(deps: ToolDeps) {
-  const present = { projectName: (id: string) => deps.projectName(id) };
+  const present: PresentOptions = {
+    projectName: (id: string) => deps.projectName(id),
+    phaseFor: (run: Run) => deps.phaseFor(run),
+  };
 
   const status = {
     name: "xcode_status",

@@ -67,9 +67,18 @@ const runSchema = z.object({
   destinationLabel: z.string().nullable(),
   /** Live compiler processes right now; null unless running. */
   workerCount: z.number().nullable(),
-  /** What the build is doing right now: compiling, linking, signing, testing. */
+  /** What the build is doing right now; null when no live worker says. */
   phase: z
-    .enum(["compiling", "assets", "linking", "signing", "testing"])
+    .enum([
+      "preparing",
+      "resolving",
+      "compiling",
+      "assets",
+      "linking",
+      "packaging",
+      "signing",
+      "testing",
+    ])
     .nullable(),
   /** Source file a compiler is on, when one is unambiguously identifiable. */
   currentFile: z.string().nullable(),

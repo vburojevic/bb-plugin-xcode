@@ -14,7 +14,12 @@
 
 import type { Collector } from "./collector";
 import type { DtoMapper, RunDto } from "./dto";
-import { isNoiseRun, VERDICT_STATUSES, type Run } from "./model";
+import {
+  isEphemeralRun,
+  isNoiseRun,
+  VERDICT_STATUSES,
+  type Run,
+} from "./model";
 import { shortName } from "./present";
 import type { ScopeSync } from "./scope-sync";
 import { scopeFilter } from "./scopes";
@@ -131,7 +136,8 @@ export function createRpcHandlers(deps: RpcDeps) {
         // names a real number of the user's own runs is a fact; one that does
         // not is an advert.
         verdictlessRuns: runs.filter(
-          (run) => run.status === "ended" && !isNoiseRun(run),
+          (run) =>
+            run.status === "ended" && !isNoiseRun(run) && !isEphemeralRun(run),
         ).length,
         simulators: deps.collector.getBootedSimulators(),
       };
@@ -209,7 +215,11 @@ export function createRpcHandlers(deps: RpcDeps) {
        */
       const newest =
         settled.find(
-          (run) => !isNoiseRun(run) && VERDICT_STATUSES.has(run.status),
+          (run) =>
+            !isNoiseRun(run) &&
+            // A finished package resolve is never "how the last thing went".
+            !isEphemeralRun(run) &&
+            VERDICT_STATUSES.has(run.status),
         ) ?? null;
       const lastSettled =
         newest && !deps.dismissedRuns.has(newest.id) ? newest : null;

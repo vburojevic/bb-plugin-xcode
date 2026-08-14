@@ -830,6 +830,15 @@ export class Store {
     this.sql(`PRAGMA wal_checkpoint(TRUNCATE)`).get();
   }
 
+  /**
+   * Duration, pass-rate and flakiness over time.
+   *
+   * Ephemeral kinds are excluded throughout. A package resolve and an index
+   * build both have durations, and both would drag the "how long do builds
+   * take here" line toward something that answers no question anyone asked —
+   * index builds already did, and now that resolves are tracked they would
+   * too, with the longest durations of the lot.
+   */
   trends(projectId: string | null, sinceMs: number): {
     durations: Array<{
       at: number;
@@ -860,6 +869,7 @@ export class Store {
         `SELECT started_at, ended_at, status, scheme, kind FROM run
           WHERE started_at >= ? ${projectClause}
             AND ended_at IS NOT NULL AND status NOT IN ('running','finishing')
+            AND kind NOT IN ('package','index')
           ORDER BY started_at ASC LIMIT 500`,
       ).all(...params) as Array<{
         started_at: number;
@@ -886,6 +896,7 @@ export class Store {
            FROM run
           WHERE started_at >= ? ${projectClause}
             AND status NOT IN ('running','finishing')
+            AND kind NOT IN ('package','index')
           GROUP BY day ORDER BY day ASC`,
       ).all(...params) as Array<{
         day: string;

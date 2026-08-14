@@ -11,6 +11,7 @@ import { destinationLabel } from "./destination";
 import type { Engine } from "./engine";
 import { durationMs, type Run } from "./model";
 import type { Store } from "./store";
+import type { BuildPhase } from "./types";
 
 export interface RunDto {
   id: string;
@@ -42,7 +43,9 @@ export interface RunDto {
   threadId: string | null;
   destinationLabel: string | null;
   workerCount: number | null;
-  phase: "compiling" | "assets" | "linking" | "signing" | "testing" | null;
+  // The union lives in `types.ts` and nowhere else. Spelling it out here meant
+  // adding a phase compiled everywhere except the one place that carries it.
+  phase: BuildPhase | null;
   currentFile: string | null;
   typicalMs: number | null;
 }
@@ -140,7 +143,9 @@ export class DtoMapper {
         this.collector.getSimulators(),
       ),
       workerCount: activity?.workerCount ?? null,
-      phase: activity?.phase ?? null,
+      // Through the engine, not straight off the snapshot: `preparing` is only
+      // true on the way in. See `Engine.livePhase`.
+      phase: this.engine.livePhase(run.id, activity),
       currentFile: activity?.currentFile ?? null,
       // What a run of this shape usually costs here, so the row can show a
       // real fraction instead of an indeterminate sweep. Null until there are

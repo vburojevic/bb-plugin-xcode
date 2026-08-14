@@ -217,7 +217,57 @@ export function statusTone(status: RunStatus): string {
 }
 
 export function kindLabel(kind: RunKind): string {
-  return kind === "unknown" ? "activity" : kind;
+  switch (kind) {
+    case "unknown":
+      return "activity";
+    // "package" alone reads as a noun in a row that wants a verb phrase.
+    case "package":
+      return "package resolve";
+    case "index":
+      return "indexing";
+    default:
+      return kind;
+  }
+}
+
+/** What a live build is doing right now, in words. */
+export type BuildPhase =
+  | "preparing"
+  | "resolving"
+  | "compiling"
+  | "assets"
+  | "linking"
+  | "packaging"
+  | "signing"
+  | "testing";
+
+const PHASE_LABEL: Record<BuildPhase, string> = {
+  preparing: "Preparing",
+  resolving: "Resolving packages",
+  compiling: "Compiling",
+  assets: "Compiling assets",
+  linking: "Linking",
+  packaging: "Generating symbols",
+  signing: "Signing",
+  testing: "Running tests",
+};
+
+export function phaseLabel(phase: BuildPhase | null): string | null {
+  return phase ? PHASE_LABEL[phase] : null;
+}
+
+/**
+ * The same fact in lower case, for use mid-sentence in a dense row.
+ *
+ * Package resolution loses the word "packages" here: the row already names the
+ * scheme, and "Index · resolving packages · 7m" spends its scarcest column on
+ * a word the verb implies.
+ */
+export function phaseTail(phase: BuildPhase | null): string | null {
+  if (!phase) return null;
+  return phase === "resolving"
+    ? "resolving packages"
+    : PHASE_LABEL[phase].toLowerCase();
 }
 
 export function basename(path: string | null | undefined): string | null {
@@ -247,8 +297,14 @@ export function runTitle(run: {
   scheme: string | null;
   container: string | null;
   root: string | null;
+  kind?: RunKind;
 }): string {
-  return (
-    run.scheme ?? basename(run.container) ?? basename(run.root) ?? "Xcode activity"
-  );
+  const named = run.scheme ?? basename(run.container) ?? basename(run.root);
+  if (named) return named;
+  // A standalone `xcodebuild -resolvePackageDependencies` names no scheme and
+  // resolves no DerivedData root, so the generic fallback produced "Resolving
+  // Xcode activity". These two give the verb something to act on.
+  if (run.kind === "package") return "packages";
+  if (run.kind === "index") return "files";
+  return "Xcode activity";
 }

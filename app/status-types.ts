@@ -5,6 +5,10 @@
  * render the same runs from the same contract without importing each other.
  */
 
+import type { BuildPhase } from "../src/types";
+
+export type { BuildPhase };
+
 export type RunDto = {
   id: string;
   status:
@@ -48,7 +52,9 @@ export type RunDto = {
   branch: string | null;
   worktree: string | null;
   workerCount: number | null;
-  phase: "compiling" | "assets" | "linking" | "signing" | "testing" | null;
+  // Imported, not re-spelled: this union had drifted from `src/types.ts` and
+  // silently dropped whichever phase was added last.
+  phase: BuildPhase | null;
   currentFile: string | null;
   typicalMs: number | null;
   projectName: string | null;

@@ -179,6 +179,57 @@ describe("lifecycle: running → finishing → ended", () => {
     expect(store.getRun(orphan)!.endedAt).toBe(9_000_000);
   });
 
+  /**
+   * `preparing` is derived from "a build service is up and nothing is
+   * executing", and that snapshot is identical before the first compiler
+   * spawns and after the last one exits. Only the first is preparing.
+   */
+  describe("livePhase", () => {
+    const preparing = activity({ phase: "preparing", workerCount: 0 });
+    const compiling = activity({ phase: "compiling", workerCount: 4 });
+
+    it("reports preparing before any work has been seen", () => {
+      engine.foldSnapshot([preparing], 1_000_000);
+      const id = store.listRuns({ limit: 1 })[0]!.id;
+      expect(engine.livePhase(id, preparing)).toBe("preparing");
+    });
+
+    it("withdraws it once the build has actually done something", () => {
+      engine.foldSnapshot([preparing], 1_000_000);
+      const id = store.listRuns({ limit: 1 })[0]!.id;
+      engine.foldSnapshot([compiling], 1_002_000);
+      expect(engine.livePhase(id, compiling)).toBe("compiling");
+
+      // Compilers gone, service still up: the same snapshot as the start, and
+      // emphatically not the same situation.
+      engine.foldSnapshot([preparing], 1_004_000);
+      expect(engine.livePhase(id, preparing)).toBeNull();
+    });
+
+    it("passes every other phase straight through", () => {
+      engine.foldSnapshot([compiling], 1_000_000);
+      const id = store.listRuns({ limit: 1 })[0]!.id;
+      expect(engine.livePhase(id, compiling)).toBe("compiling");
+      expect(engine.livePhase(id, null)).toBeNull();
+    });
+
+    /**
+     * Measured against a live machine: a fresh engine adopting a test run
+     * mid-flight reported "preparing" for a solid minute, because the sample
+     * it happened to start on was a lull between targets. A run whose history
+     * we do not have does not get to claim it is starting.
+     */
+    it("never claims preparing for a run adopted after a reload", () => {
+      engine.foldSnapshot([compiling], 1_000_000);
+      const id = store.listRuns({ limit: 1 })[0]!.id;
+
+      const second = new Engine(store, hooks);
+      second.hydrate(1_010_000);
+      second.foldSnapshot([preparing], 1_012_000);
+      expect(second.livePhase(id, preparing)).toBeNull();
+    });
+  });
+
   it("abandons a running run too old to be believed", () => {
     engine.foldSnapshot([activity()], 1_000_000);
     const id = store.listRuns({ limit: 1 })[0]!.id;

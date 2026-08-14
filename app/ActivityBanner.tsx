@@ -60,7 +60,7 @@ import { useComposerView, useRpc } from "@bb/plugin-sdk/app";
 import { cn } from "@/lib/utils";
 
 import type { rpcContract } from "../src/contract";
-import { isNoiseRun } from "../src/model";
+import { isEphemeralRun, isNoiseRun } from "../src/model";
 
 import { XcodeActivityRow } from "./ActivityRow";
 import { activityMetaClass } from "./activity-styles";
@@ -101,7 +101,12 @@ function XcodeActivityBannerLoaded({ threadId }: { threadId: string }) {
   // answer to "how did that go" outlives the build, without the card growing
   // a history section during a busy stretch.
   const settled = data?.lastSettled ?? null;
-  const runs = live.length > 0 ? live : settled && !isNoiseRun(settled) ? [settled] : [];
+  const runs =
+    live.length > 0
+      ? live
+      : settled && !isNoiseRun(settled) && !isEphemeralRun(settled)
+        ? [settled]
+        : [];
 
   // Nothing to report renders nothing at all — frame included, so the stack
   // closes up rather than keeping an empty card above the composer.
@@ -184,6 +189,11 @@ function dominant(runs: readonly RunDto[]): RunDto {
  * runs, and the focused one may be a finished run when nothing is live. The
  * banner shows in-flight work only — a finished build belongs in the history
  * panel, not pinned above the composer forever.
+ *
+ * Filtered on `isNoiseRun` alone, deliberately: an EPHEMERAL run — a package
+ * resolve, an index build — is exactly what belongs here while it is running.
+ * Hiding those is what let a thread spend seven and a half minutes resolving
+ * packages above an empty banner.
  */
 function liveRuns(focus: RunDto | null, active: readonly RunDto[]): RunDto[] {
   const out: RunDto[] = [];
