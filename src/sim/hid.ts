@@ -278,6 +278,16 @@ export const TAP_DWELL_MS = 45;
 /** serve-sim's own bottom-edge constant, used by the swipe-to-home gesture. */
 export const EDGE_BOTTOM = 3;
 
+/**
+ * Where a live drag has to start to be the home gesture.
+ *
+ * The bottom ~6% of the screen is the bezel zone: on Face ID hardware and in
+ * Simulator.app alike, a drag that begins there and travels up is "go home",
+ * not a scroll that started low. Marking those touches with `EDGE_BOTTOM` is
+ * what makes the panel's frame behave like the device's glass edge.
+ */
+export const EDGE_GESTURE_START_Y = 0.94;
+
 export interface HidSocketOptions {
   port: number;
   udid: string;
@@ -286,7 +296,6 @@ export interface HidSocketOptions {
   onClose(reason: string): void;
   /** Test seam: a fake WebSocket constructor. */
   connect?: (url: string, headers: Record<string, string>) => WebSocket;
-  now?: () => number;
 }
 
 type Sender = (data: Buffer) => void;
@@ -478,15 +487,26 @@ export class HidSocket {
   // long-press, double-tap, drag — exactly as if a finger were on the glass.
   // -------------------------------------------------------------------------
 
-  /** Finger down. Silently dropped while a scripted gesture owns the finger. */
+  /** The edge a live drag started on, carried by every frame until it ends. */
+  private liveEdge: number | undefined;
+
+  /**
+   * Finger down. Silently dropped while a scripted gesture owns the finger.
+   *
+   * A begin in the bezel zone is marked as an edge touch, so a drag from the
+   * bottom of the frame is the home gesture — the same reading Simulator.app
+   * gives a drag from the bottom of its window.
+   */
   touchBegin(x: number, y: number): void {
     if (this.fingerDown) return;
     this.fingerDown = true;
+    this.liveEdge = y >= EDGE_GESTURE_START_Y ? EDGE_BOTTOM : undefined;
     this.armStuckTimer();
     try {
-      this.touchSend("begin", x, y);
+      this.touchSend("begin", x, y, this.liveEdge);
     } catch {
       this.fingerDown = false;
+      this.liveEdge = undefined;
       this.clearStuckTimer();
     }
   }
@@ -495,7 +515,7 @@ export class HidSocket {
   touchMove(x: number, y: number): void {
     if (!this.fingerDown) return;
     try {
-      this.touchSend("move", x, y);
+      this.touchSend("move", x, y, this.liveEdge);
     } catch {
       // The socket is gone; the close path reports it.
     }
@@ -505,6 +525,7 @@ export class HidSocket {
   touchEnd(x: number, y: number): void {
     if (!this.fingerDown) return;
     this.fingerDown = false;
+    this.liveEdge = undefined;
     this.clearStuckTimer();
     try {
       this.touchSend("end", x, y);

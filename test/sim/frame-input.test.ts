@@ -95,6 +95,16 @@ describe("the wheel", () => {
     expect(wheelStep(RECT, 0, 0)).toBeNull();
     expect(wheelStep({ left: 0, top: 0, width: 0, height: 0 }, 0, 10)).toBeNull();
   });
+
+  it("translates line-mode deltas — a remote viewer's Firefox sends lines, not pixels", () => {
+    // 3 lines over a 400px-tall frame: 3 × 16px = 48px = 0.12. Read as raw
+    // pixels it would be 0.0075 — a sixteenth of the intended scroll.
+    expect(wheelStep(RECT, 0, 3, undefined, 1)).toEqual({ kind: "scroll", dx: 0, dy: 0.12 });
+  });
+
+  it("translates page-mode deltas as a fraction of the frame", () => {
+    expect(wheelStep(RECT, 0, 0.5, undefined, 2)).toEqual({ kind: "scroll", dx: 0, dy: 0.5 });
+  });
 });
 
 describe("the letterbox", () => {

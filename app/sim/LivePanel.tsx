@@ -292,7 +292,7 @@ function LiveFrame({
    * fidelity of a finger on glass, and the frame above it responds *while*
    * you drag, not after you let go.
    */
-  const dragging = useRef<{ pointerId: number } | null>(null);
+  const dragging = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   /** Freshest unsent move; coalesced to one per animation frame. */
   const pendingMove = useRef<{ x: number; y: number } | null>(null);
   const moveFrame = useRef(0);
@@ -307,12 +307,41 @@ function LiveFrame({
     moveFrame.current = 0;
     const move = pendingMove.current;
     pendingMove.current = null;
-    if (move === null || dragging.current === null) return;
+    const drag = dragging.current;
+    if (move === null || drag === null) return;
+    drag.x = move.x;
+    drag.y = move.y;
     onTouch("move", move.x, move.y);
   }, [onTouch]);
 
-  // No rAF may outlive the frame: a flush after unmount is a move for a drag
-  // that no longer exists.
+  /**
+   * Lift the finger wherever the drag is abandoned: unmount, tab hidden,
+   * capture lost.
+   *
+   * Without this, closing the panel mid-drag left the finger on the device
+   * until the five-second stuck-finger watchdog noticed — five seconds of the
+   * simulator ignoring input, with no error anywhere.
+   */
+  const abandonDrag = useCallback((): void => {
+    const drag = dragging.current;
+    if (drag === null) return;
+    dragging.current = null;
+    if (moveFrame.current !== 0) {
+      cancelAnimationFrame(moveFrame.current);
+      moveFrame.current = 0;
+    }
+    // The freshest position is the honest lift point, sent or not.
+    const at = pendingMove.current ?? { x: drag.x, y: drag.y };
+    pendingMove.current = null;
+    onTouch("end", at.x, at.y);
+  }, [onTouch]);
+
+  // Returned as the cleanup: unmounting mid-drag lifts the finger too.
+  useEffect(() => abandonDrag, [abandonDrag]);
+  useEffect(() => {
+    if (!visible) abandonDrag();
+  }, [visible, abandonDrag]);
+
   useEffect(
     () => () => {
       if (moveFrame.current !== 0) cancelAnimationFrame(moveFrame.current);
@@ -328,8 +357,8 @@ function LiveFrame({
       // Capture so a drag that leaves the frame still ends here — otherwise the
       // gesture never completes and the finger stays down on the device.
       event.currentTarget.setPointerCapture(event.pointerId);
-      dragging.current = { pointerId: event.pointerId };
       const point = toNormalized(rect, event.clientX, event.clientY);
+      dragging.current = { pointerId: event.pointerId, x: point.x, y: point.y };
       onTouch("begin", point.x, point.y);
     },
     [interactive, rectOf, onTouch],
@@ -374,7 +403,7 @@ function LiveFrame({
    * one scroll step per animation frame, anchored under the cursor so the
    * list being pointed at is the list that scrolls.
    */
-  const wheel = useRef({ dx: 0, dy: 0, clientX: 0, clientY: 0, frame: 0 });
+  const wheel = useRef({ dx: 0, dy: 0, clientX: 0, clientY: 0, deltaMode: 0, frame: 0 });
 
   const onWheel = useCallback(
     (event: React.WheelEvent<HTMLDivElement>) => {
@@ -384,6 +413,7 @@ function LiveFrame({
       acc.dy += event.deltaY;
       acc.clientX = event.clientX;
       acc.clientY = event.clientY;
+      acc.deltaMode = event.deltaMode;
       if (acc.frame !== 0) return;
       acc.frame = requestAnimationFrame(() => {
         acc.frame = 0;
@@ -393,7 +423,13 @@ function LiveFrame({
           acc.dy = 0;
           return;
         }
-        const step = wheelStep(rect, acc.dx, acc.dy, toNormalized(rect, acc.clientX, acc.clientY));
+        const step = wheelStep(
+          rect,
+          acc.dx,
+          acc.dy,
+          toNormalized(rect, acc.clientX, acc.clientY),
+          acc.deltaMode,
+        );
         acc.dx = 0;
         acc.dy = 0;
         if (step !== null) onStep(step);

@@ -263,15 +263,6 @@ export const rpcContract = defineRpcContract({
     input: z.object({ erase: z.string().optional(), shutdown: z.string().optional() }).strict(),
     output: liveStateSchema,
   },
-  /**
-   * One input step against the live device.
-   *
-   * The socket is server-owned and the frontend sends input over RPC. A direct
-   * browser WebSocket to loopback would shave a millisecond or two, but it lets
-   * two bb windows race for one device, needs a loopback origin the page may not
-   * have, and dies entirely under `https:`. Local RPC costs one to three
-   * milliseconds and works identically in every deployment.
-   */
   /** Take one frame off the stream and make it durable. */
   liveCapture: {
     input: z
@@ -437,6 +428,16 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({ looks: z.number(), bytes: z.number() }).strict(),
   },
+  /**
+   * One scripted input step against the live device.
+   *
+   * The socket is server-owned and the frontend sends input over RPC. A direct
+   * browser WebSocket to loopback would shave a millisecond or two, but it lets
+   * two bb windows race for one device, needs a loopback origin the page may not
+   * have, and dies entirely under `https:`. Local RPC costs one to three
+   * milliseconds and works identically in every deployment — and an atomic
+   * gesture survives a slow one, which a begin/end pair would not.
+   */
   liveInput: {
     input: z.object({ step: stepSchema }).strict(),
     output: z

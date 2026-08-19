@@ -87,6 +87,12 @@ export function useStream(
     const canvas = canvasRef.current;
     if (canvas === null) return;
 
+    // A (re)start is a new stream in every way: the frame count and the fps
+    // window must not average across a reconnect or a visibility toggle.
+    counter.current = 0;
+    setFrames(0);
+    setFps(null);
+
     const abort = new AbortController();
     let decoder: VideoDecoder | null = null;
     let disposed = false;

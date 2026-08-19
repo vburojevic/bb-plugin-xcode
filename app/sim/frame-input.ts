@@ -129,6 +129,9 @@ export function keyStep(event: {
   return { kind: "ignore" };
 }
 
+/** Pixels per line for line-mode wheel deltas — the de-facto browser standard. */
+export const LINE_HEIGHT_PX = 16;
+
 /**
  * A wheel event as a scroll step.
  *
@@ -139,16 +142,26 @@ export function keyStep(event: {
  *
  * `at` anchors the scroll to the pointer's position, so the list under the
  * cursor scrolls — rather than whatever happens to sit at the centre.
+ *
+ * `deltaMode` matters remotely: bb's own shell always sends pixels, but a
+ * viewer on another browser may not — Firefox sends *lines*, and a line read
+ * as a pixel is scrolling at a sixteenth of the intended speed, which feels
+ * exactly like "slow or delayed".
  */
 export function wheelStep(
   rect: Rect,
   deltaX: number,
   deltaY: number,
   at?: { x: number; y: number },
+  deltaMode = 0,
 ): Step | null {
   if (rect.width <= 0 || rect.height <= 0) return null;
-  const dx = clampSigned(deltaX / rect.width);
-  const dy = clampSigned(deltaY / rect.height);
+  // DOM_DELTA_LINE and DOM_DELTA_PAGE, normalized to pixels of content.
+  const unit = deltaMode === 1 ? LINE_HEIGHT_PX : 1;
+  const scaleX = deltaMode === 2 ? rect.width : unit;
+  const scaleY = deltaMode === 2 ? rect.height : unit;
+  const dx = clampSigned((deltaX * scaleX) / rect.width);
+  const dy = clampSigned((deltaY * scaleY) / rect.height);
   if (dx === 0 && dy === 0) return null;
   return at === undefined ? { kind: "scroll", dx, dy } : { kind: "scroll", dx, dy, at: { x: at.x, y: at.y } };
 }

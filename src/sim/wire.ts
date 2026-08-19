@@ -910,11 +910,13 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   );
 
   /**
-   * The MJPEG stream, proxied from the capture host.
+   * The device stream, proxied from the capture host — H.264 or MJPEG.
    *
    * The fallback path since direct streaming landed: it is what a viewer on
    * another machine, or one reached over `bb connect`, still uses. It keeps its
-   * own presence accounting for that case.
+   * own presence accounting for that case, and it carries both codecs because
+   * the 18× bandwidth difference matters most exactly where this route is
+   * required: on the far side of a tunnel.
    */
   bb.http.route(
     "GET",

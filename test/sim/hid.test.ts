@@ -3,6 +3,7 @@ import type { WebSocket } from "ws";
 import {
   BUTTONS,
   decodeConfig,
+  EDGE_BOTTOM,
   encodeButton,
   encodeButtonHid,
   encodeCaDebug,
@@ -303,5 +304,28 @@ describe("the socket", () => {
     hid.touchMove(0.6, 0.7);
     hid.close();
     expect(touchFrames(ws).at(-1)).toEqual({ type: "end", x: 0.6, y: 0.7 });
+  });
+
+  it("marks a drag from the bezel zone as the home gesture, and a mid-screen one as not", async () => {
+    const { hid, ws } = await openedSocket();
+
+    // From the bottom ~6%: an edge touch, on begin and every move.
+    hid.touchBegin(0.5, 0.97);
+    hid.touchMove(0.5, 0.6);
+    hid.touchEnd(0.5, 0.35);
+    const edged = ws.sent.map((frame) => decode(frame)).filter((frame) => frame.tag === TAG.touch);
+    expect((edged[0]!.body as { edge?: number }).edge).toBe(EDGE_BOTTOM);
+    expect((edged[1]!.body as { edge?: number }).edge).toBe(EDGE_BOTTOM);
+
+    // From anywhere else: no edge, or Simulator.app's own gestures break.
+    hid.touchBegin(0.5, 0.5);
+    hid.touchMove(0.5, 0.4);
+    hid.touchEnd(0.5, 0.3);
+    const plain = ws.sent
+      .map((frame) => decode(frame))
+      .filter((frame) => frame.tag === TAG.touch)
+      .slice(3);
+    expect((plain[0]!.body as { edge?: number }).edge).toBeUndefined();
+    expect((plain[1]!.body as { edge?: number }).edge).toBeUndefined();
   });
 });
