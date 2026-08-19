@@ -21,9 +21,10 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { liveVeil, metaLine, TONE_CLASS } from "./copy";
 import type { Action } from "./copy";
-import { contentRect, keyStep, pointerStep, toNormalized, wheelStep } from "./frame-input";
+import { contentRect, keyStep, toNormalized, wheelStep } from "./frame-input";
 import { canDecodeH264, currentViewerCanReachLoopback } from "./stream-core";
 import { describeSource, streamSources, type StreamSource } from "./stream-sources";
+import type { TouchPhase } from "./touch-channel";
 import { useStream } from "./useStream";
 import type { DeviceList, LiveState } from "./useLive";
 import type { Step } from "../../src/sim/steps.js";
@@ -39,9 +40,6 @@ import type { Step } from "../../src/sim/steps.js";
  */
 const STALL_AFTER_MS = 12_000;
 
-/** Wheel events arrive far faster than a gesture needs; one per frame is plenty. */
-const WHEEL_THROTTLE_MS = 40;
-
 export interface LivePanelProps {
   state: LiveState | null;
   devices: DeviceList | null;
@@ -52,6 +50,8 @@ export interface LivePanelProps {
   onAlive: () => void;
   onOpenDoctor: () => void;
   onStep: (step: Step) => void;
+  /** Live touch frames from the pointer — the device does the recognising. */
+  onTouch: (phase: TouchPhase, x: number, y: number) => void;
   /** Rendered under the meta line — the Frames strip, once captures exist. */
   belowMeta?: React.ReactNode;
   /** Rendered along the bottom edge. */
@@ -67,6 +67,7 @@ export function LivePanel({
   onAlive,
   onOpenDoctor,
   onStep,
+  onTouch,
   belowMeta,
   controls,
 }: LivePanelProps) {
@@ -122,6 +123,7 @@ export function LivePanel({
         onStall={onStall}
         onAlive={onAlive}
         onStep={onStep}
+        onTouch={onTouch}
         onStreamFailed={() => setStreamFailed(true)}
         onStats={onStreamStats}
       />
@@ -168,6 +170,7 @@ interface LiveFrameProps {
   onStall: () => void;
   onAlive: () => void;
   onStep: (step: Step) => void;
+  onTouch: (phase: TouchPhase, x: number, y: number) => void;
   onStreamFailed: () => void;
   /** Reports the rung in use and its pace, for the meta line. */
   onStats: (source: StreamSource | null, fps: number | null) => void;
@@ -180,6 +183,7 @@ function LiveFrame({
   onStall,
   onAlive,
   onStep,
+  onTouch,
   onStreamFailed,
   onStats,
 }: LiveFrameProps) {
@@ -277,61 +281,132 @@ function LiveFrame({
 
   useFrameWatchdog(active && state?.kind === "streaming", video.frames, onStall, onAlive);
 
-  const gesture = useRef<{ x: number; y: number; at: number; id: number } | null>(null);
-  const lastWheel = useRef(0);
-
   /**
-   * The picture's rectangle, not the element's.
+   * Pointer events become touch frames, verbatim.
    *
-   * The canvas is `object-fit: contain`, so a panel wider than the device
-   * letterboxes the picture and every coordinate taken from the element box is
-   * wrong.
+   * There is no gesture classification here on purpose: the panel used to
+   * decide "that was a tap" or "that was a swipe", replay the gesture
+   * server-side, and get it subtly wrong (a tap's `end` even went out at
+   * screen centre). Streaming begin/move/end as they happen lets iOS do all
+   * of the recognising — tap, double-tap, long-press, drag — at the full
+   * fidelity of a finger on glass, and the frame above it responds *while*
+   * you drag, not after you let go.
    */
+  const dragging = useRef<{ pointerId: number } | null>(null);
+  /** Freshest unsent move; coalesced to one per animation frame. */
+  const pendingMove = useRef<{ x: number; y: number } | null>(null);
+  const moveFrame = useRef(0);
+
   const rectOf = useCallback((): DOMRect | null => {
     const box = canvasRef.current?.getBoundingClientRect() ?? null;
     if (box === null) return null;
     return contentRect(box, screen) as DOMRect;
   }, [screen]);
 
+  const flushMove = useCallback((): void => {
+    moveFrame.current = 0;
+    const move = pendingMove.current;
+    pendingMove.current = null;
+    if (move === null || dragging.current === null) return;
+    onTouch("move", move.x, move.y);
+  }, [onTouch]);
+
+  // No rAF may outlive the frame: a flush after unmount is a move for a drag
+  // that no longer exists.
+  useEffect(
+    () => () => {
+      if (moveFrame.current !== 0) cancelAnimationFrame(moveFrame.current);
+    },
+    [],
+  );
+
   const onPointerDown = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
-      if (!interactive) return;
+      if (!interactive || event.button !== 0) return;
       const rect = rectOf();
       if (rect === null) return;
       // Capture so a drag that leaves the frame still ends here — otherwise the
       // gesture never completes and the finger stays down on the device.
       event.currentTarget.setPointerCapture(event.pointerId);
+      dragging.current = { pointerId: event.pointerId };
       const point = toNormalized(rect, event.clientX, event.clientY);
-      gesture.current = { ...point, at: Date.now(), id: event.pointerId };
+      onTouch("begin", point.x, point.y);
     },
-    [interactive, rectOf],
+    [interactive, rectOf, onTouch],
   );
 
-  const endGesture = useCallback(
+  const onPointerMove = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
-      const start = gesture.current;
-      gesture.current = null;
-      if (start === null || start.id !== event.pointerId) return;
+      const drag = dragging.current;
+      if (drag === null || drag.pointerId !== event.pointerId) return;
       const rect = rectOf();
       if (rect === null) return;
-      const end = toNormalized(rect, event.clientX, event.clientY);
-      onStep(pointerStep(start, end, Date.now() - start.at));
+      pendingMove.current = toNormalized(rect, event.clientX, event.clientY);
+      if (moveFrame.current === 0) moveFrame.current = requestAnimationFrame(flushMove);
     },
-    [onStep, rectOf],
+    [rectOf, flushMove],
   );
+
+  const endDrag = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      const drag = dragging.current;
+      if (drag === null || drag.pointerId !== event.pointerId) return;
+      dragging.current = null;
+      if (moveFrame.current !== 0) {
+        cancelAnimationFrame(moveFrame.current);
+        moveFrame.current = 0;
+      }
+      pendingMove.current = null;
+      const rect = rectOf();
+      if (rect === null) return;
+      const point = toNormalized(rect, event.clientX, event.clientY);
+      onTouch("end", point.x, point.y);
+    },
+    [rectOf, onTouch],
+  );
+
+  /**
+   * The wheel, accumulated per frame rather than throttled per event.
+   *
+   * The old 40ms throttle *dropped* every delta that arrived inside the
+   * window — that lost distance is exactly the "scroll is slow" a trackpad
+   * user feels. Accumulating preserves every pixel and still sends at most
+   * one scroll step per animation frame, anchored under the cursor so the
+   * list being pointed at is the list that scrolls.
+   */
+  const wheel = useRef({ dx: 0, dy: 0, clientX: 0, clientY: 0, frame: 0 });
 
   const onWheel = useCallback(
     (event: React.WheelEvent<HTMLDivElement>) => {
       if (!interactive) return;
-      const now = Date.now();
-      if (now - lastWheel.current < WHEEL_THROTTLE_MS) return;
-      lastWheel.current = now;
-      const rect = rectOf();
-      if (rect === null) return;
-      const step = wheelStep(rect, event.deltaX, event.deltaY);
-      if (step !== null) onStep(step);
+      const acc = wheel.current;
+      acc.dx += event.deltaX;
+      acc.dy += event.deltaY;
+      acc.clientX = event.clientX;
+      acc.clientY = event.clientY;
+      if (acc.frame !== 0) return;
+      acc.frame = requestAnimationFrame(() => {
+        acc.frame = 0;
+        const rect = rectOf();
+        if (rect === null) {
+          acc.dx = 0;
+          acc.dy = 0;
+          return;
+        }
+        const step = wheelStep(rect, acc.dx, acc.dy, toNormalized(rect, acc.clientX, acc.clientY));
+        acc.dx = 0;
+        acc.dy = 0;
+        if (step !== null) onStep(step);
+      });
     },
     [interactive, onStep, rectOf],
+  );
+
+  useEffect(
+    () => () => {
+      if (wheel.current.frame !== 0) cancelAnimationFrame(wheel.current.frame);
+    },
+    [],
   );
 
   const onKeyDown = useCallback(
@@ -373,8 +448,10 @@ function LiveFrame({
           : `Simulator: ${state.device.name}. Arrow keys move a crosshair, Return taps, Escape leaves.`
       }
       onPointerDown={onPointerDown}
-      onPointerUp={endGesture}
-      onPointerCancel={endGesture}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onLostPointerCapture={endDrag}
       onWheel={onWheel}
       onKeyDown={onKeyDown}
       onBlur={() => setCrosshair(null)}

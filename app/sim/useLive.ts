@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../../src/sim/wire";
 import type { Step } from "../../src/sim/steps.js";
+import { TouchChannel, type TouchPhase } from "./touch-channel";
 
 export interface LiveState {
   kind:
@@ -102,6 +103,25 @@ let rpc: Rpc | null = null;
 let inFlight = false;
 let queued = false;
 
+/**
+ * The one live-touch pipe.
+ *
+ * Module-level for the same reason the store is: the nav panel and a thread
+ * panel are separate React trees over one device, and two channels would
+ * interleave their frames. The channel reads the current client lazily, so a
+ * reconnect swaps transports without a drag in flight noticing.
+ */
+let touches: TouchChannel | null = null;
+
+function touchChannel(): TouchChannel {
+  touches ??= new TouchChannel((phase, x, y) => {
+    const client = rpc;
+    if (client === null) return Promise.resolve();
+    return client.call("liveTouch", { phase, x, y });
+  });
+  return touches;
+}
+
 function emit(patch: Partial<Snapshot>): void {
   snapshot = { ...snapshot, ...patch };
   for (const listener of listeners) listener();
@@ -169,6 +189,7 @@ export function resetLiveStore(): void {
   rpc = null;
   inFlight = false;
   queued = false;
+  touches = null;
   listeners.clear();
 }
 
@@ -180,6 +201,8 @@ export interface LiveApi extends Snapshot {
   erase: (udid: string) => Promise<void>;
   /** One input step. Rejects with the server's sentence when it refuses. */
   input: (step: Step) => Promise<{ log: string; dropped: string[] }>;
+  /** One live touch frame — fire-and-forget, ordered, moves collapse. */
+  touch: (phase: TouchPhase, x: number, y: number) => void;
   capture: (label?: string) => Promise<{ summary: string }>;
   reportStall: () => void;
   reportAlive: () => void;
@@ -247,6 +270,14 @@ export function useLive(): LiveApi {
     [client],
   );
 
+  /**
+   * Pointer events, straight through. The channel orders and coalesces; this
+   * wrapper only exists so the panel never holds the channel itself.
+   */
+  const touch = useCallback((phase: TouchPhase, x: number, y: number) => {
+    touchChannel().push(phase, x, y);
+  }, []);
+
   const capture = useCallback(
     async (label?: string) => {
       const result = (await client.call(
@@ -294,7 +325,7 @@ export function useLive(): LiveApi {
   }, [client]);
 
   return useMemo(
-    () => ({ ...value, refresh, start, stop, shutdown, erase, input, capture, reportStall, reportAlive }),
-    [value, start, stop, shutdown, erase, input, capture, reportStall, reportAlive],
+    () => ({ ...value, refresh, start, stop, shutdown, erase, input, touch, capture, reportStall, reportAlive }),
+    [value, start, stop, shutdown, erase, input, touch, capture, reportStall, reportAlive],
   );
 }

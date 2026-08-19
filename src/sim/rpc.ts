@@ -400,6 +400,22 @@ export function makeRpcHandlers(ctx: Ctx) {
       }
       return { log: result.log, dropped: result.dropped };
     },
+
+    async liveTouch({ phase, x, y }: { phase: "begin" | "move" | "end"; x: number; y: number }) {
+      const ok = ctx.live.touch(phase, x, y);
+      // A finger coming up can move the foreground app, and the meta line
+      // claims to say which one is there. Once per gesture end — never per
+      // move, or the probe would run at display rate.
+      if (phase === "end") {
+        detach(
+          () => ctx.live.pollForeground().then(() => undefined),
+          () => {
+            // The accessibility service warms up after the device does.
+          },
+        );
+      }
+      return { ok };
+    },
   };
 }
 

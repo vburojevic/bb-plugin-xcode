@@ -1,14 +1,14 @@
 /**
  * Turning pointer and keyboard events into steps.
  *
- * Pure, so the mapping is testable without a DOM and without a device: given a
- * rectangle and two points, this decides whether you tapped or swiped, and
- * given a key it decides whether you meant to type or to move.
+ * Pure, so the mapping is testable without a DOM and without a device.
+ *
+ * There is deliberately no pointer-gesture classifier here anymore. The panel
+ * streams raw touches (`liveTouch`) and iOS does the recognising — tap,
+ * long-press, drag — exactly as if a finger were on the glass. What remains is
+ * the coordinate maths and the keyboard map, which the device cannot do for us.
  */
 import type { Step } from "../../src/sim/steps.js";
-
-/** Below this much movement, a drag is a tap with a shaky hand. */
-export const TAP_SLOP = 0.015;
 
 export interface Rect {
   left: number;
@@ -66,32 +66,6 @@ export function contentRect(rect: Rect, screen: { width: number; height: number 
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.min(1, Math.max(0, value));
-}
-
-/**
- * A tap or a swipe, depending on how far the pointer travelled.
- *
- * The duration is the real one, so a slow drag reads as a slow drag: iOS's own
- * recognizers care, and a 250ms swipe where the user spent a second is a
- * different gesture.
- */
-export function pointerStep(
-  from: { x: number; y: number },
-  to: { x: number; y: number },
-  durationMs: number,
-): Step {
-  const distance = Math.hypot(to.x - from.x, to.y - from.y);
-  if (distance < TAP_SLOP) {
-    return durationMs >= 500
-      ? { kind: "longPress", at: { x: from.x, y: from.y }, holdMs: Math.min(5000, Math.round(durationMs)) }
-      : { kind: "tap", at: { x: from.x, y: from.y } };
-  }
-  return {
-    kind: "swipe",
-    from: { x: from.x, y: from.y },
-    to: { x: to.x, y: to.y },
-    durationMs: Math.min(3000, Math.max(50, Math.round(durationMs))),
-  };
 }
 
 /** How far one arrow press moves the crosshair; Shift makes it a coarse jump. */
@@ -162,13 +136,21 @@ export function keyStep(event: {
  * to get the normalized fraction the device session expects, and the sign is
  * preserved: scrolling content down is a swipe up, and the injector already
  * inverts it.
+ *
+ * `at` anchors the scroll to the pointer's position, so the list under the
+ * cursor scrolls — rather than whatever happens to sit at the centre.
  */
-export function wheelStep(rect: Rect, deltaX: number, deltaY: number): Step | null {
+export function wheelStep(
+  rect: Rect,
+  deltaX: number,
+  deltaY: number,
+  at?: { x: number; y: number },
+): Step | null {
   if (rect.width <= 0 || rect.height <= 0) return null;
   const dx = clampSigned(deltaX / rect.width);
   const dy = clampSigned(deltaY / rect.height);
   if (dx === 0 && dy === 0) return null;
-  return { kind: "scroll", dx, dy };
+  return at === undefined ? { kind: "scroll", dx, dy } : { kind: "scroll", dx, dy, at: { x: at.x, y: at.y } };
 }
 
 function clampSigned(value: number): number {

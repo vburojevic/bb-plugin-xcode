@@ -447,6 +447,26 @@ export const rpcContract = defineRpcContract({
       })
       .strict(),
   },
+  /**
+   * One live touch frame: the panel's pointer events, streamed as-is.
+   *
+   * This is deliberately separate from `liveInput`'s gesture vocabulary. A
+   * scripted gesture is atomic — "swipe from here to here over 250ms" — and
+   * survives a high-latency link intact. A live drag is a stream of positions
+   * the device must see *as they happen*, because iOS is doing the gesture
+   * recognition. Moves at display rate would drown the step machinery; this
+   * channel is the cheap, ordered, droppable pipe they belong on.
+   */
+  liveTouch: {
+    input: z
+      .object({
+        phase: z.enum(["begin", "move", "end"]),
+        x: z.number().min(0).max(1),
+        y: z.number().min(0).max(1),
+      })
+      .strict(),
+    output: z.object({ ok: z.boolean() }).strict(),
+  },
 });
 
 export type RpcContract = typeof rpcContract;

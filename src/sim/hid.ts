@@ -266,6 +266,15 @@ export function textToKeystrokes(text: string): { strokes: KeyStroke[]; dropped:
 /** A finger left down for longer than this is a bug; lift it. */
 export const STUCK_FINGER_MS = 5000;
 
+/**
+ * How long a tap holds contact.
+ *
+ * The old 16ms down-up read as a glitch to some of iOS's recognizers — below
+ * the floor of what a human finger produces, let alone what a tap recognizer
+ * tuned for human fingers expects. ~45ms is the bottom of a real tap.
+ */
+export const TAP_DWELL_MS = 45;
+
 /** serve-sim's own bottom-edge constant, used by the swipe-to-home gesture. */
 export const EDGE_BOTTOM = 3;
 
@@ -288,6 +297,21 @@ export class HidSocket {
   private stuckTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
   private config: ScreenConfig | null = null;
+  /**
+   * Where the finger is, as far as the device knows.
+   *
+   * Every `end` must go out at this point. The one that used to go out at the
+   * default (0.5, 0.5) is why taps "did nothing": the touch began where the
+   * user pressed and then teleported to the centre of the screen before it
+   * ended, so iOS delivered it to whatever lives in the middle.
+   */
+  private lastPoint = { x: 0.5, y: 0.5 };
+  /**
+   * Gestures, serialized. An overlap used to throw "a gesture is already in
+   * flight" back at the user for tapping twice quickly; gestures are physical
+   * things that happen one after another, so they queue one after another.
+   */
+  private queue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly options: HidSocketOptions) {}
 
@@ -387,85 +411,170 @@ export class HidSocket {
     this.stuckTimer = null;
   }
 
-  private liftFinger(x = 0.5, y = 0.5): void {
+  private armStuckTimer(): void {
+    this.clearStuckTimer();
+    this.stuckTimer = setTimeout(() => this.liftFinger(), STUCK_FINGER_MS);
+    this.stuckTimer.unref?.();
+  }
+
+  /** A touch frame that also remembers where it happened. */
+  private touchSend(phase: TouchPhase, x: number, y: number, edge?: number): void {
+    this.lastPoint = { x: clamp01(x), y: clamp01(y) };
+    this.send(encodeTouch(phase, x, y, edge));
+  }
+
+  private liftFinger(): void {
     this.clearStuckTimer();
     if (!this.fingerDown) return;
     this.fingerDown = false;
     try {
-      this.send(encodeTouch("end", x, y));
+      // At the point the finger actually is — never at a default.
+      this.touchSend("end", this.lastPoint.x, this.lastPoint.y);
     } catch {
       // The socket died mid-gesture. There is no finger to lift on a device we
       // can no longer reach.
     }
   }
 
-  /**
-   * The one function every touch gesture goes through.
-   *
-   * `finally` always ends the gesture. The watchdog covers the case where the
-   * body neither returns nor throws — an await that never settles — which is
-   * the only way a finger could otherwise stay down.
-   */
-  private async gesture(body: (send: Sender) => Promise<void>): Promise<void> {
+  /** The body of a gesture: tracked touch frames plus the raw send. */
+  private async gestureLocked(body: (g: { touch: (phase: TouchPhase, x: number, y: number, edge?: number) => void; send: Sender }) => Promise<void>): Promise<void> {
     if (this.fingerDown) {
-      throw new Error("A gesture is already in flight on this simulator.");
+      // With gestures queued this only fires when a *live* touch is still
+      // down — someone is physically mid-drag on the panel.
+      throw new Error("A finger is already down on this simulator.");
     }
     this.fingerDown = true;
-    const now = this.options.now ?? Date.now;
-    const startedAt = now();
-    this.stuckTimer = setTimeout(() => this.liftFinger(), STUCK_FINGER_MS);
-    this.stuckTimer.unref?.();
+    this.armStuckTimer();
     try {
-      await body(this.send);
+      await body({ touch: (phase, x, y, edge) => this.touchSend(phase, x, y, edge), send: this.send });
     } finally {
-      // `startedAt` is read so a slow gesture can be told from a wedged one in
-      // the log without adding a second timer.
-      void startedAt;
       this.liftFinger();
     }
   }
 
-  async tap(x: number, y: number): Promise<void> {
-    await this.gesture(async (send) => {
-      send(encodeTouch("begin", x, y));
-      await sleep(16);
-      send(encodeTouch("move", x, y));
+  /**
+   * The one queue every scripted gesture goes through.
+   *
+   * `finally` (inside `gestureLocked`) always ends the gesture, and the
+   * watchdog covers the case where the body neither returns nor throws — an
+   * await that never settles — which is the only way a finger could otherwise
+   * stay down. The queue itself swallows nothing: callers still get their
+   * rejection, the next gesture simply does not inherit it.
+   */
+  private enqueueGesture<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(work);
+    this.queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  // -------------------------------------------------------------------------
+  // Live touches: the panel's pointer events, streamed as-is
+  //
+  // These are not gestures and never enter the queue: the panel sends begin,
+  // a stream of moves and an end, and iOS does all the recognising — tap,
+  // long-press, double-tap, drag — exactly as if a finger were on the glass.
+  // -------------------------------------------------------------------------
+
+  /** Finger down. Silently dropped while a scripted gesture owns the finger. */
+  touchBegin(x: number, y: number): void {
+    if (this.fingerDown) return;
+    this.fingerDown = true;
+    this.armStuckTimer();
+    try {
+      this.touchSend("begin", x, y);
+    } catch {
+      this.fingerDown = false;
+      this.clearStuckTimer();
+    }
+  }
+
+  /** Finger moved. With no finger down there is nothing to move. */
+  touchMove(x: number, y: number): void {
+    if (!this.fingerDown) return;
+    try {
+      this.touchSend("move", x, y);
+    } catch {
+      // The socket is gone; the close path reports it.
+    }
+  }
+
+  /** Finger up, at the point it was lifted. */
+  touchEnd(x: number, y: number): void {
+    if (!this.fingerDown) return;
+    this.fingerDown = false;
+    this.clearStuckTimer();
+    try {
+      this.touchSend("end", x, y);
+    } catch {
+      // The socket is gone; the close path reports it.
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Scripted gestures: the agent tool, the control bar, drive scripts
+  // -------------------------------------------------------------------------
+
+  /** How long a tap holds contact. 16ms reads as a glitch; this is a human tap's floor. */
+  private async tapOnce(x: number, y: number): Promise<void> {
+    await this.gestureLocked(async ({ touch }) => {
+      touch("begin", x, y);
+      await sleep(TAP_DWELL_MS);
     });
   }
 
-  async doubleTap(x: number, y: number): Promise<void> {
-    await this.tap(x, y);
-    await sleep(80);
-    await this.tap(x, y);
+  tap(x: number, y: number): Promise<void> {
+    return this.enqueueGesture(() => this.tapOnce(x, y));
   }
 
-  async longPress(x: number, y: number, holdMs = 700): Promise<void> {
-    await this.gesture(async (send) => {
-      send(encodeTouch("begin", x, y));
-      // A press with no movement is a press; the moves keep the gesture alive
-      // for iOS's own long-press recognizers.
-      const steps = Math.max(1, Math.round(holdMs / 100));
-      for (let i = 0; i < steps; i += 1) {
-        await sleep(100);
-        send(encodeTouch("move", x, y));
-      }
+  doubleTap(x: number, y: number): Promise<void> {
+    return this.enqueueGesture(async () => {
+      await this.tapOnce(x, y);
+      await sleep(80);
+      await this.tapOnce(x, y);
     });
   }
 
-  async swipe(
+  longPress(x: number, y: number, holdMs = 700): Promise<void> {
+    return this.enqueueGesture(async () => {
+      await this.gestureLocked(async ({ touch }) => {
+        touch("begin", x, y);
+        // A press with no movement is a press; the moves keep the gesture alive
+        // for iOS's own long-press recognizers.
+        const steps = Math.max(1, Math.round(holdMs / 100));
+        for (let i = 0; i < steps; i += 1) {
+          await sleep(100);
+          touch("move", x, y);
+        }
+      });
+    });
+  }
+
+  swipe(
     from: { x: number; y: number },
     to: { x: number; y: number },
     durationMs = 250,
     edge?: number,
   ): Promise<void> {
-    await this.gesture(async (send) => {
-      const steps = Math.max(2, Math.min(30, Math.round(durationMs / 16)));
-      send(encodeTouch("begin", from.x, from.y, edge));
-      for (let i = 1; i <= steps; i += 1) {
-        const t = i / steps;
-        await sleep(durationMs / steps);
-        send(encodeTouch("move", from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t, edge));
-      }
+    return this.enqueueGesture(async () => {
+      await this.gestureLocked(async ({ touch }) => {
+        const steps = Math.max(2, Math.min(30, Math.round(durationMs / 16)));
+        touch("begin", from.x, from.y, edge);
+        for (let i = 1; i <= steps; i += 1) {
+          const t = i / steps;
+          await sleep(durationMs / steps);
+          // The last step is `to` exactly — interpolation drift
+          // (0.19999999999999996) is a real coordinate on a 3× display.
+          touch(
+            "move",
+            i === steps ? to.x : from.x + (to.x - from.x) * t,
+            i === steps ? to.y : from.y + (to.y - from.y) * t,
+            edge,
+          );
+        }
+      });
     });
   }
 
@@ -474,29 +583,31 @@ export class HidSocket {
    * `gesture` subcommand hardcodes tag `0x03`, so a pinch arrives as a single
    * touch with undefined coordinates.
    */
-  async pinch(
+  pinch(
     center: { x: number; y: number },
     fromSpread: number,
     toSpread: number,
     durationMs = 300,
   ): Promise<void> {
-    await this.gesture(async (send) => {
-      const steps = Math.max(2, Math.min(30, Math.round(durationMs / 16)));
-      const at = (spread: number): [number, number, number, number] => [
-        center.x - spread / 2,
-        center.y - spread / 2,
-        center.x + spread / 2,
-        center.y + spread / 2,
-      ];
-      send(encodeMultiTouch("begin", ...at(fromSpread)));
-      for (let i = 1; i <= steps; i += 1) {
-        const t = i / steps;
-        await sleep(durationMs / steps);
-        send(encodeMultiTouch("move", ...at(fromSpread + (toSpread - fromSpread) * t)));
-      }
-      // Multi-touch has its own end frame; the guard's single-finger lift would
-      // leave the second finger down.
-      send(encodeMultiTouch("end", ...at(toSpread)));
+    return this.enqueueGesture(async () => {
+      await this.gestureLocked(async ({ send }) => {
+        const steps = Math.max(2, Math.min(30, Math.round(durationMs / 16)));
+        const at = (spread: number): [number, number, number, number] => [
+          center.x - spread / 2,
+          center.y - spread / 2,
+          center.x + spread / 2,
+          center.y + spread / 2,
+        ];
+        send(encodeMultiTouch("begin", ...at(fromSpread)));
+        for (let i = 1; i <= steps; i += 1) {
+          const t = i / steps;
+          await sleep(durationMs / steps);
+          send(encodeMultiTouch("move", ...at(fromSpread + (toSpread - fromSpread) * t)));
+        }
+        // Multi-touch has its own end frame; the guard's single-finger lift would
+        // leave the second finger down.
+        send(encodeMultiTouch("end", ...at(toSpread)));
+      });
     });
   }
 

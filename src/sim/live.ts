@@ -588,6 +588,30 @@ export class LiveService {
     this.requireSocket().rotate(orientation);
   }
 
+  /**
+   * One live touch frame from the panel's pointer events.
+   *
+   * Returns false when there is no socket to deliver to. Dropping silently is
+   * the correct behaviour for a move: the panel sends sixty of them a second,
+   * and a dead socket mid-drag is reported by the close path, not by sixty
+   * rejections. Begin and end callers can read the boolean if they care.
+   */
+  touch(phase: "begin" | "move" | "end", x: number, y: number): boolean {
+    const session = this.session;
+    if (session === null || session.hid === null) return false;
+    switch (phase) {
+      case "begin":
+        session.hid.touchBegin(x, y);
+        return true;
+      case "move":
+        session.hid.touchMove(x, y);
+        return true;
+      case "end":
+        session.hid.touchEnd(x, y);
+        return true;
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Device resolution
   // -------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { WebSocket } from "ws";
 import {
   BUTTONS,
   decodeConfig,
@@ -12,6 +13,7 @@ import {
   encodeScroll,
   encodeSoftwareKeyboard,
   encodeTouch,
+  HidSocket,
   KEY_LEFT_SHIFT,
   normalizeOrientation,
   TAG,
@@ -179,5 +181,127 @@ describe("typing", () => {
 
   it("uses left shift, which is the modifier the injector expects", () => {
     expect(KEY_LEFT_SHIFT).toBe(0xe1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The socket: what actually leaves for the device, in what order
+// ---------------------------------------------------------------------------
+
+/** A WebSocket good enough to drive the socket's contract with one. */
+class FakeWebSocket {
+  readyState = 1; // OPEN
+  sent: Buffer[] = [];
+  private handlers = new Map<string, Array<(...args: never[]) => void>>();
+
+  on(event: string, cb: (...args: never[]) => void): void {
+    const list = this.handlers.get(event) ?? [];
+    list.push(cb);
+    this.handlers.set(event, list);
+  }
+  send(data: Buffer): void {
+    this.sent.push(data);
+  }
+  close(): void {
+    this.readyState = 3;
+  }
+  fire(event: string, ...args: never[]): void {
+    for (const cb of this.handlers.get(event) ?? []) cb(...args);
+  }
+}
+
+function touchFrames(ws: FakeWebSocket): Array<{ type: string; x: number; y: number }> {
+  return ws.sent
+    .map((frame) => decode(frame))
+    .filter((frame) => frame.tag === TAG.touch)
+    .map((frame) => frame.body as { type: string; x: number; y: number });
+}
+
+async function openedSocket(): Promise<{ hid: HidSocket; ws: FakeWebSocket }> {
+  const ws = new FakeWebSocket();
+  const hid = new HidSocket({
+    port: 1,
+    udid: "UDID",
+    secret: "s",
+    onConfig: () => {},
+    onClose: () => {},
+    connect: () => ws as unknown as WebSocket,
+  });
+  const opening = hid.open();
+  ws.fire("open");
+  await opening;
+  return { hid, ws };
+}
+
+const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe("the socket", () => {
+  it("ends a tap where the tap happened — never at screen centre", async () => {
+    // The regression test for "I can't tap stuff": the end used to go out at
+    // the default (0.5, 0.5), so iOS delivered every tap to the middle.
+    const { hid, ws } = await openedSocket();
+    await hid.tap(0.2, 0.8);
+    const frames = touchFrames(ws);
+    expect(frames[0]).toEqual({ type: "begin", x: 0.2, y: 0.8 });
+    expect(frames.at(-1)).toEqual({ type: "end", x: 0.2, y: 0.8 });
+  });
+
+  it("ends a swipe where the swipe ends", async () => {
+    const { hid, ws } = await openedSocket();
+    await hid.swipe({ x: 0.5, y: 0.8 }, { x: 0.5, y: 0.2 }, 60);
+    const frames = touchFrames(ws);
+    expect(frames[0]).toEqual({ type: "begin", x: 0.5, y: 0.8 });
+    expect(frames.at(-1)).toEqual({ type: "end", x: 0.5, y: 0.2 });
+  });
+
+  it("queues a second gesture behind the first instead of throwing", async () => {
+    const { hid, ws } = await openedSocket();
+    const first = hid.longPress(0.5, 0.5, 150);
+    const second = hid.tap(0.1, 0.1);
+    // Neither rejects: gestures are physical things, they happen in order.
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
+
+    const frames = touchFrames(ws);
+    const pressEnd = frames.findIndex((f) => f.type === "end" && f.x === 0.5 && f.y === 0.5);
+    const tapBegin = frames.findIndex((f) => f.type === "begin" && f.x === 0.1 && f.y === 0.1);
+    expect(pressEnd).toBeGreaterThan(-1);
+    expect(tapBegin).toBeGreaterThan(pressEnd);
+  });
+
+  it("streams live touches verbatim, and drops orphans", async () => {
+    const { hid, ws } = await openedSocket();
+
+    // A move with no finger down is meaningless and must not reach the device.
+    hid.touchMove(0.9, 0.9);
+    hid.touchEnd(0.9, 0.9);
+    expect(touchFrames(ws)).toHaveLength(0);
+
+    hid.touchBegin(0.3, 0.4);
+    hid.touchMove(0.35, 0.45);
+    hid.touchEnd(0.4, 0.5);
+    expect(touchFrames(ws)).toEqual([
+      { type: "begin", x: 0.3, y: 0.4 },
+      { type: "move", x: 0.35, y: 0.45 },
+      { type: "end", x: 0.4, y: 0.5 },
+    ]);
+  });
+
+  it("does not let a live touch interrupt a scripted gesture", async () => {
+    const { hid, ws } = await openedSocket();
+    const press = hid.longPress(0.5, 0.5, 100);
+    await tick(); // let the press's begin leave
+    hid.touchBegin(0.9, 0.9);
+    await press;
+    // One begin only: the live finger was refused while the gesture owned it.
+    expect(touchFrames(ws).filter((f) => f.type === "begin")).toHaveLength(1);
+  });
+
+  it("lifts a live finger at its own point when the socket closes", async () => {
+    const { hid, ws } = await openedSocket();
+    hid.touchBegin(0.3, 0.4);
+    hid.touchMove(0.6, 0.7);
+    hid.close();
+    expect(touchFrames(ws).at(-1)).toEqual({ type: "end", x: 0.6, y: 0.7 });
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { contentRect, keyStep, pointerStep, toNormalized, wheelStep } from "../../app/sim/frame-input.js";
+import { contentRect, keyStep, toNormalized, wheelStep } from "../../app/sim/frame-input.js";
 
 const RECT = { left: 100, top: 50, width: 200, height: 400 };
 
@@ -19,34 +19,6 @@ describe("normalizing a pointer", () => {
 
   it("does not divide by zero before the frame has a size", () => {
     expect(toNormalized({ left: 0, top: 0, width: 0, height: 0 }, 10, 10)).toEqual({ x: 0, y: 0 });
-  });
-});
-
-describe("pointer gestures", () => {
-  const at = { x: 0.5, y: 0.5 };
-
-  it("treats a shaky hand as a tap", () => {
-    expect(pointerStep(at, { x: 0.505, y: 0.505 }, 80)).toEqual({ kind: "tap", at });
-  });
-
-  it("treats a slow press in place as a long press", () => {
-    expect(pointerStep(at, at, 800)).toEqual({ kind: "longPress", at, holdMs: 800 });
-  });
-
-  it("treats real movement as a swipe, at the duration it actually took", () => {
-    // A 250ms swipe where the user spent a second is a different gesture, and
-    // iOS's own recognizers care.
-    expect(pointerStep(at, { x: 0.5, y: 0.1 }, 900)).toEqual({
-      kind: "swipe",
-      from: at,
-      to: { x: 0.5, y: 0.1 },
-      durationMs: 900,
-    });
-  });
-
-  it("bounds an absurd duration rather than passing it through", () => {
-    const step = pointerStep(at, { x: 0.9, y: 0.9 }, 99_999);
-    expect(step).toMatchObject({ kind: "swipe", durationMs: 3000 });
   });
 });
 
@@ -101,6 +73,17 @@ describe("the keyboard contract", () => {
 describe("the wheel", () => {
   it("converts pixels of content into a normalized fraction", () => {
     expect(wheelStep(RECT, 0, 40)).toEqual({ kind: "scroll", dx: 0, dy: 0.1 });
+  });
+
+  it("anchors the scroll under the cursor when a position is given", () => {
+    // The list being pointed at is the list that should scroll — not whatever
+    // happens to sit at the device's centre.
+    expect(wheelStep(RECT, 0, 40, { x: 0.25, y: 0.75 })).toEqual({
+      kind: "scroll",
+      dx: 0,
+      dy: 0.1,
+      at: { x: 0.25, y: 0.75 },
+    });
   });
 
   it("clamps a trackpad fling rather than sending a fraction above one", () => {
