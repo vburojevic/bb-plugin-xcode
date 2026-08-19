@@ -182,6 +182,7 @@ export interface LiveApi extends Snapshot {
   input: (step: Step) => Promise<{ log: string; dropped: string[] }>;
   capture: (label?: string) => Promise<{ summary: string }>;
   reportStall: () => void;
+  reportAlive: () => void;
 }
 
 export function useLive(): LiveApi {
@@ -276,8 +277,24 @@ export function useLive(): LiveApi {
       });
   }, [client]);
 
+  /**
+   * The other half of the watchdog's job: frames resumed after a stall.
+   *
+   * Without this, one misfired stall report left "The stream stopped" on
+   * screen forever — the server had a path that set the sentence and none
+   * that cleared it.
+   */
+  const reportAlive = useCallback(() => {
+    void client
+      .call("liveState", { stallCleared: true })
+      .then((next) => emit({ state: next as LiveState }))
+      .catch(() => {
+        // The next frame will say it again.
+      });
+  }, [client]);
+
   return useMemo(
-    () => ({ ...value, refresh, start, stop, shutdown, erase, input, capture, reportStall }),
-    [value, start, stop, shutdown, erase, input, capture, reportStall],
+    () => ({ ...value, refresh, start, stop, shutdown, erase, input, capture, reportStall, reportAlive }),
+    [value, start, stop, shutdown, erase, input, capture, reportStall, reportAlive],
   );
 }

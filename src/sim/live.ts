@@ -177,8 +177,7 @@ export class LiveService {
     this.generation += 1;
     if (expected || this.disposed) return;
 
-    const at = this.now();
-    this.crashTimestamps = [...this.crashTimestamps, at].filter((stamp) => at - stamp < CRASH_WINDOW_MS);
+    this.crashTimestamps = [...this.recentCrashes(), this.now()];
     this.deps.log(
       "warn",
       `capture host exited (${signal ?? `code ${code ?? "?"}`}); ${this.crashTimestamps.length} time(s) in the last minute`,
@@ -364,8 +363,16 @@ export class LiveService {
     if (this.session?.device.udid !== udid) return;
     if (this.session.kind === "erasing" || this.session.kind === "dead") return;
     this.session.hid = null;
-    this.session.kind = "stalled";
-    this.deps.publish();
+    /**
+     * The control socket and the video stream are different connections. A
+     * dead socket says nothing about frames, and claiming "stalled" here put
+     * that sentence on screen while the video played on — with no path that
+     * ever cleared it. So the socket's death is worked on, not announced:
+     * `recheckDevice` marks the device `dead` when it is gone and quietly
+     * re-opens the socket when it is not. "stalled" belongs to the panel,
+     * which is the only place frames can be counted.
+     */
+    this.deps.log("info", `control socket closed (${reason}); rechecking the device`);
     detach(
       () => this.recheckDevice(udid),
       (error) => this.deps.log("warn", `could not recheck ${udid} after ${reason}: ${describe(error)}`),
@@ -381,6 +388,23 @@ export class LiveService {
       this.deps.publish();
     }
     await this.recheckDevice(session.device.udid);
+    return this.state();
+  }
+
+  /**
+   * The panel's frames resumed after it reported a stall.
+   *
+   * "stalled" is the panel's call to make *and to unmake*: it is the only
+   * place that can see frames arriving. Without this half, one watchdog
+   * misfire — a slow browser tab, a throttled timer — left the sentence on
+   * screen forever, because nothing server-side ever cleared it.
+   */
+  async clearStall(): Promise<LiveState> {
+    const session = this.session;
+    if (session !== null && session.kind === "stalled") {
+      session.kind = session.screen === null ? "waiting-frame" : "streaming";
+      this.deps.publish();
+    }
     return this.state();
   }
 
@@ -589,6 +613,19 @@ export class LiveService {
   // -------------------------------------------------------------------------
 
   /**
+   * Crashes inside the window, decayed on read.
+   *
+   * The count used to be filtered only on *insert*, so the panel's "crashed
+   * twice" sentence — the dead-tone one — could be referring to crashes from
+   * hours ago, forever. A crash count that never forgets is not a signal.
+   */
+  private recentCrashes(): number[] {
+    const at = this.now();
+    this.crashTimestamps = this.crashTimestamps.filter((stamp) => at - stamp < CRASH_WINDOW_MS);
+    return this.crashTimestamps;
+  }
+
+  /**
    * The whole state, in one object, computed rather than stored.
    *
    * Every branch here has exactly one sentence in the frontend, and the
@@ -602,7 +639,7 @@ export class LiveService {
       screen: null,
       foregroundBundleId: null,
       reason: null,
-      crashes: this.crashTimestamps.length,
+      crashes: this.recentCrashes().length,
       slowBoot: false,
       generation: this.generation,
     };

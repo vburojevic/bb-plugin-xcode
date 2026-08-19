@@ -80,6 +80,7 @@ function LiveRoute({ go }: { go: (next: string) => void }) {
       onStart={(device) => void live.start(device)}
       onRefresh={live.refresh}
       onStall={live.reportStall}
+      onAlive={live.reportAlive}
       onOpenDoctor={() => go("doctor")}
       onStep={onStep}
       belowMeta={<FramesStrip frames={live.frames} now={Date.now()} />}

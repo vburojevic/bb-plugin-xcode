@@ -249,7 +249,10 @@ export const rpcContract = defineRpcContract({
   },
   liveState: {
     /** `reportStall` is the panel's watchdog telling the server its stream died. */
-    input: z.object({ reportStall: z.boolean().optional() }).strict(),
+    /** `stallCleared` is the same watchdog reporting that frames resumed. */
+    input: z
+      .object({ reportStall: z.boolean().optional(), stallCleared: z.boolean().optional() })
+      .strict(),
     output: liveStateSchema,
   },
   liveStart: {

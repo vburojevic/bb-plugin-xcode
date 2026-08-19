@@ -40,6 +40,23 @@ describe("the source ladder", () => {
     expect(sources.map((s) => `${s.codec}/${s.route}`)).toEqual(["h264/proxied", "mjpeg/proxied"]);
   });
 
+  it("skips the direct rungs entirely when this page cannot reach loopback", () => {
+    // A viewer over `bb connect` used to burn two guaranteed-failure fetches
+    // per stream, per generation, finding this out. The page's origin answers
+    // it in advance, so the doomed rungs are never offered.
+    const sources = streamSources({ direct: DIRECT, proxied: PROXIED }, true, {
+      directViable: false,
+    });
+    expect(sources.map((s) => `${s.codec}/${s.route}`)).toEqual(["h264/proxied", "mjpeg/proxied"]);
+  });
+
+  it("skips direct even without a decoder when the page cannot reach loopback", () => {
+    const sources = streamSources({ direct: DIRECT, proxied: PROXIED }, false, {
+      directViable: false,
+    });
+    expect(sources.map((s) => `${s.codec}/${s.route}`)).toEqual(["mjpeg/proxied"]);
+  });
+
   it("names the codec the way each route expects it", () => {
     // Direct is the capture host's own path, where the codec is the extension.
     expect(withCodec(DIRECT, "h264", "direct")).toContain("/stream.avcc?");

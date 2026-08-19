@@ -9,6 +9,12 @@
  * Tab order is frame → meta line → control bar → overflow, and every state
  * sentence lives in an `aria-live` region so *"iPhone 17 Pro shut down"* is
  * heard and not only seen.
+ *
+ * There is exactly one render stack: a single canvas fed by `useStream`,
+ * whichever codec and route won the ladder. The `<img>` stack it replaced
+ * could not count frames, could not time them, and fired its `load` event per
+ * part only in the browsers that felt like it — which is how "The stream
+ * stopped" ended up over a video that was playing.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -16,8 +22,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { liveVeil, metaLine, TONE_CLASS } from "./copy";
 import type { Action } from "./copy";
 import { contentRect, keyStep, pointerStep, toNormalized, wheelStep } from "./frame-input";
+import { canDecodeH264, currentViewerCanReachLoopback } from "./stream-core";
 import { describeSource, streamSources, type StreamSource } from "./stream-sources";
-import { canDecodeH264, useVideoStream } from "./useVideoStream";
+import { useStream } from "./useStream";
 import type { DeviceList, LiveState } from "./useLive";
 import type { Step } from "../../src/sim/steps.js";
 
@@ -25,9 +32,10 @@ import type { Step } from "../../src/sim/steps.js";
  * How long a stream may go without delivering a frame before the panel reports
  * a stall.
  *
- * This is the only stall detector that works: an `<img>` whose multipart stream
- * wedges fires no event at all, so nothing server-side can tell it from a
- * device showing a static screen.
+ * This works because the panel now counts painted frames itself — the only
+ * stall detector that ever works. It is also self-clearing: the next painted
+ * frame after a stall takes the sentence back, where a server-side guess used
+ * to leave it up forever.
  */
 const STALL_AFTER_MS = 12_000;
 
@@ -40,6 +48,8 @@ export interface LivePanelProps {
   onStart: (device?: string) => void;
   onRefresh: () => void;
   onStall: () => void;
+  /** Frames resumed after a stall; the server can take the sentence back. */
+  onAlive: () => void;
   onOpenDoctor: () => void;
   onStep: (step: Step) => void;
   /** Rendered under the meta line — the Frames strip, once captures exist. */
@@ -54,6 +64,7 @@ export function LivePanel({
   onStart,
   onRefresh,
   onStall,
+  onAlive,
   onOpenDoctor,
   onStep,
   belowMeta,
@@ -69,6 +80,7 @@ export function LivePanel({
    * they are on MJPEG.
    */
   const [source, setSource] = useState<StreamSource | null>(null);
+  const [fps, setFps] = useState<number | null>(null);
   // A new device, or a new stream, is a fresh chance for it to work.
   useEffect(() => setStreamFailed(false), [state?.streamUrl]);
 
@@ -96,6 +108,11 @@ export function LivePanel({
     [onStart, onRefresh, onOpenDoctor],
   );
 
+  const onStreamStats = useCallback((next: StreamSource | null, nextFps: number | null) => {
+    setSource(next);
+    setFps(nextFps);
+  }, []);
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <LiveFrame
@@ -103,9 +120,10 @@ export function LivePanel({
         veil={veil}
         onAction={runAction}
         onStall={onStall}
+        onAlive={onAlive}
         onStep={onStep}
         onStreamFailed={() => setStreamFailed(true)}
-        onSource={setSource}
+        onStats={onStreamStats}
       />
 
       {meta !== null ? (
@@ -118,7 +136,10 @@ export function LivePanel({
               <p tabIndex={0} className="truncate text-sm text-muted-foreground">
                 {meta}
                 {describeSource(source) === null ? null : (
-                  <span className="ml-2 text-xs opacity-60">{describeSource(source)}</span>
+                  <span className="ml-2 text-xs opacity-60">
+                    {describeSource(source)}
+                    {fps === null ? "" : ` · ${fps} fps`}
+                  </span>
                 )}
               </p>
             </TooltipTrigger>
@@ -145,10 +166,11 @@ interface LiveFrameProps {
   veil: ReturnType<typeof liveVeil>;
   onAction: (action: Action) => void;
   onStall: () => void;
+  onAlive: () => void;
   onStep: (step: Step) => void;
   onStreamFailed: () => void;
-  /** Reports the rung in use, for the meta line. */
-  onSource: (source: StreamSource | null) => void;
+  /** Reports the rung in use and its pace, for the meta line. */
+  onStats: (source: StreamSource | null, fps: number | null) => void;
 }
 
 function LiveFrame({
@@ -156,9 +178,10 @@ function LiveFrame({
   veil,
   onAction,
   onStall,
+  onAlive,
   onStep,
   onStreamFailed,
-  onSource,
+  onStats,
 }: LiveFrameProps) {
   const proxiedUrl = state?.streamUrl ?? null;
   const directUrl = state?.directStreamUrl ?? null;
@@ -171,72 +194,63 @@ function LiveFrame({
       : undefined;
 
   const visible = useDocumentVisible();
-  const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [failed, setFailed] = useState(false);
   const [crosshair, setCrosshair] = useState<{ x: number; y: number } | null>(null);
 
   /**
-   * The source ladder: best codec first, best route second.
+   * The source ladder: best codec first, best route second — with the routes
+   * this page can actually use. `currentViewerCanReachLoopback` answers the
+   * remote/mixed-content question from the page's own origin, so a viewer
+   * over `bb connect` no longer burns two doomed rungs finding out.
    *
-   * Neither question can be answered in advance. H.264 needs WebCodecs and a
-   * host whose hardware can encode it; direct needs the viewer to be on this
-   * machine, which the server cannot know about its own panel and which a
-   * `bb connect` tunnel additionally forbids as mixed content. So the panel
-   * tries, and a failure advances it one rung — no probe, no configuration.
-   *
-   * `streamSources` puts codec above route because the measurement does:
-   * 24.9 fps at 200 KB/s over H.264 against 14.3 fps at 3.55 MB/s over MJPEG,
-   * on the same device under the same motion.
+   * Codec outranks route because the measurement says so: 24.9 fps at
+   * 200 KB/s over H.264 against 14.3 fps at 3.55 MB/s over MJPEG, on the same
+   * device under the same motion.
    */
   const sources = useMemo(
-    () => streamSources({ direct: directUrl, proxied: proxiedUrl }, canDecodeH264()),
+    () =>
+      streamSources({ direct: directUrl, proxied: proxiedUrl }, canDecodeH264(), {
+        directViable: currentViewerCanReachLoopback(),
+      }),
     [directUrl, proxiedUrl],
   );
   const [rung, setRung] = useState(0);
   const source = sources[rung] ?? null;
-  const streamUrl = source?.url ?? null;
-  const streamingDirectly = source?.route === "direct";
-  const decoding = source?.codec === "h264";
+  /** Every rung failed; the veil has to say so. */
+  const exhausted = rung >= sources.length;
 
   const interactive = state?.kind === "streaming";
 
-  // Either stream is unbounded, so both are opened only while mounted and
-  // visible; hiding drops the connection.
-  const active = streamUrl !== null && visible && !failed;
+  // The stream is unbounded, so it is opened only while mounted and visible;
+  // hiding drops the connection.
+  const active = source !== null && visible && !exhausted;
 
   // A new stream is a fresh start at the top of the ladder: a capture host
   // restart rotates the token and the port, and whatever made a rung fail last
   // time may have gone with it.
   useEffect(() => {
-    setFailed(false);
     setRung(0);
   }, [proxiedUrl, directUrl]);
 
-  /** One rung down, or out of rungs and the veil has to say so. */
-  const advance = useCallback(() => {
-    setRung((current) => {
-      if (current + 1 < sources.length) return current + 1;
-      setFailed(true);
-      onStreamFailed();
-      return current;
-    });
-  }, [sources.length, onStreamFailed]);
+  const video = useStream(source, canvasRef, active);
 
-  useEffect(() => onSource(active ? source : null), [active, source, onSource]);
-
-  const video = useVideoStream(decoding ? streamUrl : null, canvasRef, active);
+  /**
+   * One rung down, or out of rungs and the veil has to say so.
+   *
+   * An effect, not a state updater: side effects inside an updater run twice
+   * under StrictMode's double invocation, and "the stream failed" arriving
+   * twice is how one failure used to report two.
+   */
   useEffect(() => {
-    if (video.failed) advance();
-  }, [video.failed, advance]);
+    if (!video.failed) return;
+    if (rung + 1 < sources.length) setRung(rung + 1);
+  }, [video.failed, rung, sources.length]);
 
   useEffect(() => {
-    const element = imgRef.current;
-    if (element === null) return;
-    // Assigning "" is what actually drops the connection; removing the
-    // attribute leaves the request in flight in some browsers.
-    element.src = !decoding && active && streamUrl !== null ? streamUrl : "";
-  }, [decoding, active, streamUrl]);
+    if (video.failed && rung + 1 >= sources.length) onStreamFailed();
+  }, [video.failed, rung, sources.length, onStreamFailed]);
+
+  useEffect(() => onStats(active ? source : null, video.fps), [active, source, video.fps, onStats]);
 
   /**
    * Presence, only while streaming directly.
@@ -246,6 +260,7 @@ function LiveFrame({
    * torn down 60 seconds into being watched. Zero bytes; the open connection is
    * the entire message.
    */
+  const streamingDirectly = source?.route === "direct";
   useEffect(() => {
     // Derived from the proxied URL rather than composed from a plugin id: the
     // server already told us where its own routes live, and one source for
@@ -260,12 +275,7 @@ function LiveFrame({
     return () => abort.abort();
   }, [streamingDirectly, active, proxiedUrl]);
 
-  useStallWatchdog(
-    active && state?.kind === "streaming",
-    imgRef,
-    onStall,
-    decoding ? video.frames : null,
-  );
+  useFrameWatchdog(active && state?.kind === "streaming", video.frames, onStall, onAlive);
 
   const gesture = useRef<{ x: number; y: number; at: number; id: number } | null>(null);
   const lastWheel = useRef(0);
@@ -273,13 +283,12 @@ function LiveFrame({
   /**
    * The picture's rectangle, not the element's.
    *
-   * Whichever element is mounted — a canvas measures identically to an image —
-   * narrowed to the area the frame actually covers. Both are
-   * `object-fit: contain`, so a panel wider than the device letterboxes the
-   * picture and every coordinate taken from the element box is wrong.
+   * The canvas is `object-fit: contain`, so a panel wider than the device
+   * letterboxes the picture and every coordinate taken from the element box is
+   * wrong.
    */
   const rectOf = useCallback((): DOMRect | null => {
-    const box = (canvasRef.current ?? imgRef.current)?.getBoundingClientRect() ?? null;
+    const box = canvasRef.current?.getBoundingClientRect() ?? null;
     if (box === null) return null;
     return contentRect(box, screen) as DOMRect;
   }, [screen]);
@@ -372,28 +381,12 @@ function LiveFrame({
     >
       {veil.skeleton ? (
         <div className="bbxs-skeleton h-full w-full" aria-hidden />
-      ) : decoding ? (
-        // H.264 is decoded here and painted, so the element is a canvas. It
-        // carries the same class and aspect ratio as the image, and pointer
-        // maths reads `getBoundingClientRect` either way, so nothing else in
-        // this file has to know which one is on screen.
+      ) : (
         <canvas
           ref={canvasRef}
           aria-hidden
           className="bbxs-frame-img h-full w-full"
           style={aspect}
-        />
-      ) : (
-        <img
-          ref={imgRef}
-          alt=""
-          draggable={false}
-          className="bbxs-frame-img h-full w-full"
-          style={aspect}
-          // Advancing is silent until the ladder runs out, at which point
-          // `advance` sets the sentence. A rung failing is ordinary — it is how
-          // a viewer that is not on this machine discovers that.
-          onError={advance}
         />
       )}
 
@@ -445,48 +438,52 @@ function useDocumentVisible(): boolean {
 }
 
 /**
- * Report a stall when the image stops updating.
+ * Report a stall when painted frames stop, and take it back when they resume.
  *
- * A multipart stream mutates the image in place, and browsers fire `load` per
- * part — so "no load event for twelve seconds" is the signal. A device
- * genuinely showing a static screen is re-confirmed by one `simctl` call
- * server-side, which is cheap and correct; guessing here is not.
+ * One interval per mount — the frame count lives in a ref, so the timer is
+ * not torn down and rebuilt twenty-five times a second. A stall is reported
+ * once per episode, and the *next painted frame* clears it: the panel is the
+ * only place frames can be counted, so it is the only place a stall can
+ * honestly be declared or rescinded.
  */
-function useStallWatchdog(
+function useFrameWatchdog(
   enabled: boolean,
-  ref: React.RefObject<HTMLImageElement | null>,
+  frames: number,
   onStall: () => void,
-  /**
-   * Decoded-frame count when H.264 is in use; `null` on the MJPEG path.
-   *
-   * A canvas fires no `load` events, so the decoder's own counter is the
-   * signal. It is also the better one: it says a frame was *decoded and
-   * painted*, where `load` only ever said bytes arrived.
-   */
-  decodedFrames: number | null,
+  onAlive: () => void,
 ): void {
+  const framesRef = useRef(frames);
+  useEffect(() => {
+    framesRef.current = frames;
+  }, [frames]);
+
+  const callbacksRef = useRef({ onStall, onAlive });
+  useEffect(() => {
+    callbacksRef.current = { onStall, onAlive };
+  }, [onStall, onAlive]);
+
   useEffect(() => {
     if (!enabled) return;
-    let lastSeen = Date.now();
+    let lastSeen = framesRef.current;
+    let lastAdvance = Date.now();
     let reported = false;
 
-    const element = ref.current;
-    const onLoad = (): void => {
-      lastSeen = Date.now();
-      reported = false;
-    };
-    element?.addEventListener("load", onLoad);
-
     const timer = setInterval(() => {
-      if (reported) return;
-      if (Date.now() - lastSeen < STALL_AFTER_MS) return;
-      reported = true;
-      onStall();
-    }, 2000);
+      if (framesRef.current !== lastSeen) {
+        lastSeen = framesRef.current;
+        lastAdvance = Date.now();
+        if (reported) {
+          reported = false;
+          callbacksRef.current.onAlive();
+        }
+        return;
+      }
+      if (!reported && Date.now() - lastAdvance >= STALL_AFTER_MS) {
+        reported = true;
+        callbacksRef.current.onStall();
+      }
+    }, 1000);
 
-    return () => {
-      clearInterval(timer);
-      element?.removeEventListener("load", onLoad);
-    };
-  }, [enabled, ref, onStall, decodedFrames]);
+    return () => clearInterval(timer);
+  }, [enabled]);
 }

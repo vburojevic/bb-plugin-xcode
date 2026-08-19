@@ -927,16 +927,21 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
       const address = live.address();
       if (address === null) return context.text("The capture host is not running.", 503);
 
-      // A UDID from our own cache is untrusted input: the user can shut the
-      // device down between our poll and our request, and serve-sim's device
-      // session is not graceful about a device that is not there.
-      let booted: boolean;
-      try {
-        booted = await driver.isBooted(udid);
-      } catch {
-        return context.text("Could not confirm the simulator is running.", 503);
+      /**
+       * The session is the authority on what may stream, not a fresh `simctl`.
+       *
+       * This used to run `simctl list devices -j` on every open — hundreds of
+       * milliseconds, per ladder attempt, per reconnect, per generation bump —
+       * to guard against a device shut down between poll and request. But the
+       * live service already tracks exactly that: its stall reports, socket
+       * closes and erase/shutdown calls keep `currentDevice()` honest, and a
+       * UDID that is not the session's device has no business on this route
+       * at all, because the URLs handed out are built from that device.
+       */
+      const current = live.currentDevice();
+      if (current === null || current.udid !== udid) {
+        return context.text("That simulator is not running.", 409);
       }
-      if (!booted) return context.text("That simulator is not running.", 409);
 
       // `codec=avcc` is the H.264 stream; anything else keeps the JPEG one, so
       // an older panel asking for no codec at all still gets a picture.

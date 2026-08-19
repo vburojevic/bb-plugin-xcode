@@ -289,8 +289,13 @@ export function makeRpcHandlers(ctx: Ctx) {
       }
     },
 
-    async liveState({ reportStall }: { reportStall?: boolean }) {
-      const state = reportStall === true ? await ctx.live.reportStall() : ctx.live.state();
+    async liveState({ reportStall, stallCleared }: { reportStall?: boolean; stallCleared?: boolean }) {
+      const state =
+        reportStall === true
+          ? await ctx.live.reportStall()
+          : stallCleared === true
+            ? await ctx.live.clearStall()
+            : ctx.live.state();
       // A panel asking for state is the event that refreshes the foreground
       // app. Nothing here waits for it: when the answer changes, the realtime
       // signal brings the panel back for it.
