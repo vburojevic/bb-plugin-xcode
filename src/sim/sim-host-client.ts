@@ -20,6 +20,9 @@ export interface SimHostAddress {
   streamToken: string;
 }
 
+/** A single encoded simulator frame must remain bounded even if the child lies. */
+export const MAX_JPEG_FRAME_BYTES = 32 * 1024 * 1024;
+
 export class SimHostError extends Error {
   constructor(
     message: string,
@@ -43,9 +46,8 @@ interface RequestOptions {
  * either read it as JSON or pipe it.
  *
  * The secret goes in a header rather than the query string, so it cannot end
- * up in an access log or a referrer. The query form exists in the child too,
- * for the one case that needs it: a URL handed to something that cannot set
- * headers.
+ * up in an access log or a referrer. Only the separate, stream-only token has
+ * a query-string form, for an image URL that cannot set headers.
  */
 export function open(
   address: SimHostAddress,
@@ -73,7 +75,17 @@ export function open(
         req.destroy(new SimHostError(`The capture host did not answer ${options.path} in time.`, null));
       });
     }
-    options.signal?.addEventListener("abort", () => req.destroy(new Error("aborted")), { once: true });
+    const onAbort = (): void => {
+      req.destroy(new Error("aborted"));
+    };
+    if (options.signal !== undefined) {
+      options.signal.addEventListener("abort", onAbort, { once: true });
+      // AbortSignal does not replay an abort to listeners added afterward.
+      // A browser can disconnect in the tick between constructing the route
+      // controller and opening this request, so handle that state explicitly.
+      if (options.signal.aborted) onAbort();
+      req.once("close", () => options.signal?.removeEventListener("abort", onAbort));
+    }
     req.on("error", reject);
     if (payload !== null) req.write(payload);
     req.end();
@@ -253,55 +265,71 @@ export async function grabFrame(
   }
 
   return new Promise<Buffer>((resolve, reject) => {
-    let buffer = Buffer.alloc(0);
+    let headerBuffer = Buffer.alloc(0);
     let expected: number | null = null;
-    let bodyStart = -1;
+    const bodyChunks: Buffer[] = [];
+    let bodyBytes = 0;
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
 
     const finish = (result: Buffer | Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       response.destroy();
       if (result instanceof Error) reject(result);
       else resolve(result);
     };
 
-    const timer = setTimeout(
+    const consumeBody = (chunk: Buffer): void => {
+      if (expected === null || settled) return;
+      const remaining = expected - bodyBytes;
+      if (remaining <= 0) return;
+      const accepted = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      bodyChunks.push(accepted);
+      bodyBytes += accepted.length;
+      if (bodyBytes === expected) finish(Buffer.concat(bodyChunks, expected));
+    };
+
+    timer = setTimeout(
       () => finish(new SimHostError("No frame arrived from the simulator.", null)),
       timeoutMs,
     );
     timer.unref?.();
 
     response.on("data", (chunk: Buffer) => {
-      buffer = Buffer.concat([buffer, chunk]);
       if (expected === null) {
-        const headerEnd = buffer.indexOf("\r\n\r\n");
+        headerBuffer = Buffer.concat([headerBuffer, chunk]);
+        const headerEnd = headerBuffer.indexOf("\r\n\r\n");
         if (headerEnd === -1) {
           // A part header that never ends is a malformed stream, not a slow one.
-          if (buffer.length > 8192) {
-            clearTimeout(timer);
+          if (headerBuffer.length > 8192) {
             finish(new SimHostError("The simulator's stream sent no part header.", null));
           }
           return;
         }
-        const header = buffer.subarray(0, headerEnd).toString("ascii");
+        const header = headerBuffer.subarray(0, headerEnd).toString("ascii");
         const length = /content-length:\s*(\d+)/i.exec(header);
         if (length === null) {
-          clearTimeout(timer);
           finish(new SimHostError("The simulator's stream sent no Content-Length.", null));
           return;
         }
         expected = Number.parseInt(length[1]!, 10);
-        bodyStart = headerEnd + 4;
+        if (!Number.isSafeInteger(expected) || expected <= 0 || expected > MAX_JPEG_FRAME_BYTES) {
+          finish(new SimHostError("The simulator's frame was larger than the safety limit.", null));
+          return;
+        }
+        const firstBody = headerBuffer.subarray(headerEnd + 4);
+        headerBuffer = Buffer.alloc(0);
+        consumeBody(firstBody);
+        return;
       }
-      if (expected !== null && buffer.length >= bodyStart + expected) {
-        clearTimeout(timer);
-        finish(buffer.subarray(bodyStart, bodyStart + expected));
-      }
+      consumeBody(chunk);
     });
     response.on("error", (error) => {
-      clearTimeout(timer);
       finish(error);
     });
     response.on("end", () => {
-      clearTimeout(timer);
       finish(new SimHostError("The simulator's stream ended before a frame arrived.", null));
     });
   });
@@ -313,7 +341,7 @@ export async function grabFrame(
  * `.avcc` is hardware-encoded H.264 and `.mjpeg` is serve-sim's software JPEG
  * fallback — 200 KB/s against 3.55 MB/s for the same motion on the same device.
  * The proxy carries both because the 18× matters most exactly where the proxy
- * is required: a viewer on the other end of a `bb connect` tunnel.
+ * is required: a remote bb panel.
  */
 export function streamPath(udid: string, codec: "avcc" | "mjpeg" = "mjpeg"): string {
   return `/helper/${udid}/stream.${codec}`;

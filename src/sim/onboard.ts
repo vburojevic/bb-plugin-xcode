@@ -20,8 +20,9 @@
  * user their project file, the blast radius is unbounded, and the manual path
  * is ninety seconds in a dialog they have opened a hundred times.
  */
-import { readFile, readdir } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { readTextFileBounded } from "../bounded-file.js";
 import { runJson } from "./exec.js";
 
 /**
@@ -41,6 +42,8 @@ export const SNAPSHOT_PREVIEWS_URL = "https://github.com/EmergeTools/SnapshotPre
 
 /** The class the onboarder writes. Greppable, and unlikely to collide. */
 export const TEST_CLASS_NAME = "BBPreviewSnapshotTests";
+/** A corrupt or generated project manifest must not become a server-heap allocation. */
+export const MAX_PROJECT_MANIFEST_BYTES = 32 * 1024 * 1024;
 
 export type ProjectShape = "spm" | "xcodegen" | "tuist" | "xcodeproj" | "xcworkspace" | "unknown";
 
@@ -395,7 +398,7 @@ export async function existingDependency(
   for (const manifest of manifests) {
     let text: string;
     try {
-      text = await readFile(join(checkoutPath, manifest), "utf8");
+      text = await readTextFileBounded(join(checkoutPath, manifest), MAX_PROJECT_MANIFEST_BYTES);
     } catch {
       continue;
     }

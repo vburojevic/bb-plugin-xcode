@@ -48,7 +48,7 @@ Without help the tracker can therefore time a build precisely but must report
 its outcome as **Finished** rather than guessing green. To fix that everywhere:
 
 ```sh
-bb xcode shim install     # then add the printed line to your shell profile
+bb xcode shim install     # confirm in bb, then add the printed PATH line
 ```
 
 The shim is a ~30-line POSIX `sh` script that adds `-resultBundlePath` to
@@ -65,7 +65,6 @@ bb xcode status                 # what is running now
 bb xcode runs [--kind test] [--limit N]
 bb xcode show <run-id>          # issues + failed tests with file:line
 bb xcode roots                  # discovered DerivedData roots
-bb xcode rescan                 # force discovery + manifest sweep
 
 # Live progress + guaranteed result capture:
 bb xcode run -- xcodebuild -scheme App -destination 'platform=macOS' test
@@ -74,6 +73,15 @@ bb xcode run -- xcodebuild -scheme App -destination 'platform=macOS' test
 bb xcode run --wait -- xcodebuild -scheme App test
 bb xcode wait <run-id> [--timeout 600]
 ```
+
+These commands require a bb thread with a resolvable checkout, must be run from
+inside that checkout, and are scoped to it. A caller-selected thread or project
+id is rejected when it disagrees with the invoking working directory. The
+machine-wide history and rescan controls live in the human-owned Xcode panel.
+Starting or stopping a host build and changing the shim require a human
+confirmation rendered in the invoking thread; missing context never widens
+access. Agents should normally use the native `xcode_build` tool, whose thread
+identity is supplied by bb rather than by the CLI environment.
 
 `run` detaches on purpose: a build's lifetime belongs to the build, not to the
 command that asked for it. `--wait` and `wait` only change who is *watching* —
@@ -199,6 +207,16 @@ what a single shared setting did — meant following the shim instructions above
 could quietly cost tens of gigabytes. Age alone is not enough either: an
 afternoon of snapshot-test runs passes any sane budget well inside two days,
 which is what the disk ceiling is for.
+
+## Simulator network boundary
+
+The simulator capture host binds only to an ephemeral `127.0.0.1` port. The
+plugin never publishes that port and has no public viewer URL or exposure
+command; remote simulator viewing stays inside the main bb panel through its
+existing same-origin plugin routes. Official remote access is owner-session-
+gated by bb; local `auth: "local"` routes are an Origin/CSRF boundary and accept
+originless same-user callers. The proxy routes are capped at four streams and
+four presence connections. See [SECURITY.md](SECURITY.md) for the full boundary.
 
 ## Known limits
 

@@ -24,8 +24,10 @@
  * The export directory is never cleaned by upstream, so a stale PNG from a
  * deleted preview would read as unchanged forever.
  */
-import { mkdir, readFile, readdir } from "node:fs/promises";
+import { constants, type Dirent } from "node:fs";
+import { lstat, mkdir, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { readTextFileBounded } from "../bounded-file.js";
 import { deviceKey, describePreviewName, newFrameId, newLookId, previewIdentity, sidecarFor } from "./model.js";
 import { hashContent, insertFrame, insertLook, mergeLookMeta, updateLook, type LookMeta } from "./frames.js";
 import { dimensions, downscale, THUMB_LONG_EDGE } from "./image.js";
@@ -55,6 +57,14 @@ export const MANIFEST_ENV = "SNAPSHOTS_ALL_IMAGE_NAMES_FILE";
 export const EXPORT_ENV = "SNAPSHOTS_EXPORT_DIR";
 /** Set so app code can gate network and analytics. Advice, not enforcement. */
 export const PREVIEWS_ENV = "SNAPSHOTS_RUNNING_FOR_PREVIEWS";
+export const MAX_EXPORT_FRAMES = 1000;
+export const MAX_EXPORT_PNG_BYTES = 32 * 1024 * 1024;
+export const MAX_EXPORT_SIDECAR_BYTES = 64 * 1024;
+export const MAX_EXPORT_TOTAL_BYTES = 512 * 1024 * 1024;
+export const MAX_EXPORT_IMAGE_EDGE = 16_384;
+export const MAX_EXPORT_IMAGE_PIXELS = 64 * 1024 * 1024;
+export const MAX_EXPORT_MANIFEST_BYTES = 1024 * 1024;
+export const MAX_EXPORT_MANIFEST_NAME_BYTES = 4096;
 
 export interface StillsRunInput {
   db: Db;
@@ -71,11 +81,12 @@ export interface StillsRunInput {
   commitSha: string | null;
   branch: string | null;
   scale: number;
-  delegate: { bbCli: string } | null;
   workDir: string;
   signal?: AbortSignal;
   now: () => number;
   log: (message: string) => void;
+  /** Evict old pixels and reserve budget before importing generated output. */
+  beforeImport?: (incomingBytes: number) => Promise<void>;
 }
 
 export interface StillsRunResult {
@@ -98,7 +109,7 @@ export interface StillsRunResult {
  * manifest and the run reports "we don't know" rather than a wrong denominator.
  */
 export function parseManifest(text: string): string[] {
-  return [
+  const names = [
     ...new Set(
       text
         .split("\n")
@@ -106,6 +117,13 @@ export function parseManifest(text: string): string[] {
         .filter((line) => line !== ""),
     ),
   ].sort();
+  if (names.length > MAX_EXPORT_FRAMES) {
+    throw new Error(`The preview manifest exceeds the ${MAX_EXPORT_FRAMES}-entry safety limit.`);
+  }
+  if (names.some((name) => Buffer.byteLength(name, "utf8") > MAX_EXPORT_MANIFEST_NAME_BYTES)) {
+    throw new Error("The preview manifest contains a name beyond the safety limit.");
+  }
+  return names;
 }
 
 /**
@@ -217,7 +235,6 @@ async function runStillsInner(input: StillsRunInput): Promise<StillsRunResult> {
   const build = await runXcodebuild(buildForTestingArgv(input.target), input.target, {
     cwd: join(input.checkoutPath, dirOf(input.target)),
     signal: input.signal,
-    delegate: input.delegate,
   });
   meta.buildVia = build.via;
   if (!build.ok) return fail(build.detail);
@@ -259,12 +276,14 @@ async function runStillsInner(input: StillsRunInput): Promise<StillsRunResult> {
     const manifestRun = await runXcodebuild(
       testWithoutBuildingArgv(xctestrunPath, input.target, input.onlyTesting, "manifest.xcresult"),
       input.target,
-      { cwd: join(input.checkoutPath, dirOf(input.target)), signal: input.signal, delegate: input.delegate },
+      { cwd: join(input.checkoutPath, dirOf(input.target)), signal: input.signal },
     );
     // `discoverPreviews()` writes the names and returns [] — zero tests. A
     // non-zero exit here is a real failure, not "no previews".
     if (!manifestRun.ok) return fail(manifestRun.detail);
-    manifest = parseManifest(await readFile(manifestPath, "utf8"));
+    manifest = parseManifest(
+      await readTextFileBounded(manifestPath, MAX_EXPORT_MANIFEST_BYTES, { noFollow: true }),
+    );
     manifestRan = manifest.length > 0;
   } catch (error) {
     // A manifest we could not get means no denominator, which the panel already
@@ -290,7 +309,7 @@ async function runStillsInner(input: StillsRunInput): Promise<StillsRunResult> {
   const render = await runXcodebuild(
     testWithoutBuildingArgv(xctestrunPath, input.target, input.onlyTesting, "render.xcresult"),
     input.target,
-    { cwd: join(input.checkoutPath, dirOf(input.target)), signal: input.signal, delegate: input.delegate },
+    { cwd: join(input.checkoutPath, dirOf(input.target)), signal: input.signal },
   );
 
   // ── 4. import whatever it produced ──────────────────────────────────────
@@ -301,6 +320,7 @@ async function runStillsInner(input: StillsRunInput): Promise<StillsRunResult> {
     scopeKey: input.scopeKey,
     exportDir,
     now: input.now,
+    beforeWrite: input.beforeImport,
   });
 
   const missing = manifest.filter((name) => !imported.names.has(name));
@@ -316,7 +336,6 @@ async function runStillsInner(input: StillsRunInput): Promise<StillsRunResult> {
   const error = emptyRender ? explainEmptyRender(manifest.length) : render.ok ? null : render.detail;
 
   meta.manifest = manifest;
-  meta.resultBundleRelPath = input.target.resultBundlePath;
   updateLook(input.db, input.lookId, {
     status: ok ? "ok" : "failed",
     endedAt: input.now(),
@@ -357,6 +376,7 @@ export interface ImportInput {
   scopeKey: string;
   exportDir: string;
   now: () => number;
+  beforeWrite?: (incomingBytes: number) => Promise<void>;
 }
 
 export interface ImportResult {
@@ -375,39 +395,96 @@ export interface ImportResult {
  * every per-frame threshold.
  */
 export async function importExport(input: ImportInput): Promise<ImportResult> {
-  let entries: string[];
+  let entries: Dirent[];
   try {
-    entries = await readdir(input.exportDir);
+    entries = await readdir(input.exportDir, { withFileTypes: true });
   } catch {
     return { count: 0, bytes: 0, names: new Set() };
   }
 
-  const pngs = entries.filter((entry) => entry.endsWith(".png")).sort();
+  const pngs = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".png"))
+    .map((entry) => entry.name)
+    .sort();
+  if (pngs.length > MAX_EXPORT_FRAMES) {
+    throw new Error(`The preview export produced ${pngs.length} images; the safety limit is ${MAX_EXPORT_FRAMES}.`);
+  }
+
+  let incomingBytes = 0;
+  for (const name of pngs) {
+    const info = await lstat(join(input.exportDir, name));
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error(`Preview output ${name} is not a regular file.`);
+    if (info.size > MAX_EXPORT_PNG_BYTES) throw new Error(`Preview output ${name} exceeds the per-image safety limit.`);
+    incomingBytes += info.size;
+    const sidecarPath = join(input.exportDir, sidecarFor(name));
+    try {
+      const sidecarInfo = await lstat(sidecarPath);
+      if (!sidecarInfo.isFile() || sidecarInfo.isSymbolicLink()) {
+        throw new Error(`Preview sidecar for ${name} is not a regular file.`);
+      }
+      if (sidecarInfo.size > MAX_EXPORT_SIDECAR_BYTES) {
+        throw new Error(`Preview sidecar for ${name} exceeds the safety limit.`);
+      }
+      incomingBytes += sidecarInfo.size;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (incomingBytes > MAX_EXPORT_TOTAL_BYTES) {
+      throw new Error("The preview export exceeds the total import safety limit.");
+    }
+  }
+  await input.beforeWrite?.(incomingBytes);
   const names = new Set<string>();
   let count = 0;
   let bytes = 0;
+  let actualIncomingBytes = 0;
 
   await input.store.ensureLookDir(input.scopeKey, input.lookId);
 
   for (const name of pngs) {
     let data: Buffer;
     try {
-      data = await readFile(join(input.exportDir, name));
+      data = await readRegularFile(join(input.exportDir, name), MAX_EXPORT_PNG_BYTES);
     } catch {
       continue;
     }
+    actualIncomingBytes += data.byteLength;
+    if (actualIncomingBytes > MAX_EXPORT_TOTAL_BYTES) {
+      throw new Error("The preview export grew beyond the total import safety limit while it was being read.");
+    }
     const size = dimensions(data);
     if (size === null) continue;
+    if (
+      size.width > MAX_EXPORT_IMAGE_EDGE ||
+      size.height > MAX_EXPORT_IMAGE_EDGE ||
+      size.width * size.height > MAX_EXPORT_IMAGE_PIXELS
+    ) {
+      throw new Error(`Preview output ${name} declares image dimensions beyond the safety limit.`);
+    }
 
     let sidecarJson: string | null = null;
     try {
-      sidecarJson = await readFile(join(input.exportDir, sidecarFor(name)), "utf8");
-    } catch {
+      const sidecar = await readRegularFile(
+        join(input.exportDir, sidecarFor(name)),
+        MAX_EXPORT_SIDECAR_BYTES,
+      );
+      actualIncomingBytes += sidecar.byteLength;
+      if (actualIncomingBytes > MAX_EXPORT_TOTAL_BYTES) {
+        throw new Error("The preview export grew beyond the total import safety limit while it was being read.");
+      }
+      sidecarJson = sidecar.toString("utf8");
+    } catch (error) {
       // A missing sidecar is ordinary: it only exists when a preview declared
       // something worth recording.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     const sidecar = parseSidecar(sidecarJson);
     const { groupName, displayName } = describePreviewName(name);
+
+    // The export belongs to project code and may still be changing after the
+    // directory preflight. Re-check the cumulative bytes actually opened so a
+    // grow-after-stat race cannot bypass the plugin's disk budget.
+    await input.beforeWrite?.(actualIncomingBytes);
 
     const written = await input.store.write(
       { scopeKey: input.scopeKey, lookId: input.lookId, relPath: name },
@@ -446,6 +523,25 @@ export async function importExport(input: ImportInput): Promise<ImportResult> {
   }
 
   return { count, bytes, names };
+}
+
+async function readRegularFile(path: string, limit: number): Promise<Buffer> {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > limit) throw new Error("Generated preview file failed its safety check.");
+    const data = Buffer.allocUnsafe(info.size);
+    let offset = 0;
+    while (offset < data.length) {
+      const { bytesRead } = await handle.read(data, offset, data.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== data.length) throw new Error("Generated preview file changed while it was being read.");
+    return data;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
 }
 
 /** Start a run's row, so a panel can render "running" before anything builds. */

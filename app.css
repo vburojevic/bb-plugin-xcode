@@ -334,29 +334,12 @@ span.bbx-dot > span {
   --bbxs: var(--destructive);
 }
 
-/*
- * `exposed` deliberately does not borrow `--primary`. That is the token bb
- * spends on ordinary affirmative buttons, and rendering the highest-stakes
- * state in the button colour makes it read as normal. It is a *filled* bar, so
- * it differs in form and not only in token — and it outranks `live`, because a
- * trust state outranks a liveness state.
- */
-.bbxs-tone-exposed {
-  --bbxs: var(--warning, oklch(0.78 0.15 80));
-}
-
 .bbxs-ink {
   color: var(--bbxs-ink);
 }
 
 .bbxs-wash {
   background-color: var(--bbxs-wash);
-}
-
-.bbxs-filled {
-  background-color: color-mix(in oklab, var(--bbxs) 24%, var(--card));
-  border-color: color-mix(in oklab, var(--bbxs) 55%, var(--border));
-  color: var(--bbxs-ink);
 }
 
 /* ---------------------------------------------------------------------------

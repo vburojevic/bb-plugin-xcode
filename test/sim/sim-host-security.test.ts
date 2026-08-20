@@ -3,9 +3,8 @@
  *
  * serve-sim's `GET /api` serves its `execToken` to any unauthenticated caller,
  * and `POST /exec` with that token runs arbitrary shell on the host. Loopback
- * is not a boundary under bb — `bb connect expose <port>` tunnels loopback
- * ports, and bb ships a builtin skill telling agents to run exactly that
- * whenever they have started a local HTTP server.
+ * limits network reachability but is not authentication against another
+ * process running as the same OS user, which can forward a local port.
  *
  * `sim-host.mjs` takes its middleware as a parameter precisely so this suite
  * can mount a stub and assert the whole policy matrix on a Linux CI box with no
@@ -21,6 +20,7 @@ import {
   isDenied,
   isStreamRoute,
   isWebSocketAllowed,
+  MAX_SCRUBBED_JSON_BYTES,
   scrubExecToken,
   SECRET_HEADER,
   secretMatches,
@@ -45,10 +45,31 @@ afterEach(async () => {
  * A stub middleware that records what got through and answers with a body
  * containing an `execToken`, so the scrub is exercised on a real response.
  */
-async function start(secret = SECRET): Promise<Harness> {
+async function start(
+  secret = SECRET,
+  streamToken: string | null = null,
+  respond?: (res: {
+    writeHead: (...a: unknown[]) => void;
+    setHeader: (name: string, value: string | number) => void;
+    write: (b: unknown) => boolean;
+    end: (b?: unknown) => void;
+  }) => void,
+): Promise<Harness> {
   const reached: string[] = [];
-  const middleware = ((req: { url?: string }, res: { writeHead: (...a: unknown[]) => void; end: (b?: unknown) => void }) => {
+  const middleware = ((
+    req: { url?: string },
+    res: {
+      writeHead: (...a: unknown[]) => void;
+      setHeader: (name: string, value: string | number) => void;
+      write: (b: unknown) => boolean;
+      end: (b?: unknown) => void;
+    },
+  ) => {
     reached.push(req.url ?? "");
+    if (respond) {
+      respond(res);
+      return;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, execToken: "super-secret-token" }));
   }) as unknown as Parameters<typeof createFilteredServer>[0];
@@ -60,7 +81,7 @@ async function start(secret = SECRET): Promise<Harness> {
     socket.end("HTTP/1.1 101 Switching Protocols\r\n\r\n");
   };
 
-  const server = createFilteredServer(middleware, secret);
+  const server = createFilteredServer(middleware, secret, () => {}, streamToken);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   const harness: Harness = {
@@ -158,10 +179,35 @@ describe("the allow list", () => {
     expect(isAllowed("POST", "/grid/api/start")).toBe(true);
   });
 
-  it("accepts the secret in the query string too", async () => {
+  it("never accepts the master secret in a query string", async () => {
     const harness = await start();
     const response = await fetch(`${harness.base}/helper/${UDID}/config?k=${SECRET}`, {});
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(401);
+  });
+
+  it("accepts the separate stream token only on pixel routes", async () => {
+    const streamToken = "v".repeat(43);
+    const harness = await start(SECRET, streamToken);
+    expect((await fetch(`${harness.base}/helper/${UDID}/stream.mjpeg?k=${streamToken}`)).status).toBe(200);
+    expect((await fetch(`${harness.base}/helper/${UDID}/config?k=${streamToken}`)).status).toBe(401);
+    expect(harness.reached).toEqual([`/helper/${UDID}/stream.mjpeg?k=${streamToken}`]);
+  });
+
+  it("bounds and types control request bodies before middleware", async () => {
+    const harness = await start();
+    const wrongType = await fetch(`${harness.base}/grid/api/start`, {
+      method: "POST",
+      headers: { [SECRET_HEADER]: SECRET, "content-type": "text/plain" },
+      body: "{}",
+    });
+    expect(wrongType.status).toBe(415);
+    const tooLarge = await fetch(`${harness.base}/grid/api/start`, {
+      method: "POST",
+      headers: { [SECRET_HEADER]: SECRET, "content-type": "application/json" },
+      body: JSON.stringify({ padding: "x".repeat(5000) }),
+    });
+    expect(tooLarge.status).toBe(413);
+    expect(harness.reached).toEqual([]);
   });
 });
 
@@ -176,12 +222,91 @@ describe("execToken", () => {
     expect(body).toContain("[redacted]");
   });
 
+  it("scrubs JSON whose headers were set before writeHead", async () => {
+    const original = JSON.stringify({ ok: true, execToken: "super-secret-token" });
+    const harness = await start(SECRET, null, (res) => {
+      res.setHeader("Content-Type", "Application/JSON; charset=utf-8");
+      res.setHeader("Content-Length", Buffer.byteLength(original));
+      res.writeHead(200);
+      res.end(original);
+    });
+    const response = await fetch(`${harness.base}/helper/${UDID}/config`, {
+      headers: { [SECRET_HEADER]: SECRET },
+    });
+    const body = await response.text();
+    expect(body).toContain("[redacted]");
+    expect(body).not.toContain("super-secret-token");
+    expect(response.headers.get("content-length")).not.toBe(String(Buffer.byteLength(original)));
+  });
+
+  it("scrubs JSON when Node sends headers implicitly from end", async () => {
+    const original = JSON.stringify({ ok: true, execToken: "super-secret-token" });
+    const harness = await start(SECRET, null, (res) => {
+      res.setHeader("Content-Length", Buffer.byteLength(original));
+      res.setHeader("Content-Type", "application/json");
+      res.end(original);
+    });
+    const response = await fetch(`${harness.base}/helper/${UDID}/config`, {
+      headers: { [SECRET_HEADER]: SECRET },
+    });
+    const body = await response.text();
+    expect(body).toContain("[redacted]");
+    expect(body).not.toContain("super-secret-token");
+    expect(response.headers.get("content-length")).not.toBe(String(Buffer.byteLength(original)));
+  });
+
+  it("scrubs JSON and repairs lengths from raw-array response headers", async () => {
+    const original = JSON.stringify({ ok: true, execToken: "super-secret-token" });
+    const harness = await start(SECRET, null, (res) => {
+      res.writeHead(200, [
+        "Content-Type",
+        "application/problem+json; charset=utf-8",
+        "Content-Length",
+        String(Buffer.byteLength(original)),
+      ]);
+      res.end(original);
+    });
+    const response = await fetch(`${harness.base}/helper/${UDID}/config`, {
+      headers: { [SECRET_HEADER]: SECRET },
+    });
+    const body = await response.text();
+    expect(body).toContain("[redacted]");
+    expect(body).not.toContain("super-secret-token");
+    expect(response.headers.get("content-length")).not.toBe(String(Buffer.byteLength(original)));
+  });
+
+  it("destroys an oversized buffered JSON response", async () => {
+    const harness = await start(SECRET, null, (res) => {
+      res.setHeader("Content-Type", "application/json");
+      res.write(Buffer.alloc(MAX_SCRUBBED_JSON_BYTES + 1));
+      res.end();
+    });
+    await expect(
+      fetch(`${harness.base}/helper/${UDID}/config`, {
+        headers: { [SECRET_HEADER]: SECRET },
+      }),
+    ).rejects.toThrow();
+  });
+
   it("is scrubbed wherever it appears in a JSON body", () => {
     expect(scrubExecToken('{"a":1,"execToken":"abc","b":2}')).toBe(
       '{"a":1,"execToken":"[redacted]","b":2}',
     );
     expect(scrubExecToken('{"execToken" : "with \\"escapes\\""}')).toBe('{"execToken":"[redacted]"}');
     expect(scrubExecToken('{"nothing":"here"}')).toBe('{"nothing":"here"}');
+  });
+});
+
+describe("middleware containment", () => {
+  it("turns a synchronous middleware throw into a request failure", async () => {
+    const harness = await start(SECRET, null, () => {
+      throw new Error("synchronous middleware failure");
+    });
+    const response = await fetch(`${harness.base}/helper/${UDID}/config`, {
+      headers: { [SECRET_HEADER]: SECRET },
+    });
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("Capture host error");
   });
 });
 
@@ -210,6 +335,18 @@ describe("the websocket upgrade", () => {
     const harness = await start();
     const status = await upgradeStatus(`${harness.base.replace("http", "ws")}/exec-ws`, SECRET);
     expect(status).toBe(404);
+    expect(harness.reached).toEqual([]);
+  });
+
+  it("never accepts the master or stream token from a websocket query", async () => {
+    const streamToken = "v".repeat(43);
+    const harness = await start(SECRET, streamToken);
+    expect(
+      await upgradeStatus(`${harness.base.replace("http", "ws")}/helper/${UDID}/ws?k=${SECRET}`),
+    ).toBe(401);
+    expect(
+      await upgradeStatus(`${harness.base.replace("http", "ws")}/helper/${UDID}/ws?k=${streamToken}`),
+    ).toBe(401);
     expect(harness.reached).toEqual([]);
   });
 });
@@ -254,7 +391,7 @@ describe("the stream token", () => {
     // The whole reason it exists: this token travels in a query string, where
     // it lands in the DOM, so a URL that leaks must buy "watch" and not "drive".
     expect(
-      authorize({ path: STREAM_PATH, presented: STREAM, secret: MASTER, streamToken: STREAM }),
+      authorize({ path: STREAM_PATH, header: null, query: STREAM, secret: MASTER, streamToken: STREAM }),
     ).toBe(true);
 
     for (const path of [
@@ -265,7 +402,7 @@ describe("the stream token", () => {
       "/grid/api/shutdown",
     ]) {
       expect(
-        authorize({ path, presented: STREAM, secret: MASTER, streamToken: STREAM }),
+        authorize({ path, header: null, query: STREAM, secret: MASTER, streamToken: STREAM }),
         path,
       ).toBe(false);
     }
@@ -274,7 +411,7 @@ describe("the stream token", () => {
   it("leaves the master secret opening everything", () => {
     for (const path of [STREAM_PATH, `/helper/${UDID}/ws`, "/grid/api/shutdown"]) {
       expect(
-        authorize({ path, presented: MASTER, secret: MASTER, streamToken: STREAM }),
+        authorize({ path, header: MASTER, query: null, secret: MASTER, streamToken: STREAM }),
         path,
       ).toBe(true);
     }
@@ -284,9 +421,9 @@ describe("the stream token", () => {
     // An older supervisor spawns the host without one. Direct streaming is
     // simply unavailable then; it must not become unauthenticated.
     expect(
-      authorize({ path: STREAM_PATH, presented: STREAM, secret: MASTER, streamToken: null }),
+      authorize({ path: STREAM_PATH, header: null, query: STREAM, secret: MASTER, streamToken: null }),
     ).toBe(false);
-    expect(authorize({ path: STREAM_PATH, presented: "", secret: MASTER, streamToken: "" })).toBe(
+    expect(authorize({ path: STREAM_PATH, header: null, query: "", secret: MASTER, streamToken: "" })).toBe(
       false,
     );
   });

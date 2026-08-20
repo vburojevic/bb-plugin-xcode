@@ -111,8 +111,6 @@ export function LivePanel({
         case "doctor":
           onOpenDoctor();
           return;
-        case "expose":
-          return;
       }
     },
     [onStart, onRefresh, onOpenDoctor],
@@ -214,8 +212,8 @@ function LiveFrame({
   /**
    * The source ladder: best codec first, best route second — with the routes
    * this page can actually use. `currentViewerCanReachLoopback` answers the
-   * remote/mixed-content question from the page's own origin, so a viewer
-   * over `bb connect` no longer burns two doomed rungs finding out.
+   * remote/mixed-content question from the page's own origin, so a remote bb
+   * panel no longer burns two doomed rungs finding out.
    *
    * Codec outranks route because the measurement says so: 24.9 fps at
    * 200 KB/s over H.264 against 14.3 fps at 3.55 MB/s over MJPEG, on the same

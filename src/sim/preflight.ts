@@ -41,7 +41,6 @@ export interface Preflight {
   canRunXcodebuild: boolean;
   captureAddonLoaded: boolean;
   odiffPath: string | null;
-  bbCliPath: string | null;
   serveSimVersion: string | null;
   xcodeVersion: string | null;
   macosVersion: string | null;
@@ -54,7 +53,6 @@ export interface PreflightDeps {
   runner: typeof run;
   /** Absolute path of the plugin's own directory, for `node_modules` resolution. */
   pluginDir: string;
-  env: NodeJS.ProcessEnv;
   now: () => number;
 }
 
@@ -64,7 +62,6 @@ export function defaultDeps(pluginDir: string): PreflightDeps {
     arch: process.arch,
     runner: run,
     pluginDir,
-    env: process.env,
     now: Date.now,
   };
 }
@@ -248,18 +245,6 @@ export function odiffProbe(path: string | null): Probe {
   return { id: "odiff", label: "odiff", state: "ok", detail: "odiff is available.", value: path };
 }
 
-export function bbCliProbe(path: string | null): Probe {
-  if (path === null) {
-    return {
-      id: "bb-cli",
-      label: "bb CLI",
-      state: "warn",
-      detail: "The bb CLI is not on PATH, so builds run through xcodebuild directly rather than the Xcode plugin.",
-    };
-  }
-  return { id: "bb-cli", label: "bb CLI", state: "ok", detail: "The bb CLI is available.", value: path };
-}
-
 // ---------------------------------------------------------------------------
 // The probes that actually touch the machine
 // ---------------------------------------------------------------------------
@@ -400,22 +385,6 @@ export async function probeOdiff(deps: PreflightDeps): Promise<string | null> {
 }
 
 /**
- * `BB_CLI` is bb's own absolute-path export for exactly this purpose; a bare
- * `bb` on PATH is not guaranteed.
- */
-export async function probeBbCli(deps: PreflightDeps): Promise<string | null> {
-  const candidate = deps.env.BB_CLI ?? "bb";
-  try {
-    // `--version` rather than `--help`: it answers the same question — is this
-    // executable a bb CLI — and returns without loading the command tree.
-    const result = await deps.runner(candidate, ["--version"], { timeoutMs: 15_000 });
-    return result.code === 0 ? candidate : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Run every probe, in order, stopping the machine-specific ones when the
  * platform check already says they cannot apply.
  */
@@ -431,7 +400,6 @@ export async function runPreflight(deps: PreflightDeps): Promise<Preflight> {
       canRunXcodebuild: false,
       captureAddonLoaded: false,
       odiffPath: null,
-      bbCliPath: null,
       serveSimVersion: null,
       xcodeVersion: null,
       macosVersion: null,
@@ -439,12 +407,11 @@ export async function runPreflight(deps: PreflightDeps): Promise<Preflight> {
     };
   }
 
-  const [macosVersion, xcodeSelect, serveSimVersion, odiffPath, bbCliPath] = await Promise.all([
+  const [macosVersion, xcodeSelect, serveSimVersion, odiffPath] = await Promise.all([
     probeMacosVersion(deps),
     probeXcodeSelect(deps),
     probeServeSimVersion(deps.pluginDir),
     probeOdiff(deps),
-    probeBbCli(deps),
   ]);
 
   const canRunXcodebuild = xcodeSelect.kind === "ok";
@@ -477,7 +444,6 @@ export async function runPreflight(deps: PreflightDeps): Promise<Preflight> {
     addonProbe(addonLoaded, addonError),
     serveSimVersionProbe(serveSimVersion),
     odiffProbe(odiffPath),
-    bbCliProbe(bbCliPath),
   ];
 
   return {
@@ -487,7 +453,6 @@ export async function runPreflight(deps: PreflightDeps): Promise<Preflight> {
     canRunXcodebuild,
     captureAddonLoaded: addonLoaded,
     odiffPath,
-    bbCliPath,
     serveSimVersion,
     xcodeVersion,
     macosVersion,

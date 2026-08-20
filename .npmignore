@@ -1,0 +1,9 @@
+.github/
+.impeccable/
+dist/
+docs/superpowers/
+node_modules/
+scratch/
+test/
+*.tgz
+vitest.config.ts

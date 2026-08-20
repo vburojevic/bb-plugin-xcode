@@ -7,7 +7,7 @@
  * the progress state that explains the wait.
  */
 import { join } from "node:path";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import type { Ctx } from "./context.js";
 import { deviceKey, previewIdentity, type Look, type VerdictStatus } from "./model.js";
@@ -76,12 +76,34 @@ function emptySummary() {
 
 export function makeStillsHandlers(ctx: Ctx) {
   return {
-    async stillsRun({ device }: { scope?: "changed" | "all"; device?: string }) {
+    async stillsRun({
+      device,
+      threadId,
+      projectId,
+    }: {
+      scope?: "changed" | "all";
+      device?: string;
+      threadId?: string | null;
+      projectId?: string | null;
+    }) {
       try {
-        const scope = await ctx.scopeForThread(null);
+        const hints = {
+          ...(typeof threadId === "string" ? { threadId } : {}),
+          ...(typeof projectId === "string" ? { projectId } : {}),
+        };
+        const scope = await ctx.scopeForInvocation(hints);
         if (scope === null) {
           throw new Error("Xcode Simulators could not work out which project this is.");
         }
+        const approved = await ctx.confirmAction(hints, {
+          title: "Run the preview test target on the host?",
+          facts: [
+            `Checkout: ${scope.scope.checkoutPath}`,
+            "Xcode test targets and package/compiler plugins execute code as your host user.",
+          ],
+          confirmLabel: "Render previews",
+        });
+        if (!approved) throw new Error("The preview render was not confirmed.");
         const enqueued = await ctx.stills.enqueue(scope, device ?? null);
         return { lookId: enqueued.lookId, queued: enqueued.queued, error: null };
       } catch (error) {
@@ -205,7 +227,6 @@ export function makeStillsHandlers(ctx: Ctx) {
                     baseCommit: baseLook?.commitSha ?? null,
                   },
             dismissed: link?.dismissed ?? null,
-            exposure: ctx.exposure.current(),
             offerRuns: ctx.settings().postChangedPreviews,
           }),
         };
@@ -488,7 +509,6 @@ export interface RunRequest {
   branch: string | null;
   target: BuildTarget;
   testTargetName: string | null;
-  delegate: { bbCli: string } | null;
   odiffPath: string | null;
   globalThreshold: number;
 }
@@ -514,34 +534,39 @@ export async function runAndCompare(ctx: Ctx, request: RunRequest, signal: Abort
   ctx.publish("look");
 
   const workDir = await mkdtemp(join(tmpdir(), "xcsim-run-"));
-  const result = await runStills({
-    db: ctx.db,
-    store: ctx.store,
-    lookId,
-    scopeKey: request.scopeKey,
-    projectId: request.projectId,
-    checkoutPath: request.checkoutPath,
-    target: {
-      ...request.target,
-      destination: destinationFor(request.device.udid),
-      // Per run, not per project. xcodebuild refuses to overwrite an existing
-      // result bundle and fails in about a second with no diagnostics at all —
-      // so a fixed path means the first run works and every later one dies
-      // instantly with "Build failed (exit 1)" and nothing to go on.
-      resultBundlePath: join(request.target.resultBundlePath, lookId),
-    },
-    onlyTesting: onlyTestingFor(request.testTargetName),
-    testTargetName: request.testTargetName,
-    device: request.device,
-    commitSha: request.commitSha,
-    branch: request.branch,
-    scale: request.scale,
-    delegate: request.delegate,
-    workDir,
-    signal,
-    now,
-    log: (message) => ctx.log("info", `stills ${lookId}: ${message}`),
-  });
+  const result = await (async () => {
+    try {
+      return await runStills({
+        db: ctx.db,
+        store: ctx.store,
+        lookId,
+        scopeKey: request.scopeKey,
+        projectId: request.projectId,
+        checkoutPath: request.checkoutPath,
+        target: {
+          ...request.target,
+          destination: destinationFor(request.device.udid),
+          // Per run and private. The bundles are useful while xcodebuild is
+          // running but are not part of the Stills record; retaining three
+          // directory trees forever made the frame disk budget meaningless.
+          resultBundlePath: join(workDir, "results"),
+        },
+        onlyTesting: onlyTestingFor(request.testTargetName),
+        testTargetName: request.testTargetName,
+        device: request.device,
+        commitSha: request.commitSha,
+        branch: request.branch,
+        scale: request.scale,
+        workDir,
+        signal,
+        now,
+        log: (message) => ctx.log("info", `stills ${lookId}: ${message}`),
+        beforeImport: (incomingBytes) => ctx.beforeFrameImport(incomingBytes),
+      });
+    } finally {
+      await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  })();
 
   if (result.frameCount > 0) {
     await compareAgainstBaseline(ctx, lookId, result.missing, request);

@@ -11,8 +11,9 @@
  *    lives in that referenced directory.
  */
 
-import { readFile, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { readTextFileBounded } from "./bounded-file";
 
 export interface GitInfo {
   /** Repo (or worktree) root directory. */
@@ -26,6 +27,7 @@ export interface GitInfo {
 }
 
 const MAX_ASCEND = 8;
+const MAX_GIT_POINTER_BYTES = 64 * 1024;
 
 async function pathKind(path: string): Promise<"file" | "dir" | null> {
   try {
@@ -64,7 +66,7 @@ export async function gitInfoFor(startPath: string): Promise<GitInfo | null> {
     const kind = await pathKind(gitPath);
 
     if (kind === "dir") {
-      const head = await readFile(join(gitPath, "HEAD"), "utf8").catch(
+      const head = await readTextFileBounded(join(gitPath, "HEAD"), MAX_GIT_POINTER_BYTES).catch(
         () => null,
       );
       return {
@@ -76,10 +78,10 @@ export async function gitInfoFor(startPath: string): Promise<GitInfo | null> {
     }
 
     if (kind === "file") {
-      const content = await readFile(gitPath, "utf8").catch(() => null);
+      const content = await readTextFileBounded(gitPath, MAX_GIT_POINTER_BYTES).catch(() => null);
       const gitdir = content ? parseGitFile(content) : null;
       const head = gitdir
-        ? await readFile(join(gitdir, "HEAD"), "utf8").catch(() => null)
+        ? await readTextFileBounded(join(gitdir, "HEAD"), MAX_GIT_POINTER_BYTES).catch(() => null)
         : null;
       return {
         root: dir,

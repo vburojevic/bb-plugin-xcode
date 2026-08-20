@@ -94,7 +94,7 @@ export interface LookMeta {
   threshold?: number;
   /** Sorted manifest names, so a truncation can be detected after the fact. */
   manifest?: string[];
-  /** The build's result bundle, relative to the plugin data dir. */
+  /** Historical only: older releases persisted Stills result-bundle paths. */
   resultBundleRelPath?: string;
   /** Display only: where the checkout was when the run happened. */
   checkoutPath?: string;

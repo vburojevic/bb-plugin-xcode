@@ -67,10 +67,8 @@ export interface Ctx {
    * the same way two agents do.
    */
   leases: { acquire(threadId: string | null): LeaseOutcome };
-  /** The bb server's own loopback base URL, or `null` before it is listening. */
-  loopbackBaseUrl(): string | null;
   log(level: "info" | "warn" | "error", message: string): void;
-  publish(kind: "look" | "live" | "exposure"): void;
+  publish(kind: "look" | "live"): void;
   /**
    * Resolve the repo scope for a thread, or for the plugin's own default
    * project when there is no thread. Cached per thread for the life of the
@@ -99,6 +97,8 @@ export interface Ctx {
    * simulator it means out loud.
    */
   recentDestinations(limit: number): readonly import("./pick.js").RunDestination[];
+  /** Prune and enforce the disk ceiling before generated frames are copied. */
+  beforeFrameImport(incomingBytes: number): Promise<void>;
   /** HEAD for a checkout, so a frame records what it was a picture of. */
   gitHead(checkoutPath: string): Promise<{ commitSha: string | null; branch: string | null }>;
   stills: {
@@ -120,26 +120,9 @@ export interface Ctx {
      */
     run(scope: ThreadScope, device: string | null): Promise<StillsSummary | null>;
   };
-  exposure: {
-    /** The active exposure, or `null`. Read by the banner and the header chip. */
-    current(): { msLeft: number } | null;
-    /** Whether connect can expose at all, and the sentence when it cannot. */
-    availability(): Promise<{ available: boolean; reason: string | null }>;
-    /** The consent facts, read live so the dialog names what is on screen now. */
-    consent(): Promise<{ title: string; facts: string[]; confirmLabel: string } | null>;
-    /** Start one. Returns the URL exactly once, to the caller that asked. */
-    start(): Promise<{ url: string | null; error: string | null }>;
-    stop(): void;
-    deviceName(): string | null;
-  };
-  /**
-   * Ask a human, in a thread's composer, to confirm something consequential.
-   *
-   * `bb sims expose` routes through this so the "no simulator_expose tool" rule
-   * is enforcement rather than decoration — an agent can run the CLI.
-   */
-  confirmInThread(
-    threadId: string,
+  /** Resolve a real thread, then ask through host-owned UI. */
+  confirmAction(
+    hints: { threadId?: string | null; projectId?: string | null },
     consent: { title: string; facts: string[]; confirmLabel: string },
   ): Promise<boolean>;
   /**
@@ -165,6 +148,7 @@ export interface Ctx {
   writeToInvokingHost(
     threadId: string | null,
     path: string,
+    rootPath: string,
     frameId: string,
   ): Promise<{ ok: true; path: string } | { ok: false; reason: string }>;
   isDisposed(): boolean;

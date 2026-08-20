@@ -50,6 +50,8 @@ export interface StartedBuild {
 
 /** Milliseconds between live-progress publishes while a build streams. */
 const LIVE_PUBLISH_INTERVAL_MS = 500;
+export const MAX_CONCURRENT_WRAPPED_BUILDS = 4;
+let activeWrappedBuilds = 0;
 
 /**
  * Start a wrapped build and return as soon as the child has spawned.
@@ -65,6 +67,11 @@ export async function startWrappedBuild(
   deps: WrappedDeps,
   options: { argv: readonly string[]; cwd?: string; killSignal?: AbortSignal },
 ): Promise<StartedBuild | null> {
+  if (activeWrappedBuilds >= MAX_CONCURRENT_WRAPPED_BUILDS) {
+    deps.log.warn(`refused wrapped build: ${MAX_CONCURRENT_WRAPPED_BUILDS} are already running`);
+    return null;
+  }
+  activeWrappedBuilds += 1;
   let lastLivePublishAt = 0;
   let bundlePath: string | null = null;
 
@@ -150,6 +157,9 @@ export async function startWrappedBuild(
         warnings: 0,
         failed: true,
       };
+    })
+    .finally(() => {
+      activeWrappedBuilds = Math.max(0, activeWrappedBuilds - 1);
     });
 
   await started;
@@ -169,9 +179,10 @@ export async function startWrappedBuild(
  * and hand back the wrong one.
  */
 export function resolveBuildArgv(commandArgs: readonly string[]): string[] {
-  return commandArgs[0] === "xcodebuild"
-    ? ["/usr/bin/xcodebuild", ...commandArgs.slice(1)]
-    : [...commandArgs];
+  if (commandArgs[0] !== "xcodebuild" && commandArgs[0] !== "/usr/bin/xcodebuild") {
+    throw new Error("Only xcodebuild may be run through `bb xcode run`.");
+  }
+  return ["/usr/bin/xcodebuild", ...commandArgs.slice(1)];
 }
 
 /**

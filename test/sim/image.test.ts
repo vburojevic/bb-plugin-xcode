@@ -92,10 +92,10 @@ describe("the agent image budget", () => {
     expect(omitted).toBe(2);
   });
 
-  it("always includes at least one, so a reply is never imageless by arithmetic", () => {
+  it("refuses even the first image when its base64 would exceed the hard budget", () => {
     const { included, omitted } = fitToBudget([{ bytes: AGENT_IMAGE_BUDGET_BYTES * 4 }]);
-    expect(included).toHaveLength(1);
-    expect(omitted).toBe(0);
+    expect(included).toHaveLength(0);
+    expect(omitted).toBe(1);
   });
 
   it("includes everything that fits", () => {

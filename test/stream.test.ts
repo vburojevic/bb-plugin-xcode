@@ -109,18 +109,23 @@ describe("injectStreamFlags", () => {
     expect(result.bundlePath).toBe("/t/r.xcresult");
   });
 
-  /**
-   * xcodebuild rejects a second -resultBundlePath, so wrapping a command that
-   * already sets one must reuse it rather than append.
-   */
-  it("respects a bundle path the caller already set", () => {
+  it("replaces caller-controlled result paths with plugin-owned paths", () => {
     const result = injectStreamFlags(
-      ["xcodebuild", "-resultBundlePath", "/mine.xcresult", "build"],
+      [
+        "xcodebuild",
+        "-resultBundlePath",
+        "/mine.xcresult",
+        "-resultStreamPath=/mine.ndjson",
+        "build",
+      ],
       "/t/r.xcresult",
       "/t/s.ndjson",
     );
-    expect(result.bundlePath).toBe("/mine.xcresult");
+    expect(result.bundlePath).toBe("/t/r.xcresult");
     expect(result.argv.filter((a) => a === "-resultBundlePath")).toHaveLength(1);
+    expect(result.argv).not.toContain("/mine.xcresult");
+    expect(result.argv).not.toContain("-resultStreamPath=/mine.ndjson");
+    expect(result.argv).toContain("/t/s.ndjson");
   });
 });
 

@@ -8,12 +8,17 @@
  * which blames a healthy device and sends the user to reboot it.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
+import { curatedChildEnv } from "../child-env.js";
 
 /** How long the child gets to print its handshake line before we give up on it. */
 export const HANDSHAKE_TIMEOUT_MS = 10_000;
+export const STOP_GRACE_MS = 2000;
+export const SIM_HOST_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /** The sentence the panel shows when it does not. */
 export const NO_HANDSHAKE = "The capture host did not start.";
@@ -148,21 +153,32 @@ function onLines(
  * `ELECTRON_RUN_AS_NODE: "1"` is unconditional. In the shipping desktop build
  * the bb server is itself a child of Electron, so `process.execPath` is the
  * Electron binary and it behaves as Node only while that variable is present.
- * bb's own agent-bridge code deliberately *deletes* it, so the instinct to hand
- * the child a curated environment is exactly how you launch a second full bb
- * window instead of a script. No preflight probe would catch it: the addon and
- * version checks both pass.
+ * bb's own agent-bridge code deliberately *deletes* it. The child still gets a
+ * curated environment, but this one variable must be restored explicitly or
+ * Electron launches a second full bb window instead of running the script.
  */
 export function startSimHost(deps: SpawnDeps, events: SimHostEvents): Promise<SimHostHandle> {
   const secret = newSecret();
   const streamToken = newSecret();
   const spawnFn = deps.spawnFn ?? spawn;
+  const scratch = mkdtempSync(join(tmpdir(), "bb-xcsim-host-"));
+  const cleanupScratch = (): void => {
+    try {
+      rmSync(scratch, { recursive: true, force: true });
+    } catch {
+      // Best effort after the child exits.
+    }
+  };
 
   let child: ChildProcess;
   try {
     child = spawnFn(deps.execPath, [deps.simHostPath], {
       env: {
-        ...deps.env,
+        ...curatedChildEnv(deps.env),
+        // serve-sim invokes Apple tools by bare name internally. Its isolated
+        // child must not resolve those through a Homebrew or checkout shim.
+        PATH: SIM_HOST_SYSTEM_PATH,
+        TMPDIR: scratch,
         ELECTRON_RUN_AS_NODE: "1",
         XCSIM_SECRET: secret,
         XCSIM_STREAM_KEY: streamToken,
@@ -170,22 +186,42 @@ export function startSimHost(deps: SpawnDeps, events: SimHostEvents): Promise<Si
         // the port; there is nothing to discover from serve-sim's state files.
         XCSIM_PORT: "0",
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      // stdin is a parent-liveness pipe. An abrupt parent death closes it, and
+      // the child exits instead of leaving a privileged loopback server orphaned.
+      stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (error) {
+    cleanupScratch();
     return Promise.reject(error instanceof Error ? error : new Error(String(error)));
   }
 
   let settled = false;
   let expected = false;
   let alive = true;
+  let killTimer: ReturnType<typeof setTimeout> | null = null;
 
   const stop = (): void => {
     expected = true;
     try {
+      child.stdin?.end();
+    } catch {
+      // Already gone.
+    }
+    try {
       child.kill("SIGTERM");
     } catch {
       // Already gone.
+    }
+    if (alive && killTimer === null) {
+      killTimer = setTimeout(() => {
+        if (!alive) return;
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }, STOP_GRACE_MS);
+      killTimer.unref?.();
     }
   };
 
@@ -224,6 +260,8 @@ export function startSimHost(deps: SpawnDeps, events: SimHostEvents): Promise<Si
 
     child.on("error", (error) => {
       alive = false;
+      if (killTimer !== null) clearTimeout(killTimer);
+      cleanupScratch();
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -232,6 +270,8 @@ export function startSimHost(deps: SpawnDeps, events: SimHostEvents): Promise<Si
 
     child.on("exit", (code, signal) => {
       alive = false;
+      if (killTimer !== null) clearTimeout(killTimer);
+      cleanupScratch();
       const wasExpected = expected;
       if (!settled) {
         settled = true;

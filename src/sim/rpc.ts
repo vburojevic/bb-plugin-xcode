@@ -62,8 +62,8 @@ export type LiveStateDto = LiveState & {
 /**
  * The proxied stream — the fallback, and still the only one that always works.
  *
- * Same-origin, so a panel reached over `bb connect` is not blocked as mixed
- * content, and a viewer on another machine has no loopback to talk to. The
+ * Same-origin, so a remote bb panel is not blocked as mixed content,
+ * and a viewer on another machine has no loopback to talk to. The
  * panel prefers `directStreamUrlFor` and lands here when that fails, which is
  * exactly the remote case.
  */
@@ -309,10 +309,49 @@ export function makeRpcHandlers(ctx: Ctx) {
       return toLiveStateDto(ctx, state);
     },
 
-    async liveStop({ erase, shutdown }: { erase?: string; shutdown?: string }) {
+    async liveStop({
+      erase,
+      shutdown,
+      threadId,
+      projectId,
+    }: {
+      erase?: string;
+      shutdown?: string;
+      threadId?: string | null;
+      projectId?: string | null;
+    }) {
       if (erase !== undefined) {
+        const target = ctx.live.currentDevice();
+        if (target === null || target.udid !== erase) {
+          throw new Error("Only the simulator currently shown in the panel can be erased.");
+        }
+        const approved = await ctx.confirmAction(
+          { threadId, projectId },
+          {
+            title: "Erase this simulator?",
+            facts: [
+              `Every app, login, and setting on ${target.name} (${target.udid}) will be deleted.`,
+              "This cannot be undone, and the simulator shuts down while it happens.",
+            ],
+            confirmLabel: "Erase permanently",
+          },
+        );
+        if (!approved) throw new Error("Erase was not confirmed.");
         await ctx.live.erase(erase);
       } else if (shutdown !== undefined) {
+        const target = ctx.live.currentDevice();
+        if (target === null || target.udid !== shutdown) {
+          throw new Error("Only the simulator currently shown in the panel can be shut down.");
+        }
+        const approved = await ctx.confirmAction(
+          { threadId, projectId },
+          {
+            title: "Shut down this simulator?",
+            facts: [`The running simulator ${target.name} (${target.udid}) and its active streams will stop.`],
+            confirmLabel: "Shut down",
+          },
+        );
+        if (!approved) throw new Error("Shutdown was not confirmed.");
         await ctx.live.shutdown(shutdown);
       } else {
         await ctx.live.stop();
@@ -337,31 +376,6 @@ export function makeRpcHandlers(ctx: Ctx) {
       return { frames: frames.map((frame) => toFrameDto(ctx.pluginId, frame)) };
     },
 
-    async exposeState() {
-      const availability = await ctx.exposure.availability();
-      const current = ctx.exposure.current();
-      return {
-        available: availability.available,
-        reason: availability.reason,
-        // The URL is rendered as a QR code and a Copy button rather than as
-        // selectable plaintext, and it is never returned to any surface other
-        // than the one that requested the exposure.
-        url: null,
-        msLeft: current?.msLeft ?? null,
-        deviceName: ctx.exposure.deviceName(),
-        consent: current !== null ? null : await ctx.exposure.consent(),
-      };
-    },
-
-    async exposeStart() {
-      return ctx.exposure.start();
-    },
-
-    async exposeStop() {
-      ctx.exposure.stop();
-      return { ok: true };
-    },
-
     async purgePreview() {
       const looks = allLooks(ctx.db);
       const bytes = totalBytes(ctx.db);
@@ -374,7 +388,16 @@ export function makeRpcHandlers(ctx: Ctx) {
       };
     },
 
-    async purgeApply() {
+    async purgeApply(hints: { threadId?: string | null; projectId?: string | null }) {
+      const approved = await ctx.confirmAction(hints, {
+        title: "Remove every stored simulator frame?",
+        facts: [
+          "All captured frames, preview runs, baselines, and their database records will be removed.",
+          "This cannot be undone.",
+        ],
+        confirmLabel: "Remove all stored frames",
+      });
+      if (!approved) throw new Error("Purge was not confirmed.");
       const looks = allLooks(ctx.db);
       const bytes = totalBytes(ctx.db);
       await ctx.store.removeAll();

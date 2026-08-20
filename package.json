@@ -37,7 +37,7 @@
     "lucide-react": "^1.29.0",
     "odiff-bin": "^4.5.0",
     "recharts": "^2.15.4",
-    "serve-sim": "^0.1.45",
+    "serve-sim": "0.1.45",
     "tailwind-merge": "^3.4.0",
     "ws": "^8.21.3",
     "zod": "^4.3.6"

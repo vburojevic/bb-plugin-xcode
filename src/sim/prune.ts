@@ -25,6 +25,8 @@ import { checkpoint } from "./store.js";
 import { allLooks, evictionCandidates, staleBaselinedLooks, updateLook } from "./frames.js";
 import type { FrameStore } from "./framestore.js";
 import type { Look } from "./model.js";
+import { lstat, readdir, rm } from "node:fs/promises";
+import { join } from "node:path";
 
 export interface PrunePlan {
   /** Looks whose frames would be deleted, oldest first. */
@@ -190,6 +192,31 @@ export async function sweepServeSimLogs(tmpDir: string, now: number): Promise<nu
     // No directory means nothing to sweep.
   }
   return swept;
+}
+
+/** Remove the unbounded per-run result caches written by releases before this audit. */
+export async function sweepLegacyStillsResults(dataDir: string): Promise<number> {
+  const derived = join(dataDir, "derived");
+  let scopes;
+  try {
+    scopes = await readdir(derived, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const scope of scopes) {
+    if (!scope.isDirectory() || scope.isSymbolicLink()) continue;
+    const results = join(derived, scope.name, "results");
+    try {
+      const info = await lstat(results);
+      if (!info.isDirectory() || info.isSymbolicLink()) continue;
+      await rm(results, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // Missing or concurrently removed is already the desired state.
+    }
+  }
+  return removed;
 }
 
 /** *"Xcode Simulators is using 1.4 GB across 6 projects."* */

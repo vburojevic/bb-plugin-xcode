@@ -12,15 +12,14 @@
  *  - **Route.** Direct needs the viewer to be a loopback `http:` page —
  *    `viewerCanReachLoopback`, a fact about this page's own origin. An
  *    `https:` page blocks cleartext loopback as mixed content, and a page on
- *    another host (every `bb connect` viewer) has the wrong `127.0.0.1`
+ *    another host (every remote bb panel) has the wrong `127.0.0.1`
  *    entirely. Both used to be discovered per stream, per generation, two
  *    doomed fetches at a time.
  *
  * Ordering is by measured cost, most preferred first — on the machine it was
  * measured on, under the same swipe loop, H.264 ran 24.9 fps at 200 KB/s where
  * MJPEG managed 14.3 fps at 3.55 MB/s, so codec dominates route: proxied
- * H.264 beats direct MJPEG, and by a lot over a tunnel where that 18× is
- * bandwidth someone is paying for.
+ * H.264 beats direct MJPEG, and by a lot over a remote connection.
  */
 
 export type StreamCodec = "h264" | "mjpeg";

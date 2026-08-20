@@ -30,8 +30,7 @@ import { XcodePanel } from "./app/XcodePanel";
 import { SimulatorsPanel } from "./app/sim/SimulatorsPanel";
 import { StillsDirective } from "./app/sim/StillsDirective";
 import { ActivityBanner as SimulatorBanner } from "./app/sim/ActivityBanner";
-import { ExposeControl } from "./app/sim/ExposeControl";
-import { ExposeConsent } from "./app/sim/ExposeConsent";
+import { ServerConfirm } from "./app/sim/ServerConfirm";
 import { DeviceBar } from "./app/sim/DeviceBar";
 import { ThreadSimulator } from "./app/sim/ThreadSimulator";
 import { useLive } from "./app/sim/useLive";
@@ -54,7 +53,6 @@ function SimulatorsHeader({ subPath }: { subPath: string }) {
       state={live.state}
       devices={live.devices}
       onPick={(udid) => void live.start(udid)}
-      exposure={<ExposeControl />}
     />
   );
 }
@@ -97,10 +95,7 @@ export default definePluginApp((app) => {
   // control, which is why it needs states for a subject that is gone.
   app.slots.messageDirective({ id: "xcode-simulators", component: StillsDirective });
 
-  // What `bb xcode sim expose` blocks on. An agent can run that command; it
-  // cannot answer this — which is what makes "there is no simulator_expose
-  // tool" enforcement rather than a note.
-  app.slots.pendingInteraction({ id: "expose-consent", component: ExposeConsent });
+  app.slots.pendingInteraction({ id: "server-confirm", component: ServerConfirm });
 
   app.composer.customize({
     id: "simulators",

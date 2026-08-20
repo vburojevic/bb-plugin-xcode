@@ -52,10 +52,10 @@ the exact changes and writes nothing — rather than inventing a reason.
 
 ## Never expose the simulator
 
-Do not run `bb connect expose` on any port this plugin uses, and do not ask the
-user to expose the simulator remotely. That control is theirs and it lives in
-the panel. `bb sims expose` exists, and it will stop and ask a human in the
-composer before doing anything — do not try to route around that.
+Do not share or tunnel any port this plugin uses, and do not ask the user to
+expose the simulator remotely. The capture host is loopback-only, there is no
+exposure command or public viewer URL, and remote viewing stays inside the main
+bb panel.
 
 ## The commands
 

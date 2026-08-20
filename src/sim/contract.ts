@@ -260,7 +260,14 @@ export const rpcContract = defineRpcContract({
     output: liveStateSchema,
   },
   liveStop: {
-    input: z.object({ erase: z.string().optional(), shutdown: z.string().optional() }).strict(),
+    input: z
+      .object({
+        erase: z.string().optional(),
+        shutdown: z.string().optional(),
+        threadId: z.string().nullable().optional(),
+        projectId: z.string().nullable().optional(),
+      })
+      .strict(),
     output: liveStateSchema,
   },
   /** Take one frame off the stream and make it durable. */
@@ -284,6 +291,8 @@ export const rpcContract = defineRpcContract({
       .object({
         scope: z.enum(["changed", "all"]).optional(),
         device: z.string().optional(),
+        threadId: z.string().nullable().optional(),
+        projectId: z.string().nullable().optional(),
       })
       .strict(),
     output: z.object({ lookId: z.string().nullable(), queued: z.number(), error: z.string().nullable() }).strict(),
@@ -366,9 +375,9 @@ export const rpcContract = defineRpcContract({
           z
             .object({
               id: z.string(),
-              kind: z.enum(["failure", "run", "exposure"]),
+              kind: z.enum(["failure", "run"]),
               sentence: z.string(),
-              tone: z.enum(["neutral", "dead", "exposed"]),
+              tone: z.enum(["neutral", "dead"]),
               dismissible: z.boolean(),
               lookId: z.string().nullable(),
               watermark: z.string().nullable(),
@@ -380,37 +389,6 @@ export const rpcContract = defineRpcContract({
   },
   bannerDismiss: {
     input: z.object({ threadId: z.string(), lookId: z.string(), watermark: z.string() }).strict(),
-    output: z.object({ ok: z.boolean() }).strict(),
-  },
-  exposeState: {
-    input: z.null(),
-    output: z
-      .object({
-        available: z.boolean(),
-        /** The sentence a disabled control shows. */
-        reason: z.string().nullable(),
-        /** Present only while exposed, and only to the surface that asked. */
-        url: z.string().nullable(),
-        msLeft: z.number().nullable(),
-        deviceName: z.string().nullable(),
-        /** The consent dialog's three facts, worded by the server. */
-        consent: z
-          .object({
-            title: z.string(),
-            facts: z.array(z.string()),
-            confirmLabel: z.string(),
-          })
-          .strict()
-          .nullable(),
-      })
-      .strict(),
-  },
-  exposeStart: {
-    input: z.null(),
-    output: z.object({ url: z.string().nullable(), error: z.string().nullable() }).strict(),
-  },
-  exposeStop: {
-    input: z.null(),
     output: z.object({ ok: z.boolean() }).strict(),
   },
   purgePreview: {
@@ -425,7 +403,9 @@ export const rpcContract = defineRpcContract({
       .strict(),
   },
   purgeApply: {
-    input: z.null(),
+    input: z
+      .object({ threadId: z.string().nullable().optional(), projectId: z.string().nullable().optional() })
+      .strict(),
     output: z.object({ looks: z.number(), bytes: z.number() }).strict(),
   },
   /**
@@ -479,7 +459,7 @@ export const rpcContract = defineRpcContract({
    * Batched because RPC is plain HTTP with no ordering between concurrent
    * calls: the panel keeps exactly one batch in flight and accumulates the
    * rest, and the server replays each batch at the timestamps' spacing. On a
-   * loopback link a batch is one or two events; over `bb connect` it is a
+   * loopback link a batch is one or two events; over a remote bb connection it is a
    * whole stretch of the drag, delivered smooth instead of as teleports.
    */
   liveStream: {

@@ -22,6 +22,11 @@ import { join } from "node:path";
  */
 const REAL_XCODEBUILD = "/usr/bin/xcodebuild";
 
+/** A literal POSIX-shell word; safe for paths containing quotes or `$()`. */
+export function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
 /** Actions worth instrumenting. Queries like `-version` produce no results. */
 const INSTRUMENTED_ACTIONS = [
   "build",
@@ -65,8 +70,8 @@ export function shimScript(bundleDir: string): string {
 # Falls through to the real xcodebuild unchanged whenever it is not a build,
 # already has a result bundle, or anything looks unusual.
 
-REAL="${REAL_XCODEBUILD}"
-BUNDLES="${bundleDir}"
+REAL=${shellQuote(REAL_XCODEBUILD)}
+BUNDLES=${shellQuote(bundleDir)}
 
 [ -x "$REAL" ] || { echo "bb xcode shim: $REAL missing" >&2; exit 127; }
 
@@ -250,5 +255,5 @@ export async function pruneShimBundles(
 
 /** The shell line a user adds to make the shim take effect. */
 export function pathExportLine(binDir: string): string {
-  return `export PATH="${binDir}:$PATH"`;
+  return `export PATH=${shellQuote(binDir)}:"$PATH"`;
 }

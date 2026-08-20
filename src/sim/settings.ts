@@ -24,7 +24,6 @@ export interface Settings {
   diffThreshold: number;
   retainLooks: number;
   diskBudgetMb: number;
-  exposeTtlMinutes: number;
   showDeviceChrome: boolean;
   allowIntelLive: boolean;
   allowAgentCapture: boolean;
@@ -39,15 +38,11 @@ export const DEFAULTS: Settings = {
   diffThreshold: 0.01,
   retainLooks: 20,
   diskBudgetMb: 2048,
-  exposeTtlMinutes: 30,
   showDeviceChrome: false,
   allowIntelLive: false,
-  allowAgentCapture: true,
+  allowAgentCapture: false,
   postChangedPreviews: true,
 };
-
-/** Max TTL for an exposure, in minutes. Four hours is already generous. */
-export const MAX_EXPOSE_TTL_MINUTES = 240;
 
 /**
  * The descriptor set handed to `bb.settings.define`.
@@ -103,12 +98,6 @@ export const SETTINGS_DESCRIPTORS = {
     description: "Across every project. Checked before a run writes as well as after.",
     default: String(DEFAULTS.diskBudgetMb),
   },
-  exposeTtlMinutes: {
-    type: "string",
-    label: "Exposure length (minutes)",
-    description: `How long a remote share lasts before it tears itself down. Maximum ${MAX_EXPOSE_TTL_MINUTES}.`,
-    default: String(DEFAULTS.exposeTtlMinutes),
-  },
   showDeviceChrome: {
     type: "boolean",
     label: "Show device bezel",
@@ -124,9 +113,9 @@ export const SETTINGS_DESCRIPTORS = {
   },
   allowAgentCapture: {
     type: "boolean",
-    label: "Let agents see the simulator",
+    label: "Send simulator images to agents",
     description:
-      "Registers the simulator_capture, simulator_drive and simulator_stills tools. A captured frame is sent to your model provider as an image.",
+      "Registers model-facing simulator tools and permits their CLI equivalents. Captured frames are sent to your model provider; the bb panel remains available when this is off.",
     default: DEFAULTS.allowAgentCapture,
   },
   postChangedPreviews: {
@@ -191,9 +180,6 @@ export function normalizeSettings(raw: RawSettings): Settings {
     retainLooks: Math.round(clamp(parseUserNumber(raw.retainLooks, DEFAULTS.retainLooks), 1, 500)),
     diskBudgetMb: Math.round(
       clamp(parseUserNumber(raw.diskBudgetMb, DEFAULTS.diskBudgetMb), 64, 1_000_000),
-    ),
-    exposeTtlMinutes: Math.round(
-      clamp(parseUserNumber(raw.exposeTtlMinutes, DEFAULTS.exposeTtlMinutes), 1, MAX_EXPOSE_TTL_MINUTES),
     ),
     showDeviceChrome: parseBoolean(raw.showDeviceChrome, DEFAULTS.showDeviceChrome),
     allowIntelLive: parseBoolean(raw.allowIntelLive, DEFAULTS.allowIntelLive),

@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import BetterSqlite3 from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATIONS, prepareConnection } from "../../src/sim/store.js";
 import { insertLook, setBaseline, setIdentityBaseline, linkThread, updateLook } from "../../src/sim/frames.js";
-import { describeUsage, planPrune } from "../../src/sim/prune.js";
+import { describeUsage, planPrune, sweepLegacyStillsResults } from "../../src/sim/prune.js";
 import { formatBytes } from "../../src/sim/format.js";
 import { demoBanner, DEMO_BANNER_STATES, isDemoBannerState } from "../../src/sim/demos.js";
 import { DetectCache, DETECT_TTL_MS } from "../../src/sim/detect-cache.js";
@@ -152,23 +152,33 @@ describe("the usage sentence", () => {
   });
 });
 
+describe("legacy Stills result cleanup", () => {
+  it("removes only the generated results directory from each derived-data scope", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "xcsim-results-"));
+    dirs.push(dataDir);
+    const scope = join(dataDir, "derived", "scope-a");
+    mkdirSync(join(scope, "results", "lk_old", "render.xcresult"), { recursive: true });
+    writeFileSync(join(scope, "results", "lk_old", "render.xcresult", "Info.plist"), "old");
+    writeFileSync(join(scope, "keep.txt"), "derived data stays");
+
+    await expect(sweepLegacyStillsResults(dataDir)).resolves.toBe(1);
+    expect(existsSync(join(scope, "results"))).toBe(false);
+    expect(existsSync(join(scope, "keep.txt"))).toBe(true);
+  });
+});
+
 describe("the demo banners", () => {
   it("covers every state a reviewer would want to see", () => {
     // The states worth reviewing are the failure states, and those are exactly
     // the ones you cannot produce on demand.
     expect(DEMO_BANNER_STATES).toContain("failed-build");
     expect(DEMO_BANNER_STATES).toContain("failed-no-target");
-    expect(DEMO_BANNER_STATES).toContain("exposed-expiring");
+    expect(DEMO_BANNER_STATES).not.toContain("exposed-expiring");
   });
 
   it("renders the same sentences the real code does", () => {
     expect(demoBanner("changed")[0]?.sentence).toBe("12 previews moved since `a1b2c3d`");
     expect(demoBanner("running")[0]?.sentence).toBe("Rendering previews — 41/148");
-    expect(demoBanner("exposed")[0]?.sentence).toBe(
-      "Simulator exposed to your bb account — 27 more minutes",
-    );
-    // An exposure is never dismissible, even in a demo.
-    expect(demoBanner("exposed")[0]?.dismissible).toBe(false);
     expect(demoBanner("off")).toEqual([]);
   });
 

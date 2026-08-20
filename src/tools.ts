@@ -11,6 +11,7 @@
 import { z } from "zod";
 
 import type { Collector } from "./collector";
+import { confinedBuildCwd, validateBuildArguments } from "./build-security";
 import { describeRun, verdictSentence, type PresentOptions } from "./present";
 import type { Run } from "./model";
 import { scopeFilter, type ThreadScope } from "./scopes";
@@ -71,34 +72,24 @@ export function createTools(deps: ToolDeps) {
     },
     parameters: z.object({
       limit: z.number().int().min(1).max(25).optional(),
-      machineWide: z
-        .boolean()
-        .optional()
-        .describe("Ignore this thread's checkout scope and report everything."),
     }),
     async execute(
-      { limit, machineWide }: { limit?: number; machineWide?: boolean },
+      { limit }: { limit?: number },
       { threadId }: { threadId: string },
     ): Promise<string> {
       deps.refreshProjectNames();
-      const scope = machineWide ? null : await deps.scopeFor(threadId);
-      // `machineWide` is the caller's explicit request; an unresolvable thread
-      // scope is not a licence to answer for the whole machine.
-      const inScope = scopeFilter<Run>(scope, machineWide);
+      const scope = await deps.scopeFor(threadId);
+      const inScope = scopeFilter<Run>(scope);
 
       const open = deps.store.listUnresolved().filter(inScope);
       // Scope in SQL, so a thread whose runs sit outside the machine-wide
       // recent window still sees its own history.
-      const recent = machineWide
-        ? deps.store.listRuns({ limit: limit ?? 5 })
-        : scope
-          ? deps.store.listRuns({ limit: limit ?? 5, scope })
-          : [];
+      const recent = scope
+        ? deps.store.listRuns({ limit: limit ?? 5, scope })
+        : [];
       const header = scope
         ? `Scope: this thread's checkout ${scope.path}${scope.branch ? ` @${scope.branch}` : ""}.`
-        : machineWide
-          ? "Scope: whole machine (explicitly requested)."
-          : "Scope: this thread has no resolvable checkout yet, so nothing is attributed to it.";
+        : "Scope: this thread has no resolvable checkout yet, so nothing is attributed to it.";
       const parts: string[] = [
         header,
         open.length
@@ -110,9 +101,7 @@ export function createTools(deps: ToolDeps) {
           `Recent:\n${recent.map((run) => describeRun(run, present)).join("\n")}`,
         );
       } else {
-        parts.push(
-          "No recorded runs for this checkout yet. Pass machineWide: true to see all Xcode activity.",
-        );
+        parts.push("No recorded runs for this checkout yet.");
       }
       return parts.join("\n\n");
     },
@@ -127,20 +116,16 @@ export function createTools(deps: ToolDeps) {
       completed: "Read last Xcode failure",
     },
     parameters: z.object({
-      projectId: z.string().optional(),
-      machineWide: z
-        .boolean()
-        .optional()
-        .describe("Ignore this thread's checkout scope and search all runs."),
+      projectId: z.string().max(200).optional(),
     }),
     async execute(
-      { projectId, machineWide }: { projectId?: string; machineWide?: boolean },
+      { projectId }: { projectId?: string },
       { threadId }: { threadId: string },
     ): Promise<string> {
       deps.refreshProjectNames();
-      const scope = machineWide ? null : await deps.scopeFor(threadId);
-      if (!scope && !machineWide) {
-        return "This thread has no resolvable checkout, so no run can be attributed to it. Pass machineWide: true to search all runs.";
+      const scope = await deps.scopeFor(threadId);
+      if (!scope) {
+        return "This thread has no resolvable checkout, so no run can be attributed to it.";
       }
       // Scoped in SQL. Filtering after a LIMIT 25 meant a thread whose failure
       // sat outside the newest 25 problem runs machine-wide was told, with
@@ -152,9 +137,7 @@ export function createTools(deps: ToolDeps) {
         ...(scope ? { scope } : {}),
       })[0];
       if (!failed) {
-        return scope
-          ? "No failed Xcode runs recorded for this thread's checkout. Pass machineWide: true to search all runs."
-          : "No failed Xcode runs recorded.";
+        return "No failed Xcode runs recorded for this thread's checkout.";
       }
       const detail = deps.showRun(failed.id);
       return detail.stdout ?? detail.stderr ?? "No detail available.";
@@ -172,13 +155,15 @@ export function createTools(deps: ToolDeps) {
     },
     parameters: z.object({
       args: z
-        .array(z.string())
+        .array(z.string().max(8192))
         .min(1)
+        .max(512)
         .describe(
           'Arguments passed to xcodebuild, without the program name. Example: ["-scheme","App","-destination","platform=macOS","test"]',
         ),
       cwd: z
         .string()
+        .max(4096)
         .optional()
         .describe("Directory to run in. Defaults to this thread's checkout."),
       timeoutSeconds: z
@@ -198,7 +183,20 @@ export function createTools(deps: ToolDeps) {
     ): Promise<string> {
       deps.refreshProjectNames();
       const scope = await deps.scopeFor(threadId);
-      const workingDir = cwd ?? scope?.path;
+      if (scope === null) {
+        return "This thread has no resolvable checkout, so xcodebuild was not started.";
+      }
+      let workingDir: string;
+      try {
+        workingDir = await confinedBuildCwd(scope.path, cwd);
+        await validateBuildArguments(
+          args[0] === "xcodebuild" ? args : ["xcodebuild", ...args],
+          scope.path,
+          workingDir,
+        );
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
       const timeoutMs =
         (timeoutSeconds ?? DEFAULT_BUILD_TIMEOUT_S) * 1000;
 
@@ -216,7 +214,7 @@ export function createTools(deps: ToolDeps) {
           argv: resolveBuildArgv(
             args[0] === "xcodebuild" ? args : ["xcodebuild", ...args],
           ),
-          ...(workingDir ? { cwd: workingDir } : {}),
+          cwd: workingDir,
           killSignal: killer.signal,
         });
         if (!started) {

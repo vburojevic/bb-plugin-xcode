@@ -2,9 +2,9 @@
  * Agent tools.
  *
  * Names are globally unique across plugins, so everything is `simulator_`
- * prefixed. Registered only when `allowAgentCapture` is on — a captured frame
- * is sent to the model provider, and a setting that turns that off has to
- * actually remove the tools rather than make them refuse.
+ * prefixed. Registered only when `allowAgentCapture` is on, and checked again
+ * on every invocation so switching the setting off revokes already-registered
+ * tools immediately rather than waiting for a plugin reload.
  *
  * ## The image budget
  *
@@ -16,21 +16,19 @@
  * **the text summary stands alone** — a provider may reject image content
  * entirely, and load-bearing information must never live only in a picture.
  *
- * ## There is no `simulator_expose` tool, and there never will be
+ * ## The network boundary
  *
- * Exposing a simulator is a trust decision, and a trust decision an agent can
- * make on your behalf is not one. That rule alone is not enforcement, which is
- * why `bb sims expose` routes through `bb.ui.requestInput` and why the capture
- * host serves an allowlist.
+ * The capture host listens only on loopback. Remote viewing stays inside the
+ * main bb panel; tools never create or return a simulator share.
  */
 import { z } from "zod";
-import { unlink } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { readFile } from "node:fs/promises";
+import { readFileBounded } from "../bounded-file.js";
 import type { Ctx } from "./context.js";
 import { captureNow } from "./rpc.js";
-import { AGENT_JPEG_QUALITY, AGENT_LONG_EDGE, downscale } from "./image.js";
+import { AGENT_IMAGE_BUDGET_BYTES, AGENT_JPEG_QUALITY, AGENT_LONG_EDGE, downscale } from "./image.js";
 import { frameAbsolutePath } from "./framestore.js";
 import { getFrame, getLook } from "./frames.js";
 import { fitToBudget } from "./image.js";
@@ -53,6 +51,9 @@ export interface ToolResult {
   content: ToolContent[];
   isError?: boolean;
 }
+
+/** Raw JPEG bytes whose base64 representation still fits the tool budget. */
+export const MAX_AGENT_IMAGE_FILE_BYTES = Math.floor(AGENT_IMAGE_BUDGET_BYTES * 3 / 4);
 
 export const captureParameters = z.object({
   udid: z.string().optional().describe("Which simulator, if more than one is running."),
@@ -95,18 +96,19 @@ export async function encodeForModel(
   });
   if (source === null) return null;
 
-  const target = join(tmpdir(), `xcsim-agent-${frame.id}.jpg`);
+  const scratch = await mkdtemp(join(tmpdir(), "xcsim-agent-"));
+  const target = join(scratch, "frame.jpg");
   try {
     const ok = await downscale(source, target, AGENT_LONG_EDGE, AGENT_JPEG_QUALITY);
     if (!ok) return null;
-    const bytes = await readFile(target);
+    const bytes = await readFileBounded(target, MAX_AGENT_IMAGE_FILE_BYTES, { noFollow: true });
     return { data: bytes.toString("base64"), mimeType: "image/jpeg", bytes: bytes.byteLength };
   } catch {
     return null;
   } finally {
-    // Best effort: a stale temp file is inert, and failing the call because
-    // cleanup failed would be absurd.
-    await unlink(target).catch(() => undefined);
+    // Private, unpredictable scratch avoids following an attacker-controlled
+    // symlink in a shared temp directory. Cleanup remains best effort.
+    await rm(scratch, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -125,6 +127,9 @@ export function makeCaptureTool(ctx: Ctx) {
       args: z.infer<typeof captureParameters>,
       context: { threadId: string },
     ): Promise<ToolResult> {
+      if (!ctx.settings().allowAgentCapture) {
+        return textError("Simulator agent access is disabled in Xcode plugin settings.");
+      }
       const lease = ctx.leases.acquire(context.threadId);
       if (!lease.ok) return textError(lease.reason);
 
@@ -167,7 +172,7 @@ export const GLOBAL_INSTRUCTIONS = [
   "When you have changed SwiftUI and want to show the result, call simulator_capture or simulator_drive instead of describing the screen in prose; never claim a screen \"looks correct\" without a frame.",
   "Preview renders report themselves in the panel and in the prompt stack above the composer, so never paste a list of changed previews into chat — the user is already looking at it.",
   "The simulator is shared: if a call reports another thread is driving it, wait rather than retrying.",
-  "Never expose a Xcode Simulators port with `bb connect expose`, and never ask the user to expose the simulator remotely — that control is theirs and it lives in the panel.",
+  "The simulator capture port is loopback-only. Never share or tunnel it; remote viewing belongs inside the main bb panel.",
 ].join(" ");
 
 export const driveParameters = z.object({
@@ -239,6 +244,9 @@ export function makeDriveTool(ctx: Ctx) {
       args: z.infer<typeof driveParameters>,
       context: { threadId: string },
     ): Promise<ToolResult> {
+      if (!ctx.settings().allowAgentCapture) {
+        return textError("Simulator agent access is disabled in Xcode plugin settings.");
+      }
       const device = ctx.live.currentDevice();
       if (device === null) return textError("No simulator is running.");
 
@@ -311,6 +319,9 @@ export function makeStillsTool(ctx: Ctx) {
     },
     parameters: stillsParameters,
     async execute(args: z.infer<typeof stillsParameters>): Promise<ToolResult> {
+      if (!ctx.settings().allowAgentCapture) {
+        return textError("Simulator agent access is disabled in Xcode plugin settings.");
+      }
       let summary;
       try {
         const scope = await ctx.scopeForThread(null);

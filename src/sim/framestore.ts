@@ -11,8 +11,12 @@
  * frames root before opening it. Both halves are needed: the first stops a
  * traversal, the second stops a bug in the first.
  */
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { readFileBounded } from "../bounded-file.js";
+
+/** New frame sources are capped at 32 MiB; double that for older stored data. */
+export const MAX_STORED_FRAME_BYTES = 64 * 1024 * 1024;
 
 export interface FrameLocation {
   scopeKey: string;
@@ -80,7 +84,7 @@ export class FrameStore {
     const absolute = frameAbsolutePath(this.framesRoot, location);
     if (absolute === null) return null;
     try {
-      return await readFile(absolute);
+      return await readFileBounded(absolute, MAX_STORED_FRAME_BYTES, { noFollow: true });
     } catch {
       // A frame that is no longer on disk is a state the UI renders, not an
       // error: the directive's tombstone and the grid's aspect box both exist

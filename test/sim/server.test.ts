@@ -111,8 +111,19 @@ describe("the RPC contract", () => {
 });
 
 describe("registrations", () => {
-  it("claims exactly the surfaces it says it does", async () => {
+  it("has no simulator-specific public exposure surface", async () => {
     const harness = await load();
+    for (const name of ["exposeState", "exposeStart", "exposeClaim", "exposeStop"]) {
+      expect(harness.registrations.rpcMethods).not.toContain(name);
+    }
+    const verbs = SIM_VERBS.map((command) => command.name);
+    for (const name of ["expose", "unexpose", "url"]) expect(verbs).not.toContain(name);
+    expect(SIM_SETTINGS).not.toHaveProperty("exposeTtlMinutes");
+    expect(harness.hostCalls).toEqual([]);
+  });
+
+  it("claims exactly the surfaces it says it does", async () => {
+    const harness = await load({ settings: { allowAgentCapture: true } });
     expect(harness.registrations.services).toEqual(["sim-live"]);
     // Mounted, not registered: `bb.cli.register` is one call per plugin and
     // `server.ts` owns it. The harness stands in for that mount.
@@ -133,17 +144,16 @@ describe("registrations", () => {
       "simulator_drive",
       "simulator_stills",
     ]);
-    // There is no simulator_expose tool, and there never will be: exposing a
-    // simulator is a trust decision, and a trust decision an agent can make on
-    // your behalf is not one.
+    // No agent tool can create or return a network share. Remote viewing stays
+    // inside the main bb panel.
     expect(harness.registrations.agentTools).not.toContain("simulator_expose");
   });
 
   it("keeps a proxied stream for the viewers that need one", async () => {
     // This route used to be the only way to see a frame, for three stated
     // reasons: the per-boot secret never reached the DOM, the URL was
-    // same-origin so `bb connect` did not block it as mixed content, and there
-    // was one auth model instead of two.
+    // same-origin so a remote bb panel did not hit mixed-content rules, and
+    // there was one auth model instead of two.
     //
     // The first is now handled by a stream-scoped token that authorises the
     // MJPEG route and nothing else, and the third is a cost knowingly paid: the
@@ -164,8 +174,20 @@ describe("the agent tools", () => {
     expect(harness.registrations.agentTools).toEqual([]);
   });
 
+  it("also refuses already-registered tools after agent capture is switched off", async () => {
+    const harness = await load({ settings: { allowAgentCapture: true } });
+    await harness.setSettings({ allowAgentCapture: false });
+    const result = (await harness.callAgentTool(
+      "simulator_capture",
+      {},
+      { threadId: "th_1" },
+    )) as { content: Array<{ type: string; text?: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("Simulator agent access is disabled");
+  });
+
   it("refuse a capture with a sentence rather than an empty result", async () => {
-    const harness = await load();
+    const harness = await load({ settings: { allowAgentCapture: true } });
     const result = (await harness.callAgentTool(
       "simulator_capture",
       {},
@@ -213,7 +235,7 @@ describe("the CLI", () => {
   });
 
   it("reports a simctl failure rather than an empty device list", async () => {
-    const harness = await load();
+    const harness = await load({ settings: { allowAgentCapture: true } });
     const result = await harness.runCli(["devices"]);
     // No simulators exist in a test environment, so this exercises the failure
     // path on Linux CI and the empty path on a Mac — both are honest.
@@ -223,30 +245,142 @@ describe("the CLI", () => {
     }
   });
 
-  it("answers `url` with a refusal rather than a broken link when nothing is running", async () => {
+  it("keeps model-facing CLI capture off by default", async () => {
     const harness = await load();
-    const result = await harness.runCli(["url"]);
+    const result = await harness.runCli(["shot"]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("No simulator is running.");
+    expect(result.stderr).toContain("Simulator agent access is disabled");
+  });
+
+  it("rejects screenshot output paths outside the invoking checkout before capture", async () => {
+    const harness = await load({ settings: { allowAgentCapture: true } });
+    const absolute = await harness.runCli(["shot", "--out", "/tmp/overwrite.jpg"], {
+      cwd: "/tmp/demo",
+      threadId: "th_1",
+      projectId: "proj_1",
+    });
+    expect(absolute.stderr).toContain("not an absolute path");
+    const traversal = await harness.runCli(["shot", "--out", "../overwrite.jpg"], {
+      cwd: "/tmp/demo",
+      threadId: "th_1",
+      projectId: "proj_1",
+    });
+    expect(traversal.stderr).toContain("stay inside this thread's checkout");
+  });
+
+  it("requires host confirmation for agent-facing CLI host mutations", async () => {
+    const harness = await load({ settings: { allowAgentCapture: true } });
+    const invocation = {
+      cwd: "/tmp/demo",
+      threadId: "th_1",
+      projectId: "proj_1",
+    };
+
+    const shot = await harness.runCli(
+      ["shot", "--out", "capture.jpg"],
+      invocation,
+    );
+    expect(shot.exitCode).toBe(1);
+    expect(shot.stderr).toContain("was not confirmed");
+
+    const stills = await harness.runCli(["stills"], invocation);
+    expect(stills.exitCode).toBe(1);
+    expect(stills.stderr).toContain("was not confirmed");
+
+    const baseline = await harness.runCli(
+      ["baseline", "clear"],
+      invocation,
+    );
+    expect(baseline.exitCode).toBe(1);
+    expect(baseline.stderr).toContain("was not confirmed");
+
+  });
+
+  it("does not return an explicitly named run outside the invoking checkout scope", async () => {
+    const harness = await load({ settings: { allowAgentCapture: true } });
+    const otherLookId = "lk_00000000000000000000000000";
+    for (const statement of MIGRATIONS) harness.db.exec(statement);
+    insertLook(harness.db, {
+      id: otherLookId,
+      projectId: "proj_other",
+      scopeKey: "scope-other",
+      kind: "stills",
+      status: "ok",
+      commitSha: "deadbeef",
+      branch: "main",
+      deviceKey: "device",
+      deviceUdid: null,
+      deviceName: "Private simulator",
+      osVersion: "26.5",
+      scale: 3,
+      startedAt: 1,
+    });
+    const invocation = { cwd: "/tmp/demo", threadId: "th_1", projectId: "proj_1" };
+
+    for (const argv of [
+      ["look", otherLookId],
+      ["card", otherLookId],
+      ["baseline", "set", otherLookId],
+    ]) {
+      const result = await harness.runCli(argv, invocation);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(`No run called ${otherLookId}.\n`);
+    }
+  });
+
+  it("does not infer the first bb project for a CLI invocation with no checkout", async () => {
+    const harness = await load({ settings: { allowAgentCapture: true } });
+    const result = await harness.runCli(["look"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("Run this command from the bb thread checkout");
   });
 });
 
-describe("exposure", () => {
-  it("refuses from a CLI with no thread, and points at the panel", async () => {
-    // Otherwise the "there is no simulator_expose tool" rule is decoration: an
-    // agent can run the CLI. This check comes before any capability check, so
-    // the refusal does not depend on the state of bb connect.
+describe("server-side destructive authorization", () => {
+  it("does not run a Stills test target from raw RPC without host confirmation", async () => {
     const harness = await load();
-    const result = await harness.runCli(["expose"]);
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("needs a person to confirm");
-    expect(result.stderr).toContain("Simulators panel");
+    const result = (await harness.callRpc("stillsRun", {
+      threadId: "th_1",
+      projectId: "proj_1",
+    })) as { lookId: string | null; queued: number; error: string | null };
+    expect(result.lookId).toBeNull();
+    expect(result.queued).toBe(0);
+    expect(result.error).toMatch(/not confirmed/);
   });
 
-  it("never repeats the link in a status read", async () => {
+  it("does not erase or shut down from raw RPC without host confirmation", async () => {
     const harness = await load();
-    const status = await harness.runCli(["status"]);
-    expect(status.stdout).not.toMatch(/https?:\/\//);
+    await expect(
+      harness.callRpc("liveStop", {
+        erase: "11111111-2222-3333-4444-555555555555",
+        threadId: "th_1",
+        projectId: "proj_1",
+      }),
+    ).rejects.toThrow(/currently shown|not confirmed/);
+  });
+
+  it("does not purge stored rows when host confirmation is cancelled", async () => {
+    const harness = await load();
+    for (const statement of MIGRATIONS) harness.db.exec(statement);
+    insertLook(harness.db, {
+      id: "lk_keep",
+      projectId: "proj_1",
+      scopeKey: "scope",
+      kind: "live",
+      status: "ok",
+      commitSha: null,
+      branch: null,
+      deviceKey: "device",
+      deviceUdid: null,
+      deviceName: null,
+      osVersion: null,
+      scale: null,
+      startedAt: 1,
+    });
+    await expect(
+      harness.callRpc("purgeApply", { threadId: "th_1", projectId: "proj_1" }),
+    ).rejects.toThrow(/not confirmed/);
+    expect(getLook(harness.db, "lk_keep")).not.toBeNull();
   });
 });
 

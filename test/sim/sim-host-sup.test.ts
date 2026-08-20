@@ -1,27 +1,42 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
-import { Readable } from "node:stream";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { PassThrough, Readable } from "node:stream";
+import { mkdtempSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { NO_HANDSHAKE, parseHandshake, resolveSimHostPath, startSimHost } from "../../src/sim/sim-host-sup.js";
+import {
+  NO_HANDSHAKE,
+  parseHandshake,
+  resolveSimHostPath,
+  SIM_HOST_SYSTEM_PATH,
+  startSimHost,
+} from "../../src/sim/sim-host-sup.js";
+
+const fakeChildren: EventEmitter[] = [];
+
+afterEach(() => {
+  for (const child of fakeChildren.splice(0)) child.emit("exit", 0, null);
+});
 
 /** A child process good enough to test the supervisor's contract with one. */
 function fakeChild() {
   const child = new EventEmitter() as EventEmitter & {
     stdout: Readable;
     stderr: Readable;
+    stdin: PassThrough;
     kill: (signal?: string) => boolean;
     killed: string[];
   };
   child.stdout = new Readable({ read() {} });
   child.stderr = new Readable({ read() {} });
+  child.stdin = new PassThrough();
   child.killed = [];
   child.kill = (signal = "SIGTERM") => {
     child.killed.push(signal);
     return true;
   };
+  fakeChildren.push(child);
   return child;
 }
 
@@ -82,10 +97,7 @@ describe("spawning the capture host", () => {
   it("sets ELECTRON_RUN_AS_NODE unconditionally", async () => {
     // In the shipping desktop build the bb server is itself a child of
     // Electron, so `process.execPath` is the Electron binary and it behaves as
-    // Node only while that variable is present. bb's own agent-bridge code
-    // deliberately deletes it, so handing the child a curated environment is
-    // exactly how you launch a second full bb window instead of a script — and
-    // no preflight probe would catch it.
+    // Node only while that variable is present.
     const child = fakeChild();
     const spawnFn = vi.fn(() => child);
     const started = startSimHost(deps(spawnFn), { onExit: () => {}, onLog: () => {} });
@@ -107,8 +119,31 @@ describe("spawning the capture host", () => {
     expect(options.env.XCSIM_SECRET).toMatch(/^[A-Za-z0-9_-]{43}$/);
     // We own the port; there is nothing to discover from serve-sim's state files.
     expect(options.env.XCSIM_PORT).toBe("0");
-    // The environment is inherited rather than curated.
-    expect(options.env.PATH).toBe("/usr/bin");
+    // Only the toolchain environment survives, and native scratch is private.
+    expect(options.env.PATH).toBe(SIM_HOST_SYSTEM_PATH);
+    expect(options.stdio).toEqual(["pipe", "pipe", "pipe"]);
+    expect(options.env.TMPDIR).toMatch(/bb-xcsim-host-/);
+    expect(statSync(options.env.TMPDIR!).mode & 0o777).toBe(0o700);
+    child.emit("exit", 0, null);
+  });
+
+  it("does not inherit bb or provider credentials", async () => {
+    const child = fakeChild();
+    const spawnFn = vi.fn(() => child);
+    const started = startSimHost(
+      { ...deps(spawnFn), env: { PATH: "/usr/bin", BB_SERVER_TOKEN: "no", OPENAI_API_KEY: "no" } },
+      { onExit: () => {}, onLog: () => {} },
+    );
+    child.stdout.push('{"ok":true,"port":4242,"addon":true}\n');
+    await started;
+    const [, , options] = spawnFn.mock.calls[0] as unknown as [
+      string,
+      string[],
+      { env: NodeJS.ProcessEnv },
+    ];
+    expect(options.env.BB_SERVER_TOKEN).toBeUndefined();
+    expect(options.env.OPENAI_API_KEY).toBeUndefined();
+    child.emit("exit", 0, null);
   });
 
   it("mints a different secret every time", async () => {
@@ -135,6 +170,9 @@ describe("spawning the capture host", () => {
       await vi.advanceTimersByTimeAsync(10_001);
       await assertion;
       expect(child.killed).toContain("SIGTERM");
+      expect(child.stdin.writableEnded).toBe(true);
+      await vi.advanceTimersByTimeAsync(2_001);
+      expect(child.killed).toContain("SIGKILL");
     } finally {
       vi.useRealTimers();
     }

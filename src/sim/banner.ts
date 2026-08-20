@@ -11,22 +11,18 @@
  *    the watermark is the **set of changed identities** rather than a
  *    timestamp: dismiss it and it stays gone through re-renders of the same
  *    twelve, and returns the moment a thirteenth changes.
- * 3. **An active exposure.** Not dismissible. A trust indicator you can hide is
- *    not one.
- *
  * The live stream is deliberately not in the banner. A 60fps video underneath
  * the text you are typing, in a stack already competing with bb's own context,
  * todo and workflow cards, is a worse place for it than a panel you chose to
  * open.
  */
 import { isDismissed, shortShaOf, watermarkOf, type Look, type VerdictStatus } from "./model.js";
-import { formatRemaining } from "./format.js";
 
-export type BannerTone = "neutral" | "dead" | "exposed";
+export type BannerTone = "neutral" | "dead";
 
 export interface BannerRow {
   id: string;
-  kind: "failure" | "run" | "exposure";
+  kind: "failure" | "run";
   sentence: string;
   tone: BannerTone;
   dismissible: boolean;
@@ -40,8 +36,6 @@ export interface BannerInput {
   look: (Look & { changedIdentities: readonly string[]; baseCommit: string | null }) | null;
   /** The dismissal already recorded for this thread and look, if any. */
   dismissed: string | null;
-  /** `null` when nothing is exposed. */
-  exposure: { msLeft: number } | null;
   /** Off when the user turned `postChangedPreviews` off. */
   offerRuns: boolean;
 }
@@ -100,32 +94,7 @@ export function bannerRows(input: BannerInput): BannerRow[] {
     }
   }
 
-  if (input.exposure !== null) {
-    rows.push({
-      id: "exposure",
-      kind: "exposure",
-      sentence: `Simulator exposed to your bb account — ${formatRemaining(input.exposure.msLeft)}`,
-      tone: "exposed",
-      // A trust indicator you can hide is not one.
-      dismissible: false,
-      lookId: null,
-      watermark: null,
-    });
-  }
-
-  // The exposure outranks a run, because a trust state outranks a liveness one.
-  return rows.sort((a, b) => rank(b) - rank(a)).slice(0, MAX_ROWS);
-}
-
-function rank(row: BannerRow): number {
-  switch (row.kind) {
-    case "exposure":
-      return 2;
-    case "failure":
-      return 1;
-    case "run":
-      return 0;
-  }
+  return rows.slice(0, MAX_ROWS);
 }
 
 /** A failure row is watermarked on the look id: there is no changed set. */

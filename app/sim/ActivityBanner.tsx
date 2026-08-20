@@ -19,9 +19,9 @@ import { TONE_CLASS } from "./copy";
 
 interface Row {
   id: string;
-  kind: "failure" | "run" | "exposure";
+  kind: "failure" | "run";
   sentence: string;
-  tone: "neutral" | "dead" | "exposed";
+  tone: "neutral" | "dead";
   dismissible: boolean;
   lookId: string | null;
   watermark: string | null;
@@ -58,12 +58,8 @@ export function ActivityBanner() {
     <>
       {visible.map((row) => (
         <div key={row.id} className={`bbxs-stack-card ${TONE_CLASS[row.tone]}`}>
-          <div
-            className={`flex items-center gap-2 px-3 py-2 ${row.tone === "exposed" ? "bbxs-filled" : ""}`}
-          >
-            {row.tone === "exposed" ? (
-              <Icon name="Globe" className="size-3.5 shrink-0" />
-            ) : row.tone === "dead" ? (
+          <div className="flex items-center gap-2 px-3 py-2">
+            {row.tone === "dead" ? (
               <Icon name="AlertTriangle" className="size-3.5 shrink-0" />
             ) : (
               <span className="bbxs-dot shrink-0" aria-hidden />
@@ -84,21 +80,6 @@ export function ActivityBanner() {
               </Button>
             ) : null}
 
-            {row.kind === "exposure" ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-6 px-2 text-xs"
-                onClick={() => {
-                  void rpc.call("exposeStop").then(refresh);
-                }}
-              >
-                Stop
-              </Button>
-            ) : null}
-
-            {/* A trust indicator you can hide is not one, so the exposure row
-                has no dismiss control at all. */}
             {row.dismissible ? (
               <button
                 type="button"

@@ -130,6 +130,12 @@ describe("the 0x82 config push", () => {
     expect(decodeConfig(Buffer.from([0x03, 0x7b, 0x7d]))).toBeNull();
     expect(decodeConfig(Buffer.from([0x82]))).toBeNull();
     expect(decodeConfig(Buffer.concat([Buffer.from([0x82]), Buffer.from("not json")]))).toBeNull();
+    expect(
+      decodeConfig(Buffer.concat([
+        Buffer.from([0x82]),
+        Buffer.from(JSON.stringify({ width: 1_000_000, height: 1_000_000 })),
+      ])),
+    ).toBeNull();
   });
 });
 

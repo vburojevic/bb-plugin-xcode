@@ -7,7 +7,9 @@
  */
 
 import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@bb/plugin-sdk";
+import { resolve } from "node:path";
 
+import { confinedBuildCwd, validateBuildArguments } from "./build-security";
 import type { Collector } from "./collector";
 import { destinationLabel } from "./destination";
 import { formatDuration } from "./duration";
@@ -22,6 +24,7 @@ import {
 } from "./shim";
 import type { Store } from "./store";
 import type { BuildPhase } from "./types";
+import { pathIsUnder, runMatchesScope, type ThreadScope } from "./scopes";
 import {
   resolveBuildArgv,
   startWrappedBuild,
@@ -37,6 +40,8 @@ export interface CliResult {
 
 export interface CliContext {
   cwd?: string;
+  threadId?: string;
+  projectId?: string;
   signal?: AbortSignal;
 }
 
@@ -48,9 +53,14 @@ export interface CliDeps {
   /** What a live run is doing right now; null for anything settled. */
   phaseFor(run: Run): BuildPhase | null;
   refreshProjectNames(): void;
-  rescan(): void;
+  /** Resolve the invoking thread's checkout before host-side execution. */
+  scopeFor(threadId: string): Promise<ThreadScope | null>;
   wrapped: WrappedDeps;
   onShimStateKnown(installed: boolean): void;
+  confirmHostAction(
+    threadId: string,
+    consent: { title: string; facts: string[]; confirmLabel: string },
+  ): Promise<boolean>;
 }
 
 /**
@@ -75,7 +85,6 @@ export const CLI_COMMANDS = [
   },
   { name: "show", summary: "Detail for one run", usage: "bb xcode show <run-id>" },
   { name: "roots", summary: "Discovered DerivedData roots", usage: "bb xcode roots" },
-  { name: "rescan", summary: "Force a discovery + sweep", usage: "bb xcode rescan" },
   {
     name: "run",
     summary: "Start xcodebuild with live tracking, detached from this command",
@@ -104,10 +113,41 @@ export function createCli(deps: CliDeps) {
     phaseFor: (run: Run) => deps.phaseFor(run),
   };
 
-  function show(id: string | undefined): CliResult {
+  /** `undefined` is reserved for direct, internal calls such as showRun. */
+  type InvocationScope = ThreadScope | null | undefined;
+
+  const scopeForInvocation = async (
+    ctx: CliContext,
+  ): Promise<ThreadScope | null> => {
+    // PluginCliContext is forwarded from the invoking process. Treat its ids as
+    // routing hints, not as identity: a claimed thread must agree with the
+    // checkout the process is actually standing in before it can read that
+    // thread's build history or signal one of its processes.
+    if (ctx.threadId === undefined || ctx.cwd === undefined) return null;
+    const scope = await deps.scopeFor(ctx.threadId);
+    if (scope === null) return null;
+    if (ctx.projectId !== undefined && scope.projectId !== ctx.projectId) return null;
+    const cwd = resolve(ctx.cwd);
+    const root = resolve(scope.path);
+    return pathIsUnder(cwd, root) ? scope : null;
+  };
+
+  const mayReadRun = (run: Run | null, scope: InvocationScope): run is Run =>
+    run !== null &&
+    (scope === undefined ||
+      (scope !== null && runMatchesScope(run, scope)));
+
+  function show(
+    id: string | undefined,
+    scope: InvocationScope = undefined,
+  ): CliResult {
     if (!id) return { exitCode: 1, stderr: "Usage: bb xcode show <run-id>\n" };
     const run = deps.store.getRun(id);
-    if (!run) return { exitCode: 1, stderr: `No run with id '${id}'.\n` };
+    // Deliberately do not distinguish an absent run from one outside the
+    // invoking thread. The distinction is itself a cross-thread oracle.
+    if (!mayReadRun(run, scope)) {
+      return { exitCode: 1, stderr: `No run with id '${id}'.\n` };
+    }
 
     const lines = [
       `id           ${run.id}`,
@@ -176,9 +216,54 @@ export function createCli(deps: CliDeps) {
       };
     }
 
+    let argv: string[];
+    try {
+      argv = resolveBuildArgv(commandArgs);
+    } catch (error) {
+      return { exitCode: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
+    }
+
+    let root: string;
+    let workingDir: string;
+    try {
+      if (ctx.threadId === undefined) {
+        return {
+          exitCode: 1,
+          stderr:
+            "Tracked builds require a bb thread so the checkout security boundary can be enforced.\n",
+        };
+      }
+      const scope = await scopeForInvocation(ctx);
+      if (scope === null) {
+        return {
+          exitCode: 1,
+          stderr: "The invoking checkout does not match this thread, so xcodebuild was not started.\n",
+        };
+      }
+      root = scope.path;
+      workingDir = await confinedBuildCwd(root, ctx.cwd);
+      await validateBuildArguments(argv, root, workingDir);
+      const approved = await deps.confirmHostAction(ctx.threadId, {
+        title: "Run xcodebuild on the host?",
+        facts: [
+          `Checkout: ${root}`,
+          `Command: ${argv.join(" ").slice(0, 500)}`,
+          "Xcode projects can run build phases, package plugins, compiler plugins, and tests as your host user.",
+        ],
+        confirmLabel: "Run xcodebuild",
+      });
+      if (!approved) {
+        return {
+          exitCode: 1,
+          stderr: "The host xcodebuild run was not confirmed.\n",
+        };
+      }
+    } catch (error) {
+      return { exitCode: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
+    }
     const started = await startWrappedBuild(deps.wrapped, {
-      argv: resolveBuildArgv(commandArgs),
-      ...(ctx.cwd ? { cwd: ctx.cwd } : {}),
+      argv,
+      cwd: workingDir,
     });
     if (!started) return { exitCode: 1, stderr: "Failed to start the build.\n" };
 
@@ -232,7 +317,8 @@ export function createCli(deps: CliDeps) {
         stderr: "Usage: bb xcode wait <run-id> [--timeout <seconds>]\n",
       };
     }
-    if (!deps.store.getRun(id)) {
+    const scope = await scopeForInvocation(ctx);
+    if (!mayReadRun(deps.store.getRun(id), scope)) {
       return { exitCode: 1, stderr: `No run with id '${id}'.\n` };
     }
     const seconds = Number(flag(args, "timeout"));
@@ -252,17 +338,23 @@ export function createCli(deps: CliDeps) {
         stderr: `Timed out after ${Math.round(timeoutMs / 1000)}s; ${settled.id} is still ${settled.status}.\n`,
       };
     }
-    const detail = show(settled.id);
+    const detail = show(settled.id, scope);
     return {
       exitCode: settled.status === "failed" ? 1 : 0,
       stdout: capOutput(detail.stdout ?? `${describeRun(settled, present)}\n`),
     };
   }
 
-  function stop(id: string | undefined): CliResult {
+  async function stop(
+    id: string | undefined,
+    ctx: CliContext,
+  ): Promise<CliResult> {
     if (!id) return { exitCode: 1, stderr: "Usage: bb xcode stop <run-id>\n" };
+    const scope = await scopeForInvocation(ctx);
     const target = deps.store.getRun(id);
-    if (!target) return { exitCode: 1, stderr: `No run with id '${id}'.\n` };
+    if (!mayReadRun(target, scope)) {
+      return { exitCode: 1, stderr: `No run with id '${id}'.\n` };
+    }
     if (target.status !== "running" || target.pid === null) {
       return { exitCode: 1, stderr: `Run ${id} is not running.\n` };
     }
@@ -282,6 +374,25 @@ export function createCli(deps: CliDeps) {
         exitCode: 1,
         stderr: `Run ${id} claims pid ${target.pid}, but no such Xcode process is running.\n`,
       };
+    }
+    if (ctx.threadId === undefined) {
+      return {
+        exitCode: 1,
+        stderr:
+          "Stopping a host build requires a bb thread so a person can confirm it.\n",
+      };
+    }
+    const approved = await deps.confirmHostAction(ctx.threadId, {
+      title: "Stop this host Xcode build?",
+      facts: [
+        `Run: ${target.id}`,
+        `Process: ${target.pid}`,
+        `Checkout: ${target.cwd ?? target.container ?? target.root ?? "unknown"}`,
+      ],
+      confirmLabel: "Stop build",
+    });
+    if (!approved) {
+      return { exitCode: 1, stderr: `Stopping ${id} was not confirmed.\n` };
     }
     try {
       process.kill(target.pid, "SIGTERM");
@@ -347,9 +458,16 @@ export function createCli(deps: CliDeps) {
 
       switch (command) {
         case "status": {
-          const open = deps.store.listUnresolved();
+          const scope = await scopeForInvocation(ctx);
+          const open = deps.store
+            .listUnresolved()
+            .filter((run) => mayReadRun(run, scope));
           if (open.length === 0) {
-            const last = deps.store.listRuns({ limit: 1 })[0];
+            const last = scope === undefined
+              ? deps.store.listRuns({ limit: 1 })[0]
+              : scope
+                ? deps.store.listRuns({ limit: 1, scope })[0]
+                : undefined;
             return {
               exitCode: 0,
               stdout: `No Xcode activity running.${last ? `\nLast: ${describeRun(last, present)}` : ""}\n`,
@@ -361,12 +479,20 @@ export function createCli(deps: CliDeps) {
           };
         }
         case "runs": {
+          const scope = await scopeForInvocation(ctx);
           const limitRaw = Number(flag(rest, "limit"));
-          const rows = deps.store.listRuns({
-            projectId: flag(rest, "project"),
-            kind: (flag(rest, "kind") as Run["kind"] | null) ?? undefined,
-            limit: Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 25,
-          });
+          const rows = scope === null
+            ? []
+            : deps.store.listRuns({
+                projectId: flag(rest, "project"),
+                kind:
+                  (flag(rest, "kind") as Run["kind"] | null) ?? undefined,
+                limit:
+                  Number.isFinite(limitRaw) && limitRaw > 0
+                    ? Math.min(Math.floor(limitRaw), 100)
+                    : 25,
+                ...(scope ? { scope } : {}),
+              });
           return {
             exitCode: 0,
             stdout: rows.length
@@ -374,10 +500,19 @@ export function createCli(deps: CliDeps) {
               : "No runs recorded yet.\n",
           };
         }
-        case "show":
-          return show(rest[0]);
+        case "show": {
+          const scope = await scopeForInvocation(ctx);
+          return show(rest[0], scope);
+        }
         case "roots": {
-          const roots = deps.store.listRoots();
+          const scope = await scopeForInvocation(ctx);
+          const roots = deps.store.listRoots().filter((root) =>
+            scope === undefined
+              ? true
+              : scope !== null &&
+                scope.projectId !== null &&
+                root.projectId === scope.projectId,
+          );
           if (!roots.length) {
             return {
               exitCode: 0,
@@ -395,24 +530,58 @@ export function createCli(deps: CliDeps) {
           );
           return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
         }
-        case "rescan": {
-          // Detached, like the rpc method: a sweep can spawn xcresulttool with
-          // a 60s timeout per bundle, and holding the CLI handler open for
-          // that is what put xcode on perf-watch's slow-handler list.
-          deps.rescan();
-          return {
-            exitCode: 0,
-            stdout: `Scanning in the background. ${deps.store.listRoots().length} DerivedData root(s) known so far.\n`,
-          };
-        }
         case "run":
           return run(rest, ctx);
         case "wait":
           return waitFor(rest, ctx);
         case "stop":
-          return stop(rest[0]);
-        case "shim":
-          return shim(rest[0] ?? "status");
+          return stop(rest[0], ctx);
+        case "shim": {
+          const action = rest[0] ?? "status";
+          if ((action === "install" || action === "uninstall") && ctx.threadId === undefined) {
+            return {
+              exitCode: 1,
+              stderr:
+                "Shim changes require a bb thread so a person can confirm them.\n",
+            };
+          }
+          if (action === "install" || action === "uninstall") {
+            if ((await scopeForInvocation(ctx)) === null) {
+              return {
+                exitCode: 1,
+                stderr: "The invoking checkout does not match this thread, so the host shim was not changed.\n",
+              };
+            }
+            const approved = await deps.confirmHostAction(
+              ctx.threadId!,
+              {
+                title:
+                  action === "install"
+                    ? "Install the host-wide xcodebuild shim?"
+                    : "Remove the host-wide xcodebuild shim?",
+                facts:
+                  action === "install"
+                    ? [
+                        "This writes a wrapper into the Xcode plugin data directory.",
+                        "It affects xcodebuild only after you add the shown directory to PATH.",
+                      ]
+                    : [
+                        "This removes the wrapper from the Xcode plugin data directory.",
+                        "Existing builds keep running, but new shell builds will no longer be wrapped.",
+                      ],
+                confirmLabel:
+                  action === "install" ? "Install shim" : "Remove shim",
+              },
+            );
+            if (!approved) {
+              return {
+                exitCode: 1,
+                stderr: `Shim ${action} was not confirmed.\n`,
+              };
+            }
+          }
+          return shim(action);
+        }
         default:
           return {
             exitCode: 1,

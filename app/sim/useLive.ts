@@ -13,7 +13,7 @@
  * has told the user something false.
  */
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
-import { useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
+import { useBbContext, useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../../src/sim/wire";
 import type { Step } from "../../src/sim/steps.js";
 import { TouchChannel, type StreamEvent } from "./touch-channel";
@@ -210,6 +210,7 @@ export interface LiveApi extends Snapshot {
 
 export function useLive(): LiveApi {
   const client = useRpc<typeof rpcContract>();
+  const { threadId, projectId } = useBbContext();
   rpc = client;
 
   const value = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
@@ -247,20 +248,20 @@ export function useLive(): LiveApi {
 
   const shutdown = useCallback(
     async (udid: string) => {
-      const next = await client.call("liveStop", { shutdown: udid });
+      const next = await client.call("liveStop", { shutdown: udid, threadId, projectId });
       emit({ state: next as LiveState });
       refresh();
     },
-    [client],
+    [client, projectId, threadId],
   );
 
   const erase = useCallback(
     async (udid: string) => {
-      const next = await client.call("liveStop", { erase: udid });
+      const next = await client.call("liveStop", { erase: udid, threadId, projectId });
       emit({ state: next as LiveState });
       refresh();
     },
-    [client],
+    [client, projectId, threadId],
   );
 
   const input = useCallback(

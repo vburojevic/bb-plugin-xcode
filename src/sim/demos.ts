@@ -16,8 +16,6 @@ export const DEMO_BANNER_STATES = [
   "running-unknown",
   "failed-build",
   "failed-no-target",
-  "exposed",
-  "exposed-expiring",
   "off",
 ] as const;
 
@@ -106,30 +104,6 @@ export function demoBanner(state: DemoBannerState): BannerRow[] {
           dismissible: true,
           lookId: "lk_demo",
           watermark: "failed:lk_demo",
-        },
-      ];
-    case "exposed":
-      return [
-        {
-          id: "demo-exposure",
-          kind: "exposure",
-          sentence: "Simulator exposed to your bb account — 27 more minutes",
-          tone: "exposed",
-          dismissible: false,
-          lookId: null,
-          watermark: null,
-        },
-      ];
-    case "exposed-expiring":
-      return [
-        {
-          id: "demo-exposure",
-          kind: "exposure",
-          sentence: "Simulator exposed to your bb account — less than a minute left",
-          tone: "exposed",
-          dismissible: false,
-          lookId: null,
-          watermark: null,
         },
       ];
     case "off":

@@ -68,14 +68,6 @@ export function formatAgo(then: number, now: number): string {
   return days === 1 ? "yesterday" : `${days} days ago`;
 }
 
-/** The exposure countdown. Minutes, never `27:14`. */
-export function formatRemaining(msLeft: number): string {
-  if (msLeft <= 0) return "expired";
-  const minutes = Math.floor(msLeft / 60_000);
-  if (minutes < 1) return "less than a minute left";
-  return minutes === 1 ? "1 more minute" : `${minutes} more minutes`;
-}
-
 /** A commit for display. Short, and never presented as if it were the full sha. */
 export function shortSha(sha: string | null): string | null {
   if (sha === null || sha.length < 7) return sha;

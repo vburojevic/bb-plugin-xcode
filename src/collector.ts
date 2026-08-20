@@ -6,9 +6,10 @@
  * state; the collector owns none beyond caches.
  */
 
-import { readFile, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { join } from "node:path";
 
+import { readTextFileBounded } from "./bounded-file";
 import { Engine } from "./engine";
 import {
   discoverDefaultRoots,
@@ -62,6 +63,8 @@ export interface CollectorDeps {
  */
 const SIM_REFRESH_BUSY_MS = 20_000;
 const SIM_REFRESH_IDLE_MS = 10 * 60_000;
+/** Xcode's plist is normally KB; this prevents a corrupt root from exhausting the server. */
+export const MAX_LOG_MANIFEST_BYTES = 32 * 1024 * 1024;
 
 export interface CollectorSettings {
   scanProjects: boolean;
@@ -328,7 +331,7 @@ export class Collector {
         );
         let xml: string;
         try {
-          xml = await readFile(manifestPath, "utf8");
+          xml = await readTextFileBounded(manifestPath, MAX_LOG_MANIFEST_BYTES);
         } catch {
           continue;
         }

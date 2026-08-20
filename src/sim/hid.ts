@@ -30,6 +30,10 @@
  */
 import { WebSocket } from "ws";
 
+export const HID_MAX_MESSAGE_BYTES = 4096;
+export const HID_HANDSHAKE_TIMEOUT_MS = 5000;
+export const HID_MAX_SCREEN_EDGE = 32_768;
+
 // ---------------------------------------------------------------------------
 // Tags — verified byte-for-byte against serve-sim 0.1.45's DeviceSession
 // ---------------------------------------------------------------------------
@@ -169,7 +173,14 @@ export function decodeConfig(data: Buffer): ScreenConfig | null {
     const raw = JSON.parse(data.subarray(1).toString("utf8")) as Record<string, unknown>;
     const width = typeof raw.width === "number" ? raw.width : 0;
     const height = typeof raw.height === "number" ? raw.height : 0;
-    if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+    if (
+      !Number.isInteger(width) ||
+      !Number.isInteger(height) ||
+      width <= 0 ||
+      height <= 0 ||
+      width > HID_MAX_SCREEN_EDGE ||
+      height > HID_MAX_SCREEN_EDGE
+    ) return null;
     return {
       width,
       height,
@@ -375,7 +386,12 @@ export class HidSocket {
     const headers = { "x-xcode-simulators-key": this.options.secret };
     const socket = this.options.connect
       ? this.options.connect(url, headers)
-      : new WebSocket(url, { headers });
+      : new WebSocket(url, {
+          headers,
+          handshakeTimeout: HID_HANDSHAKE_TIMEOUT_MS,
+          maxPayload: HID_MAX_MESSAGE_BYTES,
+          perMessageDeflate: false,
+        });
     this.socket = socket;
 
     return new Promise<void>((resolve, reject) => {

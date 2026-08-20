@@ -2,7 +2,7 @@
  * A confirmation that says what it will end.
  *
  * "Are you sure?" is not a confirmation; it is a speed bump. Every use of this
- * passes a body naming the consequence — an active exposure, a queued render —
+ * passes a body naming the consequence — an erase, a queued render —
  * because the only reason to interrupt someone is to tell them something they
  * did not know.
  */

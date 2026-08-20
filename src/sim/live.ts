@@ -150,6 +150,10 @@ export class LiveService {
       onExit: ({ code, signal, expected }) => this.handleHostExit(code, signal, expected),
     })
       .then((handle) => {
+        if (this.disposed) {
+          handle.stop();
+          throw new Error("The simulator service was disposed while its capture host started.");
+        }
         this.child = handle;
         this.starting = null;
         if (handle.addonLoaded === false) {
@@ -759,8 +763,11 @@ export class LiveService {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    const starting = this.starting;
     this.clearIdleTimers();
     await this.detachDevice();
+    this.stopHost();
+    await starting?.catch(() => undefined);
     this.stopHost();
   }
 }

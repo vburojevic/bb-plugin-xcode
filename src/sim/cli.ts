@@ -13,12 +13,11 @@
  * invoking host and goes through `bb.sdk.files`, never `node:fs` against a
  * `ctx.cwd`-relative path.
  *
- * **Anything that grants access asks a human.** `bb sims expose` routes through
- * `bb.ui.requestInput`; without a thread to ask in, it refuses and points at
- * the panel. Otherwise the no-tool rule for exposure is decoration, because an
- * agent can run the CLI.
+ * **Remote viewing stays in bb.** The CLI never opens, shares, or returns a
+ * simulator network endpoint. The main bb panel owns that surface.
  */
 import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@bb/plugin-sdk";
+import { isAbsolute, relative, resolve } from "node:path";
 import type { Ctx } from "./context.js";
 import { overallState } from "./preflight.js";
 import { SimctlError } from "./devices.js";
@@ -26,9 +25,7 @@ import { getLook, listFrames } from "./frames.js";
 import { LOOK_ID_PATTERN } from "./model.js";
 import { formatBytes } from "./format.js";
 import { DEMO_BANNER_STATES, isDemoBannerState } from "./demos.js";
-import { TEARDOWN_WARNING } from "./connect.js";
-import { HIDDEN_LINK } from "./guard.js";
-import { captureNow, makeRpcHandlers, streamUrlFor } from "./rpc.js";
+import { captureNow, makeRpcHandlers } from "./rpc.js";
 import { DriveScriptError, parseDriveScript } from "./drive-script.js";
 import { executeStep } from "./steps.js";
 import { makeResolver, movesTheScreen } from "./tools.js";
@@ -88,14 +85,13 @@ export function positionals(argv: readonly string[]): string[] {
 
 export const CLI_COMMANDS = [
   { name: "doctor", summary: "Every prerequisite, its state, and the fix", usage: "bb sims doctor [--json]" },
-  { name: "status", summary: "Exposure, live device, last look", usage: "bb sims status [--json]" },
+  { name: "status", summary: "Live device and current state", usage: "bb sims status [--json]" },
   {
     name: "devices",
     summary: "Simulators, marking booted and which is live",
     usage: "bb sims devices [--json]",
   },
   { name: "live", summary: "Start or stop the live surface", usage: "bb sims live [<device>] [--stop]" },
-  { name: "url", summary: "The local viewer URL for the current device", usage: "bb sims url [--json]" },
   {
     name: "shot",
     summary: "Capture one frame",
@@ -126,12 +122,6 @@ export const CLI_COMMANDS = [
     summary: "Show, set or clear the baseline",
     usage: "bb sims baseline [show | set <lookId> | clear]",
   },
-  {
-    name: "expose",
-    summary: "Share the simulator through bb connect, once a human confirms",
-    usage: "bb sims expose [--minutes N]",
-  },
-  { name: "unexpose", summary: "Stop sharing", usage: "bb sims unexpose" },
   {
     name: "demos",
     summary: "List the demo states this plugin can render with no hardware",
@@ -164,6 +154,20 @@ export const CLI_COMMANDS = [
   },
 ];
 
+const AGENT_CAPTURE_COMMANDS = new Set([
+  "status",
+  "devices",
+  "live",
+  "shot",
+  "drive",
+  "stills",
+  "look",
+  "history",
+  "baseline",
+  "card",
+  "diff",
+]);
+
 /**
  * A context whose project scope comes from the invocation rather than from
  * "whichever project bb lists first".
@@ -177,13 +181,39 @@ export function forInvocation(ctx: Ctx, cliCtx: CliContext): Ctx {
     ...(cliCtx.projectId === undefined ? {} : { projectId: cliCtx.projectId }),
     ...(cliCtx.cwd === undefined ? {} : { cwd: cliCtx.cwd }),
   };
-  return { ...ctx, scopeForThread: () => ctx.scopeForInvocation(hints) };
+  // `cwd` is supplied by the invoking bb CLI itself. A bare thread/project id
+  // is caller-selectable routing data and cannot authorize reading that
+  // checkout's stored images or verdicts.
+  const hasInvocationCheckout = cliCtx.cwd !== undefined;
+  return {
+    ...ctx,
+    // An empty CLI context is not the panel's trusted "current project"
+    // request. It carries no authority to inherit the first project in bb.
+    scopeForThread: () =>
+      hasInvocationCheckout ? ctx.scopeForInvocation(hints) : Promise.resolve(null),
+  };
 }
+
+async function scopedLook(ctx: Ctx, lookId: string): Promise<ReturnType<typeof getLook>> {
+  const scope = await ctx.scopeForThread(null);
+  if (scope === null) return null;
+  const look = getLook(ctx.db, lookId);
+  return look?.scopeKey === scope.scope.scopeKey ? look : null;
+}
+
+const NO_INVOCATION_SCOPE =
+  "Run this command from the bb thread checkout whose simulator data you want to access.\n";
 
 export function makeCli(base: Ctx) {
   return async function run(argv: string[], cliCtx: CliContext): Promise<CliResult> {
     const ctx = forInvocation(base, cliCtx);
     const command = argv[0] ?? "";
+    if (!ctx.settings().allowAgentCapture && AGENT_CAPTURE_COMMANDS.has(command)) {
+      return {
+        exitCode: 1,
+        stderr: "Simulator agent access is disabled in Xcode plugin settings. Use the human-owned panel instead.\n",
+      };
+    }
     switch (command) {
       case "doctor":
         return doctor(ctx, argv);
@@ -193,29 +223,22 @@ export function makeCli(base: Ctx) {
         return devices(ctx, argv);
       case "live":
         return live(ctx, argv);
-      case "url":
-        return url(ctx, argv);
       case "shot":
         return shot(ctx, argv, cliCtx);
       case "drive":
         return drive(ctx, argv);
       case "stills":
-        return stills(ctx, argv);
+        return stills(ctx, argv, cliCtx);
       case "onboard":
-        return onboard(ctx, argv);
+        return onboard(ctx, argv, cliCtx);
       case "look":
         return look(ctx, argv);
       case "history":
         return history(ctx, argv);
       case "baseline":
-        return baseline(ctx, argv);
-      case "expose":
-        return expose(ctx, argv, cliCtx);
-      case "unexpose":
-        ctx.exposure.stop();
-        return { exitCode: 0, stdout: "Stopped.\n" };
+        return baseline(ctx, argv, cliCtx);
       case "purge":
-        return purge(ctx, argv);
+        return purge(ctx, argv, cliCtx);
       case "demos":
         return {
           exitCode: 0,
@@ -276,8 +299,6 @@ async function status(ctx: Ctx, argv: string[]): Promise<CliResult> {
       screen: state.screen,
       foregroundBundleId: state.foregroundBundleId,
     },
-    // A capability token never appears in a status read.
-    exposure: ctx.exposure.current() === null ? "not exposed" : HIDDEN_LINK,
   };
   if (wantsJson(argv)) return json(payload);
 
@@ -292,9 +313,7 @@ async function status(ctx: Ctx, argv: string[]): Promise<CliResult> {
           : state.kind === "dead"
             ? `${device.name} shut down.`
             : `${device.name}: ${state.kind}.`;
-  const exposure = ctx.exposure.current();
-  const exposureLine = exposure === null ? "Not exposed." : HIDDEN_LINK;
-  return { exitCode: 0, stdout: fit(`${liveLine}\n${exposureLine}\n`) };
+  return { exitCode: 0, stdout: fit(`${liveLine}\n`) };
 }
 
 async function devices(ctx: Ctx, argv: string[]): Promise<CliResult> {
@@ -350,29 +369,6 @@ async function live(ctx: Ctx, argv: string[]): Promise<CliResult> {
 }
 
 /**
- * The viewer URL for the current device.
- *
- * This is the plugin's own stream route on the bb server, not the capture
- * host's loopback port. The capture host refuses any request without the
- * per-boot secret, and printing that secret to stdout would hand it to whatever
- * ran the command — including an agent. The bb route needs no secret, works in
- * any browser on this Mac, and is the same URL the panel uses.
- */
-async function url(ctx: Ctx, argv: string[]): Promise<CliResult> {
-  const state = ctx.live.state();
-  if (state.device === null) {
-    return { exitCode: 1, stderr: "No simulator is running. Start one with `bb sims live`.\n" };
-  }
-  const base = ctx.loopbackBaseUrl();
-  if (base === null) {
-    return { exitCode: 1, stderr: "The bb server is not listening yet. Try again in a moment.\n" };
-  }
-  const value = `${base}${streamUrlFor(ctx.pluginId, state) ?? ""}`;
-  if (wantsJson(argv)) return json({ url: value, device: state.device });
-  return { exitCode: 0, stdout: `${value}\n` };
-}
-
-/**
  * Capture one frame.
  *
  * `--out` names a file on the **invoking** machine, not on the server's
@@ -389,6 +385,50 @@ async function shot(ctx: Ctx, argv: string[], cliCtx: CliContext): Promise<CliRe
   const label = flagValue(argv, "label");
   const out = flagValue(argv, "out");
 
+  let output: { path: string; rootPath: string } | null = null;
+  if (out !== null) {
+    if (isAbsolute(out)) {
+      return { exitCode: 1, stderr: "--out must be a path inside this thread's checkout, not an absolute path.\n" };
+    }
+    if (cliCtx.threadId === undefined) {
+      return { exitCode: 1, stderr: "--out needs a thread checkout so the write can be confined safely.\n" };
+    }
+    const scope = await ctx.scopeForInvocation({
+      threadId: cliCtx.threadId,
+      projectId: cliCtx.projectId,
+      cwd: cliCtx.cwd,
+    });
+    if (scope === null) return { exitCode: 1, stderr: "Could not resolve this thread's checkout.\n" };
+    const rootPath = scope.scope.checkoutPath;
+    const base = cliCtx.cwd ?? rootPath;
+    const target = resolve(base, out);
+    const fromRoot = relative(rootPath, target);
+    if (fromRoot === ".." || fromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(fromRoot)) {
+      return { exitCode: 1, stderr: "--out must stay inside this thread's checkout.\n" };
+    }
+    output = { path: target, rootPath };
+    const approved = await ctx.confirmAction(
+      {
+        threadId: cliCtx.threadId,
+        projectId: cliCtx.projectId,
+      },
+      {
+        title: "Write this simulator capture into the checkout?",
+        facts: [
+          `Destination: ${target}`,
+          "The write is create-only and will not replace an existing file.",
+        ],
+        confirmLabel: "Write capture",
+      },
+    );
+    if (!approved) {
+      return {
+        exitCode: 1,
+        stderr: "Writing the simulator capture was not confirmed.\n",
+      };
+    }
+  }
+
   let result;
   try {
     result = await captureNow(ctx, label);
@@ -396,8 +436,13 @@ async function shot(ctx: Ctx, argv: string[], cliCtx: CliContext): Promise<CliRe
     return { exitCode: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
   }
 
-  if (out !== null) {
-    const written = await ctx.writeToInvokingHost(cliCtx.threadId ?? null, out, result.frameId);
+  if (output !== null) {
+    const written = await ctx.writeToInvokingHost(
+      cliCtx.threadId ?? null,
+      output.path,
+      output.rootPath,
+      result.frameId,
+    );
     if (written.ok) {
       return {
         exitCode: 0,
@@ -474,10 +519,21 @@ async function drive(ctx: Ctx, argv: string[]): Promise<CliResult> {
   return { exitCode: 0, stdout: fit(`${log.join("\n")}\n`) };
 }
 
-async function stills(ctx: Ctx, argv: string[]): Promise<CliResult> {
+async function stills(
+  ctx: Ctx,
+  argv: string[],
+  cliCtx: CliContext,
+): Promise<CliResult> {
+  if ((await ctx.scopeForThread(null)) === null) {
+    return { exitCode: 1, stderr: NO_INVOCATION_SCOPE };
+  }
   const handlers = makeRpcHandlers(ctx);
   const device = flagValue(argv, "device");
-  const result = await handlers.stillsRun(device === null ? {} : { device });
+  const result = await handlers.stillsRun({
+    ...(device === null ? {} : { device }),
+    ...(cliCtx.threadId === undefined ? {} : { threadId: cliCtx.threadId }),
+    ...(cliCtx.projectId === undefined ? {} : { projectId: cliCtx.projectId }),
+  });
   if (result.error !== null) return { exitCode: 1, stderr: `${result.error}\n` };
   // The run takes minutes and reports itself in the panel; blocking a terminal
   // on it would be a worse version of watching the panel.
@@ -490,7 +546,11 @@ async function stills(ctx: Ctx, argv: string[]): Promise<CliResult> {
  * written. `--apply` writes only the files that can be written safely; the
  * pbxproj is never rewritten.
  */
-async function onboard(ctx: Ctx, argv: string[]): Promise<CliResult> {
+async function onboard(
+  ctx: Ctx,
+  argv: string[],
+  cliCtx: CliContext,
+): Promise<CliResult> {
   const handlers = makeRpcHandlers(ctx);
   const project = flagValue(argv, "project");
   const plan = await handlers.onboardPlan(project === null ? { wait: true } : { project, wait: true });
@@ -540,6 +600,22 @@ async function onboard(ctx: Ctx, argv: string[]): Promise<CliResult> {
     return { exitCode: 0, stdout: fit(`${lines.join("\n")}\n`) };
   }
 
+  const approved = await ctx.confirmAction(
+    { threadId: cliCtx.threadId, projectId: cliCtx.projectId },
+    {
+      title: "Write the Stills onboarding files?",
+      facts: [
+        `Checkout: ${plan.searched ?? "the resolved project checkout"}`,
+        ...plan.files.map((file) => `Create: ${file.relPath}`).slice(0, 20),
+        "Writes are create-only and will not replace existing files.",
+      ],
+      confirmLabel: "Write onboarding files",
+    },
+  );
+  if (!approved) {
+    return { exitCode: 1, stderr: "Stills onboarding was not confirmed.\n" };
+  }
+
   const applied = await handlers.onboardApply(project === null ? {} : { project });
   if (applied.error !== null) return { exitCode: 1, stderr: `${applied.error}\n` };
   lines.push(
@@ -557,6 +633,12 @@ async function onboard(ctx: Ctx, argv: string[]): Promise<CliResult> {
 async function look(ctx: Ctx, argv: string[]): Promise<CliResult> {
   const handlers = makeRpcHandlers(ctx);
   const lookId = positionals(argv)[0];
+  if (lookId !== undefined && (await scopedLook(ctx, lookId)) === null) {
+    return { exitCode: 1, stderr: `No run called ${lookId}.\n` };
+  }
+  if (lookId === undefined && (await ctx.scopeForThread(null)) === null) {
+    return { exitCode: 1, stderr: NO_INVOCATION_SCOPE };
+  }
   const summary = await handlers.stillsLatest(lookId === undefined ? {} : { lookId });
   if (wantsJson(argv)) return json(summary);
   if (summary.lookId === null) return { exitCode: 0, stdout: "Nothing has run yet.\n" };
@@ -581,6 +663,9 @@ async function history(ctx: Ctx, argv: string[]): Promise<CliResult> {
   if (identity === undefined) {
     return { exitCode: 2, stderr: "Which preview? Try: bb sims history preview:MyApp_LoginView.swift_Dark.png\n" };
   }
+  if ((await ctx.scopeForThread(null)) === null) {
+    return { exitCode: 1, stderr: NO_INVOCATION_SCOPE };
+  }
   const handlers = makeRpcHandlers(ctx);
   const result = await handlers.stillsIdentityHistory({ identity });
   if (wantsJson(argv)) return json(result);
@@ -594,9 +679,15 @@ async function history(ctx: Ctx, argv: string[]): Promise<CliResult> {
   return { exitCode: 0, stdout: fit(`${identity}\n${lines.join("\n")}\n`) };
 }
 
-async function baseline(ctx: Ctx, argv: string[]): Promise<CliResult> {
+async function baseline(
+  ctx: Ctx,
+  argv: string[],
+  cliCtx: CliContext,
+): Promise<CliResult> {
   const handlers = makeRpcHandlers(ctx);
   const sub = positionals(argv)[0] ?? "show";
+  const scope = await ctx.scopeForThread(null);
+  if (scope === null) return { exitCode: 1, stderr: NO_INVOCATION_SCOPE };
   if (sub === "show") {
     const current = await handlers.baselineShow();
     if (wantsJson(argv)) return json(current);
@@ -613,12 +704,33 @@ async function baseline(ctx: Ctx, argv: string[]): Promise<CliResult> {
     };
   }
   if (sub === "clear") {
+    const approved = await ctx.confirmAction(
+      { threadId: cliCtx.threadId, projectId: cliCtx.projectId },
+      {
+        title: "Clear this project's preview baseline?",
+        facts: ["Future preview runs will compare against the previous run instead."],
+        confirmLabel: "Clear baseline",
+      },
+    );
+    if (!approved) return { exitCode: 1, stderr: "Clearing the baseline was not confirmed.\n" };
     await handlers.baselineClear();
     return { exitCode: 0, stdout: "Cleared. Runs now compare against the previous run.\n" };
   }
   if (sub === "set") {
     const lookId = positionals(argv)[1];
     if (lookId === undefined) return { exitCode: 2, stderr: "Which run? bb sims baseline set <lookId>\n" };
+    if ((await scopedLook(ctx, lookId)) === null) {
+      return { exitCode: 1, stderr: `No run called ${lookId}.\n` };
+    }
+    const approved = await ctx.confirmAction(
+      { threadId: cliCtx.threadId, projectId: cliCtx.projectId },
+      {
+        title: "Replace this project's preview baseline?",
+        facts: [`New baseline: ${lookId}`],
+        confirmLabel: "Set baseline",
+      },
+    );
+    if (!approved) return { exitCode: 1, stderr: "Setting the baseline was not confirmed.\n" };
     const result = await handlers.baselineSet({ lookId });
     if (!result.ok) return { exitCode: 1, stderr: `No run called ${lookId}.\n` };
     return {
@@ -644,7 +756,7 @@ async function card(ctx: Ctx, argv: string[]): Promise<CliResult> {
   if (!LOOK_ID_PATTERN.test(lookId)) {
     return { exitCode: 2, stderr: `"${lookId}" is not a run id.\n` };
   }
-  const look = getLook(ctx.db, lookId);
+  const look = await scopedLook(ctx, lookId);
   if (look === null) return { exitCode: 1, stderr: `No run called ${lookId}.\n` };
   return { exitCode: 0, stdout: `::xcode-simulators{look="${lookId}"}\n` };
 }
@@ -661,8 +773,7 @@ async function diffRuns(ctx: Ctx, argv: string[]): Promise<CliResult> {
   if (a === undefined || b === undefined) {
     return { exitCode: 2, stderr: "bb sims diff <lookA> <lookB>\n" };
   }
-  const lookA = getLook(ctx.db, a);
-  const lookB = getLook(ctx.db, b);
+  const [lookA, lookB] = await Promise.all([scopedLook(ctx, a), scopedLook(ctx, b)]);
   if (lookA === null || lookB === null) {
     return { exitCode: 1, stderr: `No run called ${lookA === null ? a : b}.\n` };
   }
@@ -702,47 +813,6 @@ async function diffRuns(ctx: Ctx, argv: string[]): Promise<CliResult> {
 }
 
 /**
- * Share the simulator, once a human says so.
- *
- * This routes through `bb.ui.requestInput` against the invoking thread, so the
- * person confirms in the composer. Without that, the "there is no
- * simulator_expose tool" rule would be decoration: an agent can run the CLI.
- * With no thread to ask in, it refuses and points at the panel.
- */
-async function expose(ctx: Ctx, _argv: string[], cliCtx: CliContext): Promise<CliResult> {
-  // The consent check comes first, before any capability check. It is the
-  // load-bearing one: an agent that can reach this command must still end up
-  // waiting on a human, whatever the state of bb connect.
-  if (cliCtx.threadId === undefined) {
-    return {
-      exitCode: 1,
-      stderr:
-        "Exposing the simulator needs a person to confirm, and there is no thread here to ask in. Use the Expose control in the Simulators panel.\n",
-    };
-  }
-
-  const availability = await ctx.exposure.availability();
-  if (!availability.available) {
-    return { exitCode: 1, stderr: `${availability.reason ?? "Exposure is unavailable."}\n` };
-  }
-
-  const consent = await ctx.exposure.consent();
-  if (consent === null) return { exitCode: 1, stderr: "No simulator is running.\n" };
-
-  const answer = await ctx.confirmInThread(cliCtx.threadId, consent);
-  if (!answer) return { exitCode: 1, stderr: "Not exposed.\n" };
-
-  const result = await ctx.exposure.start();
-  if (result.error !== null) return { exitCode: 1, stderr: `${result.error}\n` };
-  // Printed once, here, and never again: `bb sims status` says the link is
-  // hidden rather than repeating it.
-  return {
-    exitCode: 0,
-    stdout: `${result.url}\n\n${TEARDOWN_WARNING}\nThis link is printed once. Reopen the panel to see it again.\n`,
-  };
-}
-
-/**
  * Report, then remove.
  *
  * `--dry-run` reports and stops. Uninstalling the plugin leaves the frames
@@ -750,7 +820,7 @@ async function expose(ctx: Ctx, _argv: string[], cliCtx: CliContext): Promise<Cl
  * and a command that deletes without first saying how much is a command people
  * learn not to run.
  */
-async function purge(ctx: Ctx, argv: string[]): Promise<CliResult> {
+async function purge(ctx: Ctx, argv: string[], cliCtx: CliContext): Promise<CliResult> {
   const handlers = makeRpcHandlers(ctx);
   const preview = await handlers.purgePreview();
   if (wantsJson(argv)) return json(preview);
@@ -763,7 +833,21 @@ async function purge(ctx: Ctx, argv: string[]): Promise<CliResult> {
       stdout: `${preview.sentence}\n${preview.looks} run(s) across ${preview.scopes} project(s). Nothing has been removed.\n`,
     };
   }
-  const result = await handlers.purgeApply();
+  if (cliCtx.threadId === undefined && cliCtx.projectId === undefined) {
+    return {
+      exitCode: 1,
+      stderr: "Purging needs a person to confirm in a recent thread. Run it from a bb thread.\n",
+    };
+  }
+  let result;
+  try {
+    result = await handlers.purgeApply({
+      threadId: cliCtx.threadId ?? null,
+      projectId: cliCtx.projectId ?? null,
+    });
+  } catch (error) {
+    return { exitCode: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
+  }
   return {
     exitCode: 0,
     stdout: `Removed ${result.looks} run(s), freeing ${formatBytes(result.bytes)}.\n`,

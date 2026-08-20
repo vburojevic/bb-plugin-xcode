@@ -7,6 +7,7 @@
  * tool — ask for JSON or a machine-readable flag, or do not ask.
  */
 import { spawn } from "node:child_process";
+import { curatedChildEnv } from "../child-env.js";
 
 export interface RunResult {
   code: number | null;
@@ -29,6 +30,21 @@ export interface RunOptions {
 
 const DEFAULT_MAX_BUFFER = 1024 * 1024;
 
+const SYSTEM_EXECUTABLES: Readonly<Record<string, string>> = {
+  git: "/usr/bin/git",
+  plutil: "/usr/bin/plutil",
+  sips: "/usr/bin/sips",
+  sw_vers: "/usr/bin/sw_vers",
+  "xcode-select": "/usr/bin/xcode-select",
+  xcodebuild: "/usr/bin/xcodebuild",
+  xcrun: "/usr/bin/xcrun",
+};
+
+/** Resolve every Apple/system helper without trusting the server's PATH. */
+export function trustedExecutable(command: string): string {
+  return SYSTEM_EXECUTABLES[command] ?? command;
+}
+
 /**
  * Run a command to completion.
  *
@@ -38,13 +54,16 @@ const DEFAULT_MAX_BUFFER = 1024 * 1024;
  */
 export function run(command: string, args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
   const maxBuffer = options.maxBuffer ?? DEFAULT_MAX_BUFFER;
+  const executable = trustedExecutable(command);
 
   return new Promise<RunResult>((resolve, reject) => {
     let child;
     try {
-      child = spawn(command, [...args], {
+      child = spawn(executable, [...args], {
         cwd: options.cwd,
-        env: options.env,
+        // Native helpers and third-party binaries do not need provider,
+        // tunnel, or plugin credentials from the long-lived bb server.
+        env: options.env ?? curatedChildEnv(process.env),
         stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       });
     } catch (error) {
@@ -86,6 +105,7 @@ export function run(command: string, args: readonly string[], options: RunOption
       kill();
     };
     options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted === true) onAbort();
 
     const finish = (result: RunResult): void => {
       if (settled) return;

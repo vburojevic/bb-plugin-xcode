@@ -429,9 +429,26 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     projectName: (id) => dto.projectName(id),
     phaseFor,
     refreshProjectNames: () => dto.refreshProjectNames(),
-    rescan: runRescan,
+    scopeFor: (threadId) => scopeSync.bounded(threadId),
     wrapped,
     onShimStateKnown,
+    confirmHostAction: async (threadId, consent) => {
+      try {
+        const result = await bb.ui.requestInput({
+          threadId,
+          rendererId: "server-confirm",
+          title: consent.title,
+          payload: {
+            facts: consent.facts,
+            confirmLabel: consent.confirmLabel,
+          },
+          timeoutMs: 120_000,
+        });
+        return result.outcome === "submitted" && result.value === true;
+      } catch {
+        return false;
+      }
+    },
   });
 
   // ------------------------------------------------------------------- RPC

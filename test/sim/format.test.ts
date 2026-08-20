@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatAgo, formatBytes, formatDuration, formatRatio, formatRemaining, joinWords, shortSha } from "../../src/sim/format.js";
+import { formatAgo, formatBytes, formatDuration, formatRatio, joinWords, shortSha } from "../../src/sim/format.js";
 import { normalizeSettings, parseUserNumber } from "../../src/sim/settings.js";
 
 /**
@@ -54,17 +54,6 @@ describe("relative time", () => {
   });
 });
 
-describe("the exposure countdown", () => {
-  it("is minutes, never a second-precision animation", () => {
-    // A 1Hz countdown re-renders the prompt stack once a second for half an
-    // hour, for a number nobody is reading that precisely.
-    expect(formatRemaining(27 * 60_000 + 14_000)).toBe("27 more minutes");
-    expect(formatRemaining(60_000)).toBe("1 more minute");
-    expect(formatRemaining(30_000)).toBe("less than a minute left");
-    expect(formatRemaining(0)).toBe("expired");
-  });
-});
-
 describe("words", () => {
   it("joins a list the way a sentence does", () => {
     expect(joinWords([])).toBe("");
@@ -104,13 +93,10 @@ describe("settings normalization", () => {
       diffThreshold: "5",
       retainLooks: "0",
       diskBudgetMb: "1",
-      exposeTtlMinutes: "9999",
     });
     expect(settings.diffThreshold).toBe(1);
     expect(settings.retainLooks).toBe(1);
     expect(settings.diskBudgetMb).toBe(64);
-    // Four hours is already generous.
-    expect(settings.exposeTtlMinutes).toBe(240);
   });
 
   it("defaults everything that is absent", () => {
@@ -118,9 +104,8 @@ describe("settings normalization", () => {
     expect(settings.diffThreshold).toBe(0.01);
     expect(settings.retainLooks).toBe(20);
     expect(settings.diskBudgetMb).toBe(2048);
-    expect(settings.exposeTtlMinutes).toBe(30);
     expect(settings.showDeviceChrome).toBe(false);
-    expect(settings.allowAgentCapture).toBe(true);
+    expect(settings.allowAgentCapture).toBe(false);
   });
 
   it("keeps a threshold of exactly zero, which is a legitimate choice", () => {

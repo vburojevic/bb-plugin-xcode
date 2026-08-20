@@ -140,31 +140,32 @@ export function applyStreamEvent(
 /**
  * Rewrite an xcodebuild argv so it emits a result bundle and a live stream.
  *
- * Existing `-resultBundlePath` / `-resultStreamPath` flags are respected rather
- * than duplicated, so wrapping a command that already sets them is safe.
+ * Result paths are always owned by the plugin. Caller-selected paths let an
+ * agent make the shared server tail an arbitrary huge file, or make xcodebuild
+ * create artifacts outside the checkout. Existing flags are replaced.
  */
 export function injectStreamFlags(
   argv: readonly string[],
   bundlePath: string,
   streamPath: string,
 ): { argv: string[]; bundlePath: string; streamPath: string } {
-  const out = [...argv];
-
-  const existingBundle = valueOf(out, "-resultBundlePath");
-  const resolvedBundle = existingBundle ?? bundlePath;
-  if (!existingBundle) out.push("-resultBundlePath", resolvedBundle);
-
-  const existingStream = valueOf(out, "-resultStreamPath");
-  const resolvedStream = existingStream ?? streamPath;
-  if (!existingStream) out.push("-resultStreamPath", resolvedStream);
-
-  return { argv: out, bundlePath: resolvedBundle, streamPath: resolvedStream };
+  const out = withoutValueFlags(argv, ["-resultBundlePath", "-resultStreamPath"]);
+  out.push("-resultBundlePath", bundlePath, "-resultStreamPath", streamPath);
+  return { argv: out, bundlePath, streamPath };
 }
 
-function valueOf(argv: readonly string[], flag: string): string | null {
-  const index = argv.indexOf(flag);
-  if (index === -1 || index + 1 >= argv.length) return null;
-  return argv[index + 1] ?? null;
+function withoutValueFlags(argv: readonly string[], flags: readonly string[]): string[] {
+  const out: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!;
+    if (flags.includes(arg)) {
+      index += 1;
+      continue;
+    }
+    if (flags.some((flag) => arg.startsWith(`${flag}=`))) continue;
+    out.push(arg);
+  }
+  return out;
 }
 
 /**

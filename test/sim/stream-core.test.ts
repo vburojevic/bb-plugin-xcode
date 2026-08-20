@@ -28,7 +28,7 @@ describe("who may use the direct route", () => {
   });
 
   it("a page on another host may not — its 127.0.0.1 is the wrong machine", () => {
-    // Every `bb connect` viewer looks like this.
+    // Every remote bb viewer looks like this.
     expect(viewerCanReachLoopback({ protocol: "https:", hostname: "veki.getbb.app" })).toBe(false);
     expect(viewerCanReachLoopback({ protocol: "http:", hostname: "veki.getbb.app" })).toBe(false);
   });

@@ -16,9 +16,7 @@
  * `safely`, and every fire-and-forget through `detach`.
  */
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { z } from "zod";
-import { Readable } from "node:stream";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 
 import { rpcContract } from "./contract.js";
@@ -26,7 +24,7 @@ import { CHANNEL } from "./channel.js";
 import { prepareConnection } from "./store.js";
 import { dataDirOf, framesRootOf, type Ctx, type ThreadScope } from "./context.js";
 import { FrameStore } from "./framestore.js";
-import { getFrame, getLook, linkThread, listVerdicts } from "./frames.js";
+import { getFrame, getLook, linkThread, listVerdicts, totalBytes } from "./frames.js";
 import type { Db } from "./store.js";
 import { contentTypeOf } from "./image.js";
 import { FRAME_ID_PATTERN, LOOK_ID_PATTERN } from "./model.js";
@@ -41,21 +39,27 @@ import { gitHead, resolveScope } from "./scope.js";
 import { locateCheckout, describeCheckoutLocation, resolveServerHostId } from "./hostcheck.js";
 import { LeaseRegistry } from "./lease.js";
 import { DeviceQueue } from "./queue.js";
-import { ExposureGuard, consentText } from "./guard.js";
-import { startViewer, type ViewerHandle } from "./viewer.js";
-import { CONNECT_REASONS, detectConnect, publicUrl } from "./connect.js";
-import { CONNECT_PLUGIN_ID, PeerDetector, XCODE_PLUGIN_ID } from "./peers.js";
 import { runAndCompare, summarizeLook } from "./stills-rpc.js";
 import { detectProject, findCandidates, shapeOf } from "./onboard.js";
 import { DetectCache } from "./detect-cache.js";
 import { deviceKey } from "./model.js";
 import { findDeviceByNameOrUdid, pickDefaultDevice } from "./devices.js";
 import { GLOBAL_INSTRUCTIONS, makeCaptureTool, makeDriveTool, makeStillsTool } from "./tools.js";
-import { applyPrune, planPrune, sweepServeSimLogs } from "./prune.js";
+import { applyPrune, planPrune, sweepLegacyStillsResults, sweepServeSimLogs } from "./prune.js";
 import { DEMO_TTL_MS, type DemoState } from "./demos.js";
 import { coalesce, detach, safely } from "./safe.js";
 import * as simhost from "./sim-host-client.js";
 import type { RunDestination } from "./pick.js";
+import {
+  ConnectionLimit,
+  MAX_PANEL_PRESENCES,
+  MAX_PANEL_STREAMS,
+} from "./connection-limit.js";
+import {
+  makePresenceRouteHandler,
+  makeStreamRouteHandler,
+  type PrivateStreamRouteDeps,
+} from "./private-stream-routes.js";
 
 export { rpcContract };
 
@@ -119,9 +123,6 @@ export type SimulatorCliRun = (
 export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): Promise<void> {
   let disposed = false;
   const isDisposed = (): boolean => disposed;
-  bb.onDispose(() => {
-    disposed = true;
-  });
 
   const log = (level: "info" | "warn" | "error", message: string): void => {
     safely(isDisposed, () => bb.log[level](message));
@@ -176,7 +177,7 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // Realtime, coalesced
   // ---------------------------------------------------------------------------
 
-  const pending = new Set<"look" | "live" | "exposure">();
+  const pending = new Set<"look" | "live">();
   const flush = coalesce(PUBLISH_FLOOR_MS, () => {
     const kinds = [...pending];
     pending.clear();
@@ -184,7 +185,7 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
       safely(isDisposed, () => bb.realtime.publish(CHANNEL, { kind }));
     }
   });
-  const publish = (kind: "look" | "live" | "exposure"): void => {
+  const publish = (kind: "look" | "live"): void => {
     if (disposed) return;
     pending.add(kind);
     flush.schedule();
@@ -197,7 +198,6 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   const driver = new DeviceDriver();
   const simHost = resolveSimHostPath(import.meta.url);
   log("info", `capture host at ${simHost.path}`);
-
   const live = new LiveService({
     driver,
     spawn: () => ({
@@ -226,14 +226,6 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // by design, so two projects rendering at once would otherwise both pass a
   // scope-keyed in-flight check and drive the same device.
   const queue = new DeviceQueue();
-
-  // One list read in response to an action, cached for a minute. Never a
-  // schedule, and never a cross-plugin RPC call — a skew in a peer's RPC
-  // contract cannot break this plugin.
-  const peers = new PeerDetector(async () => {
-    const { plugins } = await bb.sdk.plugins.list();
-    return plugins.map((peer) => ({ id: peer.id, enabled: peer.enabled, status: peer.status }));
-  });
 
   /**
    * Project detection, cached and refreshed in the background.
@@ -310,6 +302,7 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   }): Promise<ThreadScope | null> => {
     try {
       const projects = await bb.sdk.projects.list();
+      const hasHint = hints.threadId !== undefined || hints.projectId !== undefined || hints.cwd !== undefined;
 
       let projectId: string | null = null;
       let environmentId: string | null = null;
@@ -317,6 +310,7 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
         const thread = await bb.sdk.threads.get({ threadId: hints.threadId });
         projectId = thread.projectId;
         environmentId = thread.environmentId;
+        if (hints.projectId !== undefined && hints.projectId !== projectId) return null;
       } else if (hints.projectId !== undefined) {
         projectId = hints.projectId;
       } else if (hints.cwd !== undefined) {
@@ -329,8 +323,10 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
           .sort((a, b) => b.path.length - a.path.length);
         projectId = matches[0]?.project.id ?? null;
       }
-      // Only when nothing else knew. A single-project bb makes this exact.
-      projectId ??= projects[0]?.id ?? null;
+      // Only a trusted panel call has no hints. An agent-facing CLI call with a
+      // bad cwd must fail closed instead of widening to whichever project bb
+      // happens to list first.
+      if (projectId === null && !hasHint) projectId = projects[0]?.id ?? null;
       if (projectId === null) return null;
 
       let checkoutPath: string | null = null;
@@ -350,6 +346,10 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
         hostId = source?.hostId ?? null;
       }
       if (checkoutPath === null) return null;
+      if (hints.cwd !== undefined) {
+        const rel = relative(resolve(checkoutPath), resolve(hints.cwd));
+        if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+      }
 
       const projectPath =
         settings.projectPath === ""
@@ -439,9 +439,6 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
 
       const head = await gitHead(scope.scope.checkoutPath);
       const probes = await getPreflight();
-      const bbCli = probes.bbCliPath;
-      const delegate = bbCli !== null && (await peers.has(XCODE_PLUGIN_ID)) ? { bbCli } : null;
-
       const scale = 3;
       const derived = join(dataDir, "derived", scope.scope.scopeKey);
       const key = deviceKey({
@@ -474,7 +471,6 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
                 resultBundlePath: join(derived, "results"),
               },
               testTargetName: project.snapshotTestTarget,
-              delegate,
               odiffPath: probes.odiffPath,
               globalThreshold: settings.diffThreshold,
             },
@@ -549,63 +545,39 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
     linkThread(db, recent.threadId, lookId, Date.now());
   };
 
-  // ---------------------------------------------------------------------------
-  // Exposure
-  // ---------------------------------------------------------------------------
+  // Host-owned confirmations are serialized so two destructive prompts cannot
+  // race each other in one thread.
+  let hostConfirmationInFlight = false;
 
-  let viewer: ViewerHandle | null = null;
-
-  /**
-   * Tear an exposure down.
-   *
-   * `declareSharedPorts(hostId, [])` is what actually revokes it, and it
-   * restarts the host's whole tunnel — momentarily dropping other plugins'
-   * shares and the user's own `bb connect expose` on this Mac. That cost is why
-   * the idle timeout is five minutes rather than sixty seconds, and why the
-   * README says so plainly.
-   */
-  const guard = new ExposureGuard({
-    onEnd: (exposure, reason) => {
-      log("info", `exposure ended (${reason}) after ${Math.round((Date.now() - exposure.startedAt) / 1000)}s`);
-      const hostId = serverHostId;
-      if (hostId !== null) {
-        safely(isDisposed, () => bb.hosts.declareSharedPorts(hostId, []));
-      }
-      const closing = viewer;
-      viewer = null;
-      if (closing !== null) {
-        detach(
-          () => closing.close(),
-          (error) => log("warn", `viewer did not close: ${describe(error)}`),
-        );
-      }
-      publish("exposure");
-    },
-  });
-
-  // A **narrow** schema: only `paired`. A peer can grow fields without
-  // breaking this, and a contract that moved falls through rather than failing.
-  const connectStatusSchema = z.object({ paired: z.boolean() }).loose();
-
-  const connectDeps = {
-    plugins: () => peers.plugins(),
-    connectStatus: async () => {
-      // A narrow schema wanting only `paired`: a peer's contract can grow
-      // fields without breaking this, and `unknown_method` falls through rather
-      // than failing.
-      const result = await bb.sdk.plugins.callRpc({
-        pluginId: CONNECT_PLUGIN_ID,
-        method: "status",
-        input: null,
-        outputSchema: connectStatusSchema,
+  const confirmInThread = async (
+    threadId: string,
+    consent: { title: string; facts: string[]; confirmLabel: string },
+  ): Promise<boolean> => {
+    try {
+      const result = await bb.ui.requestInput({
+        threadId,
+        rendererId: "server-confirm",
+        title: consent.title,
+        payload: { facts: consent.facts, confirmLabel: consent.confirmLabel },
+        timeoutMs: 120_000,
       });
-      return result as { paired: boolean };
-    },
-    ensureTunnel: (hostId: string) => bb.hosts.ensureSharedPortTunnel(hostId),
-    hostId: () => serverHostId,
+      return result.outcome === "submitted" && result.value === true;
+    } catch (error) {
+      log("warn", `consent request failed: ${describe(error)}`);
+      return false;
+    }
+  };
+
+  const confirmationThread = (hints: { threadId?: string | null; projectId?: string | null }): string | null => {
+    if (typeof hints.threadId === "string" && hints.threadId !== "") return hints.threadId;
+    if (typeof hints.projectId !== "string" || hints.projectId === "") return null;
+    const recent = lastActiveThread.get(hints.projectId);
+    if (recent === undefined || Date.now() - recent.at > THREAD_LINK_WINDOW_MS) return null;
+    return recent.threadId;
   };
 
   let demoState: DemoState | null = null;
+  let reserveFrameBytes: (incomingBytes: number) => Promise<void> = async () => {};
 
   const ctx: Ctx = {
     pluginId: bb.pluginId,
@@ -624,13 +596,13 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
         return leases.acquire(device?.udid ?? "none", threadId);
       },
     },
-    loopbackBaseUrl: () => safely(isDisposed, () => bb.server.loopbackBaseUrl) ?? null,
     log,
     publish,
     scopeForThread,
     scopeForInvocation,
     gitHead,
     recentDestinations: (limit) => host.recentDestinations(limit),
+    beforeFrameImport: (incomingBytes) => reserveFrameBytes(incomingBytes),
 
     /**
      * Write a frame to a path on the machine that invoked the CLI.
@@ -640,7 +612,7 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
      * through `bb.sdk.files` is the difference between writing where the user
      * is looking and writing somewhere they will never find.
      */
-    async writeToInvokingHost(threadId, path, frameId) {
+    async writeToInvokingHost(threadId, path, rootPath, frameId) {
       const frame = getFrame(db, frameId);
       const look = frame === null ? null : getLook(db, frame.lookId);
       if (frame === null || look === null) return { ok: false, reason: "That frame is gone." };
@@ -670,8 +642,11 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
         const written = await bb.sdk.files.write({
           ...(hostId === undefined ? {} : { hostId }),
           path,
+          rootPath,
           content: bytes.toString("base64"),
           contentEncoding: "base64",
+          expectedSha256: null,
+          mode: 0o600,
         });
         if (written.outcome !== "written") {
           return { ok: false, reason: `Could not write ${path}: ${written.outcome}.` };
@@ -712,101 +687,16 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
      * is a bug nobody would look for. `expectedSha256: null` is create-only —
      * an onboarding run must never clobber a file someone has since edited.
      */
-    exposure: {
-      current: () => guard.summary(),
-
-      async availability() {
-        const state = await detectConnect(connectDeps);
-        return state.available
-          ? { available: true, reason: null }
-          : { available: false, reason: state.detail };
-      },
-
-      deviceName: () => live.currentDevice()?.name ?? null,
-
-      /**
-       * The consent facts, read live.
-       *
-       * The foreground app is fetched at the moment the dialog opens rather
-       * than remembered, because "what is on screen right now" is the fact the
-       * person is being asked to weigh.
-       */
-      async consent() {
-        const device = live.currentDevice();
-        if (device === null) return null;
-        const address = live.address();
-        const foreground =
-          address === null ? null : (await simhost.foregroundApp(address, device.udid)).bundleId;
-        return consentText({
-          deviceName: device.name,
-          foregroundBundleId: foreground,
-          minutes: settings.exposeTtlMinutes,
-        });
-      },
-
-      async start() {
-        const device = live.currentDevice();
-        if (device === null) return { url: null, error: "No simulator is running." };
-
-        const state = await detectConnect(connectDeps);
-        if (!state.available) return { url: null, error: state.detail };
-        const hostId = await resolveHostId();
-        if (hostId === null) return { url: null, error: CONNECT_REASONS["no-tunnel"] };
-
-        // One viewer origin per exposure, on a fresh port: reusing one across
-        // exposures would let an old URL reach a new device.
-        viewer?.close().catch(() => undefined);
-        viewer = await startViewer({
-          isValid: (token) => guard.isValid(token),
-          udid: () => live.currentDevice()?.udid ?? null,
-          address: () => live.address(),
-          onViewerOpened: () => guard.noteViewerOpened(),
-          onViewerClosed: () => guard.noteViewerClosed(),
-          onError: (message) => log("warn", message),
-          showDeviceChrome: () => settings.showDeviceChrome,
-        });
-
-        const exposure = guard.start({
-          udid: device.udid,
-          deviceName: device.name,
-          port: viewer.port,
-          url: "",
-          ttlMs: settings.exposeTtlMinutes * 60_000,
-        });
-        const url = publicUrl(state.label, state.baseDomain, viewer.port, exposure.token);
-        bb.hosts.declareSharedPorts(hostId, [viewer.port]);
-        // The URL is logged nowhere, and the token appears in no other reply.
-        log("info", `exposed ${device.name} for ${settings.exposeTtlMinutes} minutes`);
-        publish("exposure");
-        return { url, error: null };
-      },
-
-      stop: () => guard.end("stopped"),
-    },
-
-    /**
-     * Ask a human, in the composer, before doing something consequential.
-     *
-     * `bb.ui.requestInput` replaces the composer with a plugin form and blocks
-     * until the person answers. This is what makes "there is no
-     * simulator_expose tool" enforcement rather than decoration: an agent that
-     * runs `bb sims expose` still ends up waiting on a human.
-     */
-    async confirmInThread(threadId, consent) {
+    /** Ask a human, in the composer, before a destructive server action. */
+    async confirmAction(hints, consent) {
+      if (hostConfirmationInFlight) return false;
+      const threadId = confirmationThread(hints);
+      if (threadId === null) return false;
+      hostConfirmationInFlight = true;
       try {
-        const result = await bb.ui.requestInput({
-          threadId,
-          rendererId: "expose-consent",
-          title: consent.title,
-          payload: { facts: consent.facts, confirmLabel: consent.confirmLabel },
-          // Long enough to read four sentences, short enough that an abandoned
-          // prompt does not hold a CLI open forever.
-          timeoutMs: 120_000,
-        });
-        return result.outcome === "submitted" && result.value === true;
-      } catch (error) {
-        log("warn", `consent request failed: ${describe(error)}`);
-        return false;
+        return await confirmInThread(threadId, consent);
+      } finally {
+        hostConfirmationInFlight = false;
       }
     },
 
@@ -854,6 +744,20 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // The stream proxy
   // ---------------------------------------------------------------------------
 
+  // These routes are long-lived by design. Hard ceilings keep a buggy or
+  // hostile local-route client from turning reconnects into unbounded child
+  // streams or open response bodies.
+  const presenceConnections = new ConnectionLimit(MAX_PANEL_PRESENCES);
+  const streamConnections = new ConnectionLimit(MAX_PANEL_STREAMS);
+  const privateStreamDeps: PrivateStreamRouteDeps = {
+    currentDeviceUdid: () => live.currentDevice()?.udid ?? null,
+    address: () => live.address(),
+    noteViewerOpened: () => live.noteViewerOpened(),
+    noteViewerClosed: () => live.noteViewerClosed(),
+    open: simhost.open,
+    streamPath: simhost.streamPath,
+  };
+
   /**
    * Viewer presence, with no pixels in it.
    *
@@ -872,124 +776,22 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   bb.http.route(
     "GET",
     "/presence",
-    async (context) => {
-      const udid = context.req.query("udid");
-      if (udid === undefined || !/^[0-9A-Fa-f-]{36}$/.test(udid)) {
-        return context.text("Not found", 404);
-      }
-      live.noteViewerOpened();
-      let counted = true;
-      const release = (): void => {
-        if (!counted) return;
-        counted = false;
-        try {
-          live.noteViewerClosed();
-        } catch {
-          // Teardown accounting must never throw into a socket handler.
-        }
-      };
-
-      // A body that never produces a chunk and never ends. `cancel` is what the
-      // browser calls when the panel drops the connection, which is the whole
-      // mechanism — there is nothing to read, only something to close.
-      const body = new ReadableStream<Uint8Array>({
-        cancel: release,
-      });
-      context.req.raw.signal?.addEventListener("abort", release, { once: true });
-
-      return new Response(body, {
-        status: 200,
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-store",
-          "X-Content-Type-Options": "nosniff",
-        },
-      });
-    },
+    makePresenceRouteHandler(privateStreamDeps, presenceConnections),
     { auth: "local" },
   );
 
   /**
    * The device stream, proxied from the capture host — H.264 or MJPEG.
    *
-   * The fallback path since direct streaming landed: it is what a viewer on
-   * another machine, or one reached over `bb connect`, still uses. It keeps its
-   * own presence accounting for that case, and it carries both codecs because
-   * the 18× bandwidth difference matters most exactly where this route is
-   * required: on the far side of a tunnel.
+   * The fallback path since direct streaming landed: it is what a remote
+   * bb panel uses. It keeps its own presence accounting for that
+   * case, and it carries both codecs because the 18× bandwidth difference
+   * matters most across a remote connection.
    */
   bb.http.route(
     "GET",
     "/stream",
-    async (context) => {
-      const udid = context.req.query("udid");
-      if (udid === undefined || !/^[0-9A-Fa-f-]{36}$/.test(udid)) {
-        return context.text("Not found", 404);
-      }
-      const address = live.address();
-      if (address === null) return context.text("The capture host is not running.", 503);
-
-      /**
-       * The session is the authority on what may stream, not a fresh `simctl`.
-       *
-       * This used to run `simctl list devices -j` on every open — hundreds of
-       * milliseconds, per ladder attempt, per reconnect, per generation bump —
-       * to guard against a device shut down between poll and request. But the
-       * live service already tracks exactly that: its stall reports, socket
-       * closes and erase/shutdown calls keep `currentDevice()` honest, and a
-       * UDID that is not the session's device has no business on this route
-       * at all, because the URLs handed out are built from that device.
-       */
-      const current = live.currentDevice();
-      if (current === null || current.udid !== udid) {
-        return context.text("That simulator is not running.", 409);
-      }
-
-      // `codec=avcc` is the H.264 stream; anything else keeps the JPEG one, so
-      // an older panel asking for no codec at all still gets a picture.
-      const codec = context.req.query("codec") === "avcc" ? "avcc" : "mjpeg";
-
-      let upstream;
-      try {
-        upstream = await simhost.open(address, {
-          method: "GET",
-          path: simhost.streamPath(udid, codec),
-        });
-      } catch (error) {
-        return context.text(`The capture host refused the stream: ${describe(error)}`, 502);
-      }
-      if (upstream.statusCode !== 200) {
-        upstream.destroy();
-        return context.text("The simulator has no stream right now.", 502);
-      }
-
-      live.noteViewerOpened();
-      let counted = true;
-      const release = (): void => {
-        if (!counted) return;
-        counted = false;
-        try {
-          live.noteViewerClosed();
-        } catch {
-          // Teardown accounting must never throw into a socket handler.
-        }
-      };
-      upstream.on("close", release);
-      upstream.on("error", release);
-
-      // `Readable.toWeb` carries backpressure through, which matters: MJPEG is
-      // unbounded and a browser that stops reading must slow the simulator's
-      // encoder rather than fill this process's heap.
-      const body = Readable.toWeb(upstream) as unknown as ReadableStream<Uint8Array>;
-      return new Response(body, {
-        status: 200,
-        headers: {
-          "Content-Type": upstream.headers["content-type"] ?? "multipart/x-mixed-replace; boundary=frame",
-          "Cache-Control": "no-store",
-          "X-Content-Type-Options": "nosniff",
-        },
-      });
-    },
+    makeStreamRouteHandler(privateStreamDeps, streamConnections),
     { auth: "local" },
   );
 
@@ -1062,9 +864,8 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // Background service
   // ---------------------------------------------------------------------------
 
-  // Owns the capture host, the control sockets and (from milestone 8) the
-  // exposure guard. It awaits an abort — there is no loop and no timer running
-  // while nothing is on screen.
+  // Owns the loopback capture host and its control sockets. It awaits an abort
+  // — there is no loop and no timer running while nothing is on screen.
   bb.background.service("sim-live", {
     async start(signal) {
       if (signal.aborted) return;
@@ -1106,7 +907,16 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
       publish("look");
     }
     await sweepServeSimLogs(tmpdir(), Date.now());
+    await sweepLegacyStillsResults(dataDir);
     await bb.storage.kv.set("lastPruneAt", Date.now());
+  };
+
+  reserveFrameBytes = async (incomingBytes) => {
+    await runPrune(incomingBytes);
+    const budget = settings.diskBudgetMb * 1024 * 1024;
+    if (totalBytes(db) + incomingBytes > budget) {
+      throw new Error("The preview export would exceed the simulator frame disk budget.");
+    }
   };
 
   const pruneIfDue = (): void => {
@@ -1173,6 +983,7 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
         // The handle is already stale; there is nowhere left to report to.
       },
     );
+    disposed = true;
   });
 }
 

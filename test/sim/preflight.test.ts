@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   addonProbe,
   archProbe,
-  bbCliProbe,
   macosProbe,
   odiffProbe,
   overallState,
@@ -135,12 +134,6 @@ describe("the odiff probe", () => {
     const probe = odiffProbe(null);
     expect(probe.state).toBe("warn");
     expect(probe.detail).toBe("odiff is missing, so previews will render but nothing will be compared.");
-  });
-});
-
-describe("the bb CLI probe", () => {
-  it("explains the consequence rather than the absence", () => {
-    expect(bbCliProbe(null).detail).toContain("builds run through xcodebuild directly");
   });
 });
 

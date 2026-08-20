@@ -4,7 +4,7 @@
  * Ordering is a measurement, not a preference: H.264 ran 24.9 fps at 200 KB/s
  * where MJPEG managed 14.3 fps at 3.55 MB/s on the same device under the same
  * motion. So codec outranks route, and proxied H.264 beats direct MJPEG — most
- * visibly over a `bb connect` tunnel, where the 18× is bandwidth someone pays
+ * visibly over a remote connection, where the 18× is bandwidth someone pays
  * for by the gigabyte.
  */
 import { describe, expect, it } from "vitest";
@@ -41,7 +41,7 @@ describe("the source ladder", () => {
   });
 
   it("skips the direct rungs entirely when this page cannot reach loopback", () => {
-    // A viewer over `bb connect` used to burn two guaranteed-failure fetches
+    // A remote bb viewer used to burn two guaranteed-failure fetches
     // per stream, per generation, finding this out. The page's origin answers
     // it in advance, so the doomed rungs are never offered.
     const sources = streamSources({ direct: DIRECT, proxied: PROXIED }, true, {

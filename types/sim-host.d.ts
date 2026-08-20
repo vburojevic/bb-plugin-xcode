@@ -8,10 +8,13 @@
  */
 declare module "*/sim-host.mjs" {
   export const SECRET_HEADER: string;
+  export const MAX_CONTROL_BODY_BYTES: number;
+  export const MAX_SCRUBBED_JSON_BYTES: number;
   export function createFilteredServer(
     middleware: unknown,
     secret: string,
     onError?: (error: unknown) => void,
+    streamToken?: string | null,
   ): import("node:http").Server;
   export function isDenied(path: string): boolean;
   export function isAllowed(method: string, path: string): boolean;
@@ -19,7 +22,8 @@ declare module "*/sim-host.mjs" {
   export function isStreamRoute(path: string): boolean;
   export function authorize(args: {
     path: string;
-    presented: unknown;
+    header: unknown;
+    query: unknown;
     secret: string;
     streamToken: string | null;
   }): boolean;

@@ -8,7 +8,12 @@
  * reconnect has told the user their run vanished.
  */
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
-import { useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
+import {
+  useBbContext,
+  useRealtime,
+  useRealtimeConnectionState,
+  useRpc,
+} from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../../src/sim/wire";
 import type { CapturedFrame } from "./useLive";
 
@@ -135,6 +140,7 @@ export function isOnboarded(plan: OnboardPlan | null): boolean {
 
 export function useStills(lookId?: string) {
   const client = useRpc<typeof rpcContract>();
+  const { threadId, projectId } = useBbContext();
   rpc = client;
 
   const value = useSyncExternalStore(
@@ -158,10 +164,13 @@ export function useStills(lookId?: string) {
   }, [connection, lookId]);
 
   const run = useCallback(async () => {
-    const result = (await client.call("stillsRun", {})) as { error: string | null };
+    const result = (await client.call("stillsRun", {
+      threadId,
+      projectId,
+    })) as { error: string | null };
     if (result.error !== null) throw new Error(result.error);
     refresh();
-  }, [client]);
+  }, [client, projectId, threadId]);
 
   const setBaseline = useCallback(async () => {
     const current = snapshot.summary?.lookId;

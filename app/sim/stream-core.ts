@@ -27,7 +27,7 @@ export function isLoopbackHost(hostname: string): boolean {
  *
  *  - an `https:` page blocks cleartext loopback as mixed content, and
  *  - a page on any other host is a remote viewer, whose `127.0.0.1` is the
- *    wrong machine entirely (the `bb connect` tunnel case).
+ *    wrong machine entirely.
  *
  * The page's own origin answers the question in advance, for free. A loopback
  * `http:` page is the only viewer the direct route was built for.

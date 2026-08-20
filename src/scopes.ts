@@ -124,16 +124,14 @@ export function pathIsUnder(path: string, base: string): boolean {
  * archived worktree, presented as this thread's last activity.
  *
  * An unresolved scope is an absence of knowledge, not permission to answer
- * with everything. `machineWide` is the only thing that opens the filter, and
- * only a caller that explicitly asked for it can pass it.
+ * with everything. Machine-wide host-owned surfaces query the store directly;
+ * this boundary has no widening switch.
  */
 export function scopeFilter<
   T extends Parameters<typeof runMatchesScope>[0],
 >(
   scope: { threadId: string; path: string; branch: string | null } | null,
-  machineWide = false,
 ): (run: T) => boolean {
-  if (machineWide) return () => true;
   if (!scope) return () => false;
   return (run) => runMatchesScope(run, scope);
 }

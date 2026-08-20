@@ -1,16 +1,7 @@
 /**
- * The panel header accessory: device picker, Live/Stills segmented control,
- * and — from milestone 8 — the exposure indicator.
- *
- * That bar's width is the host's, so the collapse order is stated rather than
- * left to flexbox. The exposure indicator **never collapses and never moves**:
- * it is the only element there that is a safety claim. The segmented control
- * drops its labels to glyphs next. The device picker collapses to the bare
- * device name and finally to a chevron.
- *
- * A throw in `headerContent` hides the accessory without breaking the panel,
- * which is why the exposure state is *also* in the banner row. That is
- * deliberate redundancy, not duplication.
+ * The panel header accessory: device picker and Live/Stills segmented control.
+ * The segmented control drops its labels to glyphs on compact viewports; the
+ * device picker then collapses to the bare chevron.
  */
 import { Button } from "@/components/ui/button";
 import {
@@ -33,11 +24,9 @@ export interface DeviceBarProps {
   state: LiveState | null;
   devices: DeviceList | null;
   onPick: (udid: string) => void;
-  /** The exposure chip, rendered first and never collapsed. */
-  exposure?: React.ReactNode;
 }
 
-export function DeviceBar({ tab, onTab, state, devices, onPick, exposure }: DeviceBarProps) {
+export function DeviceBar({ tab, onTab, state, devices, onPick }: DeviceBarProps) {
   const compact = useIsCompactViewport();
   const current = state?.device ?? null;
   const booted = new Set(devices?.bootedUdids ?? []);
@@ -47,8 +36,6 @@ export function DeviceBar({ tab, onTab, state, devices, onPick, exposure }: Devi
 
   return (
     <div className="flex min-w-0 items-center gap-1">
-      {exposure}
-
       <div className="flex shrink-0 items-center rounded-md border p-0.5" role="tablist">
         <SegmentButton active={tab === "live"} compact={compact} icon="Play" label="Live" onClick={() => onTab("live")} />
         <SegmentButton

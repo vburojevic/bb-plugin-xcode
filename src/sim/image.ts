@@ -173,7 +173,7 @@ export function fitToBudget<T extends { bytes: number }>(
   let used = 0;
   for (const item of items) {
     const encoded = Math.ceil(item.bytes / 3) * 4;
-    if (used + encoded > budget && included.length > 0) break;
+    if (used + encoded > budget) break;
     included.push(item);
     used += encoded;
   }

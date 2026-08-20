@@ -9,11 +9,11 @@
 import { joinWords } from "../../src/sim/format.js";
 import type { DeviceList, LiveState } from "./useLive.js";
 
-export type Tone = "neutral" | "live" | "stalled" | "dead" | "exposed";
+export type Tone = "neutral" | "live" | "stalled" | "dead";
 
 export interface Action {
   label: string;
-  kind: "boot" | "watch" | "refresh" | "retry" | "expose" | "doctor";
+  kind: "boot" | "watch" | "refresh" | "retry" | "doctor";
   /** The device this action would act on, when it names one. */
   udid?: string;
 }
@@ -265,5 +265,4 @@ export const TONE_CLASS: Record<Tone, string> = {
   live: "bbxs-tone bbxs-tone-live",
   stalled: "bbxs-tone bbxs-tone-stalled",
   dead: "bbxs-tone bbxs-tone-dead",
-  exposed: "bbxs-tone bbxs-tone-exposed",
 };

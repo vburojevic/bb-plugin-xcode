@@ -8,7 +8,18 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import BetterSqlite3 from "better-sqlite3";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  truncateSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +28,11 @@ import { MIGRATIONS, prepareConnection } from "../../src/sim/store.js";
 import { FrameStore } from "../../src/sim/framestore.js";
 import {
   importExport,
+  MAX_EXPORT_FRAMES,
+  MAX_EXPORT_IMAGE_EDGE,
+  MAX_EXPORT_MANIFEST_NAME_BYTES,
+  MAX_EXPORT_PNG_BYTES,
+  MAX_EXPORT_SIDECAR_BYTES,
   parseManifest,
   explainRenderFailure,
   explainEmptyRender,
@@ -140,6 +156,130 @@ describe("importing a recorded export", () => {
     expect(result).toEqual({ count: 0, bytes: 0, names: new Set() });
     db.close();
   });
+
+  it("preflights total bytes before creating the look directory", async () => {
+    const { db, store, dir } = scratch();
+    seedLook(db, "lk_budget", 2);
+    const exportDir = join(dir, "export");
+    mkdirSync(exportDir);
+    const source = join(FIXTURES, "head", "Almanac_Card.swift_Wide.png");
+    const target = join(exportDir, "Almanac_Card.swift_Wide.png");
+    copyFileSync(source, target);
+    let reserved = 0;
+    const result = await importExport({
+      db,
+      store,
+      lookId: "lk_budget",
+      scopeKey: "scope",
+      exportDir,
+      now: () => 2,
+      beforeWrite: async (bytes) => {
+        reserved = bytes;
+      },
+    });
+    expect(reserved).toBeGreaterThan(0);
+    expect(result.count).toBe(1);
+    db.close();
+  });
+
+  it("rechecks bytes that grow after the directory preflight", async () => {
+    const { db, store, dir } = scratch();
+    seedLook(db, "lk_growing", 2);
+    const exportDir = join(dir, "export");
+    mkdirSync(exportDir);
+    const target = join(exportDir, "Growing.png");
+    copyFileSync(join(FIXTURES, "head", "Almanac_Card.swift_Wide.png"), target);
+    const checks: number[] = [];
+    const result = await importExport({
+      db,
+      store,
+      lookId: "lk_growing",
+      scopeKey: "scope",
+      exportDir,
+      now: () => 2,
+      beforeWrite: async (bytes) => {
+        checks.push(bytes);
+        if (checks.length === 1) appendFileSync(target, Buffer.alloc(1024));
+      },
+    });
+    expect(result.count).toBe(1);
+    expect(checks).toHaveLength(2);
+    expect(checks[1]!).toBeGreaterThan(checks[0]!);
+    db.close();
+  });
+
+  it("rejects oversized PNGs and sidecars before reading them", async () => {
+    const { db, store, dir } = scratch();
+    seedLook(db, "lk_large", 2);
+    const exportDir = join(dir, "export");
+    mkdirSync(exportDir);
+    const png = join(exportDir, "Large.png");
+    writeFileSync(png, "");
+    truncateSync(png, MAX_EXPORT_PNG_BYTES + 1);
+    await expect(
+      importExport({ db, store, lookId: "lk_large", scopeKey: "scope", exportDir, now: () => 2 }),
+    ).rejects.toThrow(/per-image safety limit/);
+
+    rmSync(png);
+    copyFileSync(join(FIXTURES, "head", "Almanac_Card.swift_Wide.png"), png);
+    const sidecar = join(exportDir, "Large.json");
+    writeFileSync(sidecar, "");
+    truncateSync(sidecar, MAX_EXPORT_SIDECAR_BYTES + 1);
+    await expect(
+      importExport({ db, store, lookId: "lk_large", scopeKey: "scope", exportDir, now: () => 2 }),
+    ).rejects.toThrow(/sidecar.*safety limit/);
+    db.close();
+  });
+
+  it("rejects compressed images that declare unsafe dimensions", async () => {
+    const { db, store, dir } = scratch();
+    seedLook(db, "lk_dimensions", 2);
+    const exportDir = join(dir, "export");
+    mkdirSync(exportDir);
+    const header = Buffer.alloc(24);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(header);
+    header.writeUInt32BE(13, 8);
+    Buffer.from("IHDR").copy(header, 12);
+    header.writeUInt32BE(MAX_EXPORT_IMAGE_EDGE + 1, 16);
+    header.writeUInt32BE(1, 20);
+    writeFileSync(join(exportDir, "Bomb.png"), header);
+    await expect(
+      importExport({ db, store, lookId: "lk_dimensions", scopeKey: "scope", exportDir, now: () => 2 }),
+    ).rejects.toThrow(/dimensions beyond the safety limit/);
+    db.close();
+  });
+
+  it("never follows a generated PNG symlink", async () => {
+    const { db, store, dir } = scratch();
+    seedLook(db, "lk_link", 2);
+    const exportDir = join(dir, "export");
+    mkdirSync(exportDir);
+    symlinkSync(join(FIXTURES, "head", "Almanac_Card.swift_Wide.png"), join(exportDir, "Linked.png"));
+    const result = await importExport({
+      db,
+      store,
+      lookId: "lk_link",
+      scopeKey: "scope",
+      exportDir,
+      now: () => 2,
+    });
+    expect(result.count).toBe(0);
+    db.close();
+  });
+
+  it("refuses an unbounded number of generated frames", async () => {
+    const { db, store, dir } = scratch();
+    seedLook(db, "lk_many", 2);
+    const exportDir = join(dir, "export");
+    mkdirSync(exportDir);
+    for (let index = 0; index <= MAX_EXPORT_FRAMES; index += 1) {
+      writeFileSync(join(exportDir, `Frame-${index}.png`), "");
+    }
+    await expect(
+      importExport({ db, store, lookId: "lk_many", scopeKey: "scope", exportDir, now: () => 2 }),
+    ).rejects.toThrow(/safety limit/);
+    db.close();
+  });
 });
 
 describe("the manifest", () => {
@@ -154,6 +294,17 @@ describe("the manifest", () => {
 
   it("ignores blank lines rather than counting them", () => {
     expect(parseManifest("a.png\n\n b.png \n\n")).toEqual(["a.png", "b.png"]);
+  });
+
+  it("bounds manifest entries and individual names before persisting them", () => {
+    expect(() =>
+      parseManifest(
+        Array.from({ length: MAX_EXPORT_FRAMES + 1 }, (_unused, index) => `${index}.png`).join("\n"),
+      ),
+    ).toThrow(/entry safety limit/);
+    expect(() => parseManifest(`${"a".repeat(MAX_EXPORT_MANIFEST_NAME_BYTES + 1)}.png`)).toThrow(
+      /name beyond the safety limit/,
+    );
   });
 });
 

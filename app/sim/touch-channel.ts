@@ -6,7 +6,7 @@
  * accumulates into the next one. Nothing is thrown away on the way: every
  * sample keeps its own timestamp, and the server replays a batch at the
  * timestamps' spacing. On a loopback link a batch is one or two events; over
- * `bb connect` it is a whole stretch of the drag — delivered smooth, one
+ * a remote bb connection it is a whole stretch of the drag — delivered smooth, one
  * round-trip late, instead of as three teleporting positions.
  *
  * The predecessor of this class collapsed queued moves to the freshest one,

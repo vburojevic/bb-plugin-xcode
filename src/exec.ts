@@ -7,6 +7,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { curatedChildEnv } from "./child-env";
 
 export interface ExecResult {
   stdout: string;
@@ -39,6 +40,9 @@ export function run(
         killSignal: "SIGKILL",
         maxBuffer: options.maxBuffer ?? 32 * 1024 * 1024,
         cwd: options.cwd,
+        // Process inspection and xcresult parsing do not need provider,
+        // plugin, or tunnel credentials from the long-lived bb server.
+        env: curatedChildEnv(process.env),
         encoding: "utf8",
       },
       (error, stdout, stderr) => {

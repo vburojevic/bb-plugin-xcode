@@ -229,11 +229,6 @@ describe("scopeFilter", () => {
     expect(filter(mine)).toBe(false);
   });
 
-  it("opens up only when the caller explicitly asked for machine-wide", () => {
-    expect(scopeFilter(null, true)(foreign)).toBe(true);
-    expect(scopeFilter(scope, true)(foreign)).toBe(true);
-  });
-
   it("keeps a resolved scope to its own checkout", () => {
     const filter = scopeFilter(scope);
     expect(filter(mine)).toBe(true);

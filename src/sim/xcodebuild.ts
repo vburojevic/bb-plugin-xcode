@@ -1,17 +1,16 @@
 /**
- * Running xcodebuild — directly, or through `bb-plugin-xcode` when it is there.
+ * Running the Stills target directly through the fixed system xcodebuild.
  *
- * Neither path polls. Both are `await once(child, "close")` with an
- * `AbortSignal` watchdog, because the exit code of a build is the one thing
- * about a build you can actually trust.
+ * It never polls: the child close event and an `AbortSignal` watchdog own the
+ * lifetime, because the exit code is the one thing about a build we can trust.
  *
- * **The direct path does not parse build logs.** Doing that badly is worse than
- * not doing it, and doing it well is exactly what the Xcode plugin exists for.
- * So the failure state reads *"Build failed (exit 65). Install bb-plugin-xcode
- * for parsed errors, or open the result bundle."*
+ * It does not parse build logs. Doing that badly is worse than not doing it;
+ * the bounded tail is retained in the run while scratch result bundles are
+ * deleted with the run's private working directory.
  */
 import { join } from "node:path";
 import { run, tail, type RunResult } from "./exec.js";
+import { curatedChildEnv } from "../child-env.js";
 
 export interface BuildTarget {
   /**
@@ -110,17 +109,6 @@ export interface RunBuildOptions {
   cwd: string;
   signal?: AbortSignal;
   timeoutMs?: number;
-  /**
-   * The bb CLI, when the Xcode plugin is installed and should own the build.
-   *
-   * `bb xcode run --wait -- xcodebuild …` gives three things this would
-   * otherwise reinvent: the build appears in the Xcode plugin's own activity
-   * card, so the user's "what is building" surface stays singular; the verdict
-   * comes back parsed by an engine that already knows how to distrust a poll
-   * loop's exit code; and this plugin's banner can point at their card instead
-   * of drawing a second progress bar for the same work.
-   */
-  delegate: { bbCli: string } | null;
 }
 
 /** Default watchdog. A clean build of a large app genuinely takes this long. */
@@ -131,28 +119,17 @@ export async function runXcodebuild(
   target: BuildTarget,
   options: RunBuildOptions,
 ): Promise<BuildOutcome> {
-  const via: BuildVia = options.delegate === null ? "xcodebuild" : "xcode-plugin";
+  const via: BuildVia = "xcodebuild";
   let result: RunResult;
   try {
-    if (options.delegate === null) {
-      result = await run("xcodebuild", argv, {
-        cwd: options.cwd,
-        // Unbuffered, so a hung build's last output is the line it hung on.
-        env: { ...process.env, NSUnbufferedIO: "YES" },
-        timeoutMs: options.timeoutMs ?? BUILD_TIMEOUT_MS,
-        signal: options.signal,
-        maxBuffer: 4 * 1024 * 1024,
-      });
-    } else {
-      // `resolveBuildArgv` rewrites `xcodebuild` to `/usr/bin/xcodebuild` and
-      // passes everything else through unchanged, so this argv is safe as-is.
-      result = await run(options.delegate.bbCli, ["xcode", "run", "--wait", "--", "xcodebuild", ...argv], {
-        cwd: options.cwd,
-        timeoutMs: options.timeoutMs ?? BUILD_TIMEOUT_MS,
-        signal: options.signal,
-        maxBuffer: 4 * 1024 * 1024,
-      });
-    }
+    result = await run("xcodebuild", argv, {
+      cwd: options.cwd,
+      // Unbuffered, so a hung build's last output is the line it hung on.
+      env: { ...curatedChildEnv(process.env), NSUnbufferedIO: "YES" },
+      timeoutMs: options.timeoutMs ?? BUILD_TIMEOUT_MS,
+      signal: options.signal,
+      maxBuffer: 4 * 1024 * 1024,
+    });
   } catch (error) {
     return {
       ok: false,
@@ -171,7 +148,7 @@ export async function runXcodebuild(
     ok: false,
     via,
     exitCode: result.code,
-    detail: describeFailure(result, via, target.resultBundlePath),
+    detail: describeFailure(result),
     resultBundlePath: target.resultBundlePath,
   };
 }
@@ -183,16 +160,13 @@ export async function runXcodebuild(
  * parsed version lives. Pointing at a better tool is more useful than a worse
  * imitation of it.
  */
-export function describeFailure(result: RunResult, via: BuildVia, resultBundlePath: string): string {
+export function describeFailure(result: RunResult): string {
   if (result.timedOut) {
     return "The build did not finish in time and was stopped.";
   }
   const stderr = tail(result.stderr, 8 * 1024);
   const stdout = stderr === "" ? tail(result.stdout, 8 * 1024) : "";
   const detail = stderr || stdout;
-  const head =
-    via === "xcode-plugin"
-      ? `Build failed (exit ${result.code ?? "?"}).`
-      : `Build failed (exit ${result.code ?? "?"}). Install bb-plugin-xcode for parsed errors, or open the result bundle at ${resultBundlePath}.`;
+  const head = `Build failed (exit ${result.code ?? "?"}).`;
   return detail === "" ? head : `${head}\n\n${detail}`;
 }

@@ -68,7 +68,6 @@ export interface FakeHostOptions {
   pluginId?: string;
   settings?: Record<string, string | boolean>;
   sdk?: Record<string, unknown>;
-  loopbackBaseUrl?: string;
 }
 
 export interface Harness {
@@ -93,6 +92,7 @@ export interface Harness {
   signals: Array<{ channel: string; payload: unknown }>;
   needsConfiguration: string[];
   sdkCalls: string[];
+  hostCalls: string[];
   registrations: {
     rpcMethods: string[];
     httpRoutes: Array<{ method: string; path: string; auth: string }>;
@@ -123,6 +123,7 @@ export function createFakePluginHost(options: FakeHostOptions = {}): { bb: unkno
   const signals: Harness["signals"] = [];
   const needsConfiguration: string[] = [];
   const sdkCalls: string[] = [];
+  const hostCalls: string[] = [];
   const disposeHooks: Array<() => void | Promise<void>> = [];
   const kv = new Map<string, unknown>();
   const settingsValues: Record<string, string | boolean> = { ...options.settings };
@@ -255,16 +256,14 @@ export function createFakePluginHost(options: FakeHostOptions = {}): { bb: unkno
       },
     },
 
-    server: {
-      get loopbackBaseUrl() {
-        assertLive("server.loopbackBaseUrl");
-        return options.loopbackBaseUrl ?? "http://127.0.0.1:38886";
-      },
-    },
-
     hosts: {
-      ensureSharedPortTunnel: async () => ({ label: "test-host", baseDomain: "example.invalid" }),
-      declareSharedPorts: () => {},
+      async ensureSharedPortTunnel() {
+        hostCalls.push("ensureSharedPortTunnel");
+        return { label: "test-host", baseDomain: "example.invalid" };
+      },
+      declareSharedPorts() {
+        hostCalls.push("declareSharedPorts");
+      },
     },
 
     get sdk() {
@@ -381,6 +380,7 @@ export function createFakePluginHost(options: FakeHostOptions = {}): { bb: unkno
     signals,
     needsConfiguration,
     sdkCalls,
+    hostCalls,
     get registrations() {
       return {
         rpcMethods: Object.keys(rpcSchemas),
