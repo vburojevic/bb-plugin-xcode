@@ -12,7 +12,7 @@
  */
 import type { SimDevice } from "./devices.js";
 import { DeviceDriver, SimctlError, DRIVABLE_PLATFORMS, findDeviceByNameOrUdid, pickDefaultDevice } from "./devices.js";
-import { HidSocket, type ButtonName, type Orientation, type ScreenConfig } from "./hid.js";
+import { HidSocket, sleep, type ButtonName, type LiveStreamEvent, type Orientation, type ScreenConfig } from "./hid.js";
 import { startSimHost, type SimHostHandle, type SpawnDeps } from "./sim-host-sup.js";
 import * as host from "./sim-host-client.js";
 import { detach } from "./safe.js";
@@ -610,6 +610,35 @@ export class LiveService {
         session.hid.touchEnd(x, y);
         return true;
     }
+  }
+
+  /**
+   * A batch of live input events, replayed at their timestamps' spacing.
+   *
+   * `false` means none of it was delivered — no socket, or a scripted gesture
+   * owns the finger — and the panel can say so rather than letting a tap
+   * silently do nothing.
+   */
+  stream(events: readonly LiveStreamEvent[]): boolean {
+    const session = this.session;
+    if (session === null || session.hid === null) return false;
+    return session.hid.streamLive(events);
+  }
+
+  /**
+   * Text through the device pasteboard: `simctl pbcopy`, a beat for the sync,
+   * then the ⌘V chord. The path for every character the US-layout HID
+   * keyboard cannot type — é, emoji, anything beyond ASCII.
+   */
+  async pasteText(text: string): Promise<void> {
+    const session = this.session;
+    if (session === null) throw new Error("No simulator is running.");
+    const socket = this.requireSocket();
+    await this.deps.driver.pbcopy(session.device.udid, text);
+    // pbcopy returns before the pasteboard daemon has synced; pasting
+    // immediately pastes the *previous* clipboard.
+    await sleep(150);
+    await socket.pasteChord();
   }
 
   // -------------------------------------------------------------------------

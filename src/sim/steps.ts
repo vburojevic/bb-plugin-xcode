@@ -11,7 +11,7 @@
  * here ever sees a pixel.
  */
 import { z } from "zod";
-import { BUTTONS, NAMED_KEYS, normalizeOrientation, sleep, type HidSocket } from "./hid.js";
+import { BUTTONS, NAMED_KEYS, normalizeOrientation, sleep, textToKeystrokes, type HidSocket } from "./hid.js";
 
 const unit = z.number().min(0).max(1);
 
@@ -96,6 +96,18 @@ export interface StepResult {
 }
 
 /**
+ * What the executor may lean on beyond the socket.
+ *
+ * `pasteText` routes text through the device pasteboard and the ⌘V chord —
+ * the path for characters the US-layout HID keyboard cannot type. Injected
+ * rather than imported so the pure executor stays testable, and so a caller
+ * with no device driver simply gets the honest keystroke path.
+ */
+export interface StepCaps {
+  pasteText?: (text: string) => Promise<void>;
+}
+
+/**
  * Run one step.
  *
  * Every touch gesture goes through `HidSocket.gesture`, whose `finally` always
@@ -108,6 +120,7 @@ export async function executeStep(
   socket: HidSocket,
   step: Step,
   resolve: ResolvePoint = coordinatesOnly,
+  caps: StepCaps = {},
 ): Promise<StepResult> {
   switch (step.kind) {
     case "tap": {
@@ -148,6 +161,13 @@ export async function executeStep(
       };
     }
     case "type": {
+      // Text the US-layout HID keyboard cannot fully type goes through the
+      // pasteboard instead — as a whole, never half-typed-half-pasted, so an
+      // é in the middle does not split the string into two insertions.
+      if (caps.pasteText !== undefined && textToKeystrokes(step.text).dropped.length > 0) {
+        await caps.pasteText(step.text);
+        return { log: `pasted ${JSON.stringify(step.text)} via the clipboard`, dropped: [] };
+      }
       const { dropped } = await socket.type(step.text);
       const note =
         dropped.length === 0

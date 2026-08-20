@@ -104,6 +104,31 @@ describe("executing steps", () => {
     expect(result.log).toContain("2 characters could not be typed");
   });
 
+  it("routes untypeable text through the pasteboard when it can", async () => {
+    const socket = fakeSocket();
+    const pasted: string[] = [];
+    const caps = { pasteText: async (text: string) => void pasted.push(text) };
+    // The whole string is pasted, never half-typed-half-pasted: an é in the
+    // middle must not split the text into two insertions.
+    const result = await executeStep(socket, { kind: "type", text: "café 🎉" }, coordinatesOnly, caps);
+    expect(pasted).toEqual(["café 🎉"]);
+    expect(socket.type).not.toHaveBeenCalled();
+    expect(result.dropped).toEqual([]);
+    expect(result.log).toContain("pasted");
+  });
+
+  it("still types plain text as keystrokes even when paste is available", async () => {
+    // Keystrokes fire the app's per-character machinery — search-as-you-type,
+    // formatters — that a paste skips. The clipboard is the fallback, not the
+    // fast path.
+    const socket = fakeSocket();
+    const pasted: string[] = [];
+    const caps = { pasteText: async (text: string) => void pasted.push(text) };
+    await executeStep(socket, { kind: "type", text: "plain ascii" }, coordinatesOnly, caps);
+    expect(pasted).toEqual([]);
+    expect(socket.type).toHaveBeenCalledWith("plain ascii");
+  });
+
   it("names the keys it knows when given one it does not", async () => {
     const socket = fakeSocket();
     await expect(executeStep(socket, { kind: "key", name: "any" })).rejects.toThrow(

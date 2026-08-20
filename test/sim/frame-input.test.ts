@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { contentRect, keyStep, toNormalized, wheelStep } from "../../app/sim/frame-input.js";
+import {
+  contentRect,
+  keyStep,
+  PINCH_INITIAL_SPREAD,
+  PINCH_MAX_SPREAD,
+  PINCH_MIN_SPREAD,
+  pinchFingers,
+  pinchSpread,
+  toNormalized,
+  wheelStep,
+} from "../../app/sim/frame-input.js";
 
 const RECT = { left: 100, top: 50, width: 200, height: 400 };
 
@@ -153,5 +163,33 @@ describe("the letterbox", () => {
       width: 0,
       height: 0,
     });
+  });
+});
+
+describe("the trackpad pinch", () => {
+  it("spreads the fingers on spread, narrows them on squeeze", () => {
+    // macOS reports a spreading pinch as negative deltaY.
+    expect(pinchSpread(PINCH_INITIAL_SPREAD, -50)).toBeGreaterThan(PINCH_INITIAL_SPREAD);
+    expect(pinchSpread(PINCH_INITIAL_SPREAD, 50)).toBeLessThan(PINCH_INITIAL_SPREAD);
+  });
+
+  it("clamps the spread to something two fingers could do", () => {
+    expect(pinchSpread(PINCH_MAX_SPREAD, -10_000)).toBe(PINCH_MAX_SPREAD);
+    expect(pinchSpread(PINCH_MIN_SPREAD, 10_000)).toBe(PINCH_MIN_SPREAD);
+  });
+
+  it("places the fingers on a diagonal around the cursor", () => {
+    expect(pinchFingers({ x: 0.5, y: 0.5 }, 0.2)).toEqual({
+      x1: 0.4,
+      y1: 0.4,
+      x2: 0.6,
+      y2: 0.6,
+    });
+  });
+
+  it("keeps both fingers on the glass near a corner", () => {
+    const fingers = pinchFingers({ x: 0.02, y: 0.98 }, 0.4);
+    expect(fingers.x1).toBeGreaterThanOrEqual(0);
+    expect(fingers.y2).toBeLessThanOrEqual(1);
   });
 });

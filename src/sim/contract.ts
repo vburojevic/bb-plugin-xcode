@@ -451,12 +451,9 @@ export const rpcContract = defineRpcContract({
   /**
    * One live touch frame: the panel's pointer events, streamed as-is.
    *
-   * This is deliberately separate from `liveInput`'s gesture vocabulary. A
-   * scripted gesture is atomic — "swipe from here to here over 250ms" — and
-   * survives a high-latency link intact. A live drag is a stream of positions
-   * the device must see *as they happen*, because iOS is doing the gesture
-   * recognition. Moves at display rate would drown the step machinery; this
-   * channel is the cheap, ordered, droppable pipe they belong on.
+   * Kept for a panel bundle from before `liveStream`: a window open across a
+   * plugin reload keeps its old frontend against the new server, and its taps
+   * must keep landing.
    */
   liveTouch: {
     input: z
@@ -464,6 +461,67 @@ export const rpcContract = defineRpcContract({
         phase: z.enum(["begin", "move", "end"]),
         x: z.number().min(0).max(1),
         y: z.number().min(0).max(1),
+      })
+      .strict(),
+    output: z.object({ ok: z.boolean() }).strict(),
+  },
+  /**
+   * A batch of live input events, in order, each stamped with the pointer
+   * event's own timestamp.
+   *
+   * This is deliberately separate from `liveInput`'s gesture vocabulary. A
+   * scripted gesture is atomic — "swipe from here to here over 250ms" — and
+   * survives a high-latency link intact. A live drag is a stream of positions
+   * the device must see *at their own cadence*, because iOS is doing the
+   * gesture recognition — flick momentum is computed from the spacing of the
+   * last few samples before the lift.
+   *
+   * Batched because RPC is plain HTTP with no ordering between concurrent
+   * calls: the panel keeps exactly one batch in flight and accumulates the
+   * rest, and the server replays each batch at the timestamps' spacing. On a
+   * loopback link a batch is one or two events; over `bb connect` it is a
+   * whole stretch of the drag, delivered smooth instead of as teleports.
+   */
+  liveStream: {
+    input: z
+      .object({
+        events: z
+          .array(
+            z.discriminatedUnion("kind", [
+              z
+                .object({
+                  kind: z.literal("touch"),
+                  phase: z.enum(["begin", "move", "end"]),
+                  x: z.number().min(0).max(1),
+                  y: z.number().min(0).max(1),
+                  t: z.number().min(0),
+                })
+                .strict(),
+              z
+                .object({
+                  kind: z.literal("multi"),
+                  phase: z.enum(["begin", "move", "end"]),
+                  x1: z.number().min(0).max(1),
+                  y1: z.number().min(0).max(1),
+                  x2: z.number().min(0).max(1),
+                  y2: z.number().min(0).max(1),
+                  t: z.number().min(0),
+                })
+                .strict(),
+              z
+                .object({
+                  kind: z.literal("scroll"),
+                  dx: z.number().min(-1).max(1),
+                  dy: z.number().min(-1).max(1),
+                  x: z.number().min(0).max(1).optional(),
+                  y: z.number().min(0).max(1).optional(),
+                  t: z.number().min(0),
+                })
+                .strict(),
+            ]),
+          )
+          .min(1)
+          .max(128),
       })
       .strict(),
     output: z.object({ ok: z.boolean() }).strict(),

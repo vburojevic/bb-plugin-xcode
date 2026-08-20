@@ -1,27 +1,36 @@
 /**
- * The touch transport's two rules, proven: boundaries are never dropped or
- * reordered, and moves are latest-wins while a send is in flight.
+ * The transport's rules, proven: one batch in flight, everything accumulates
+ * behind it in order, no sample loses its timestamp, and a failed send drops
+ * the gesture — with a recovery lift — rather than delivering half of one.
  */
 import { describe, expect, it } from "vitest";
-import { TouchChannel, type TouchEvent, type TouchPhase } from "../../app/sim/touch-channel.js";
+import { MAX_BACKLOG, MAX_BATCH, TouchChannel, type StreamEvent } from "../../app/sim/touch-channel.js";
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
-/** A send that resolves immediately and remembers everything. */
+const touch = (phase: "begin" | "move" | "end", x: number, y: number, t = 0): StreamEvent => ({
+  kind: "touch",
+  phase,
+  x,
+  y,
+  t,
+});
+
+/** A send that resolves immediately and remembers every batch. */
 function immediate() {
-  const sent: TouchEvent[] = [];
-  const send = async (phase: TouchPhase, x: number, y: number): Promise<void> => {
-    sent.push({ phase, x, y });
+  const batches: StreamEvent[][] = [];
+  const send = async (events: StreamEvent[]): Promise<void> => {
+    batches.push(events);
   };
-  return { sent, send };
+  return { batches, send };
 }
 
 /** A send whose completions the test controls one at a time. */
 class GatedTransport {
-  sent: TouchEvent[] = [];
+  batches: StreamEvent[][] = [];
   private resolvers: Array<() => void> = [];
-  send = (phase: TouchPhase, x: number, y: number): Promise<void> => {
-    this.sent.push({ phase, x, y });
+  send = (events: StreamEvent[]): Promise<void> => {
+    this.batches.push(events);
     return new Promise((resolve) => this.resolvers.push(resolve));
   };
   /** Resolve every in-flight send, then let the pump run. */
@@ -34,108 +43,165 @@ class GatedTransport {
 }
 
 describe("the touch channel", () => {
-  it("delivers a tap as exactly begin then end", async () => {
-    const { sent, send } = immediate();
+  it("delivers a tap as begin then end, in order", async () => {
+    const { batches, send } = immediate();
     const channel = new TouchChannel(send);
-    channel.push("begin", 0.2, 0.8);
-    channel.push("end", 0.2, 0.8);
+    channel.push(touch("begin", 0.2, 0.8, 100));
+    channel.push(touch("end", 0.2, 0.8, 180));
     await tick();
     await tick();
-    expect(sent).toEqual([
-      { phase: "begin", x: 0.2, y: 0.8 },
-      { phase: "end", x: 0.2, y: 0.8 },
-    ]);
+    expect(batches.flat()).toEqual([touch("begin", 0.2, 0.8, 100), touch("end", 0.2, 0.8, 180)]);
   });
 
-  it("collapses moves to the freshest while a send is in flight", async () => {
+  it("accumulates everything behind the in-flight batch, losing no sample", async () => {
     const transport = new GatedTransport();
     const channel = new TouchChannel(transport.send);
 
-    channel.push("begin", 0.5, 0.5);
-    // The begin is in flight; these moves queue and collapse.
-    channel.push("move", 0.5, 0.6);
-    channel.push("move", 0.5, 0.7);
-    channel.push("move", 0.5, 0.8);
-    expect(channel.pending).toBe(1);
+    channel.push(touch("begin", 0.5, 0.5, 0));
+    // The begin is in flight; the whole trail queues behind it. The old
+    // channel collapsed these to the freshest — and iOS computes flick
+    // momentum from exactly the samples that collapse threw away.
+    channel.push(touch("move", 0.5, 0.6, 8));
+    channel.push(touch("move", 0.5, 0.7, 16));
+    channel.push(touch("move", 0.5, 0.8, 24));
+    expect(channel.pending).toBe(3);
 
     await transport.drain();
-    expect(transport.sent).toEqual([
-      { phase: "begin", x: 0.5, y: 0.5 },
-      { phase: "move", x: 0.5, y: 0.8 },
+    expect(transport.batches).toEqual([
+      [touch("begin", 0.5, 0.5, 0)],
+      [touch("move", 0.5, 0.6, 8), touch("move", 0.5, 0.7, 16), touch("move", 0.5, 0.8, 24)],
     ]);
   });
 
-  it("never collapses an end into the move before it", async () => {
+  it("keeps exactly one batch in flight — order needs no transport guarantee", async () => {
     const transport = new GatedTransport();
     const channel = new TouchChannel(transport.send);
 
-    channel.push("begin", 0.5, 0.5);
-    channel.push("move", 0.5, 0.6);
-    channel.push("move", 0.5, 0.7);
-    channel.push("end", 0.5, 0.7);
+    channel.push(touch("begin", 0.5, 0.5, 0));
+    channel.push(touch("move", 0.1, 0.1, 8));
+    channel.push(touch("end", 0.1, 0.1, 16));
+    // Only the first send has gone out; the rest wait for it.
+    expect(transport.batches).toHaveLength(1);
 
     await transport.drain();
-    expect(transport.sent).toEqual([
-      { phase: "begin", x: 0.5, y: 0.5 },
-      { phase: "move", x: 0.5, y: 0.7 },
-      { phase: "end", x: 0.5, y: 0.7 },
+    expect(transport.batches).toHaveLength(2);
+    expect(transport.batches.flat().map((event) => (event as { phase: string }).phase)).toEqual([
+      "begin",
+      "move",
+      "end",
     ]);
   });
 
-  it("sends immediately once the pipe is empty, and keeps order across drags", async () => {
+  it("splits an oversized backlog at the contract's cap", async () => {
     const transport = new GatedTransport();
     const channel = new TouchChannel(transport.send);
-
-    channel.push("begin", 0.5, 0.5);
-    channel.push("move", 0.1, 0.1);
+    channel.push(touch("begin", 0.5, 0.5, 0));
+    for (let i = 0; i < MAX_BATCH + 10; i += 1) {
+      channel.push(touch("move", 0.5, 0.5, i));
+    }
     await transport.drain();
-
-    // The queue is empty, so the next move starts its own send immediately —
-    // latest-wins only collapses moves stuck *behind* an in-flight send.
-    channel.push("move", 0.2, 0.2);
-    channel.push("move", 0.3, 0.3);
-    await transport.drain();
-
-    expect(transport.sent).toEqual([
-      { phase: "begin", x: 0.5, y: 0.5 },
-      { phase: "move", x: 0.1, y: 0.1 },
-      { phase: "move", x: 0.2, y: 0.2 },
-      { phase: "move", x: 0.3, y: 0.3 },
-    ]);
+    for (const batch of transport.batches) {
+      expect(batch.length).toBeLessThanOrEqual(MAX_BATCH);
+    }
   });
 
-  it("drops the rest of a gesture whose send fails, and recovers for the next", async () => {
+  it("thins moves — never boundaries — when the backlog says the link is dead", async () => {
+    const transport = new GatedTransport();
+    const channel = new TouchChannel(transport.send);
+    channel.push(touch("begin", 0.5, 0.5, 0));
+    for (let i = 0; i < MAX_BACKLOG + 40; i += 1) {
+      channel.push(touch("move", 0.5, 0.5, i));
+    }
+    channel.push(touch("end", 0.5, 0.5, 9999));
+    expect(channel.pending).toBeLessThanOrEqual(MAX_BACKLOG + 2);
+
+    await transport.drain();
+    const flat = transport.batches.flat() as Array<{ phase: string }>;
+    expect(flat[0]!.phase).toBe("begin");
+    expect(flat.at(-1)!.phase).toBe("end");
+  });
+
+  it("drops the rest of a failed gesture, lifts the finger, and recovers on the next begin", async () => {
     const errors: string[] = [];
-    const sent: TouchEvent[] = [];
+    const batches: StreamEvent[][] = [];
     let broken = true;
     const channel = new TouchChannel(
-      async (phase, x, y) => {
+      async (events) => {
         if (broken) throw new Error("socket dead");
-        sent.push({ phase, x, y });
+        batches.push(events);
       },
       () => errors.push("failed"),
     );
 
-    channel.push("begin", 0.5, 0.5);
-    channel.push("move", 0.6, 0.6);
-    channel.push("end", 0.7, 0.7);
+    channel.push(touch("begin", 0.5, 0.5, 0));
+    channel.push(touch("move", 0.6, 0.6, 8));
     await tick();
     await tick();
 
-    // The begin failed, so the move and end were meaningless and went nowhere.
-    expect(sent).toEqual([]);
+    // The begin failed. The gesture is dead, the panel was told once, and a
+    // recovery lift went out in case the batch was delivered but the response
+    // lost — an orphan end is dropped server-side, a missing one is five
+    // seconds of dead input.
     expect(errors).toEqual(["failed"]);
     expect(channel.pending).toBe(0);
 
+    // Moves and ends of the broken gesture go nowhere.
+    channel.push(touch("move", 0.7, 0.7, 16));
+    channel.push(touch("end", 0.7, 0.7, 24));
+    await tick();
+    expect(batches).toEqual([]);
+
     // The channel is not poisoned: the next gesture works.
     broken = false;
-    channel.push("begin", 0.1, 0.1);
-    channel.push("end", 0.1, 0.1);
+    channel.push(touch("begin", 0.1, 0.1, 40));
+    channel.push(touch("end", 0.1, 0.1, 90));
     await tick();
     await tick();
-    expect(sent).toEqual([
-      { phase: "begin", x: 0.1, y: 0.1 },
-      { phase: "end", x: 0.1, y: 0.1 },
-    ]);
+    expect(batches.flat()).toEqual([touch("begin", 0.1, 0.1, 40), touch("end", 0.1, 0.1, 90)]);
+  });
+
+  it("sends the recovery lift for the gesture that was actually down", async () => {
+    const sent: StreamEvent[][] = [];
+    let fail = false;
+    const channel = new TouchChannel(async (events) => {
+      if (fail) {
+        fail = false;
+        throw new Error("gone");
+      }
+      sent.push(events);
+    });
+
+    channel.push({ kind: "multi", phase: "begin", x1: 0.4, y1: 0.4, x2: 0.6, y2: 0.6, t: 0 });
+    await tick();
+    fail = true;
+    channel.push({ kind: "multi", phase: "move", x1: 0.3, y1: 0.3, x2: 0.7, y2: 0.7, t: 8 });
+    await tick();
+    await tick();
+
+    // The lift is a multi end — a single-finger end would leave the second
+    // finger on the glass.
+    const last = sent.flat().at(-1) as { kind: string; phase: string };
+    expect(last.kind).toBe("multi");
+    expect(last.phase).toBe("end");
+  });
+
+  it("lets scrolls flow while a broken gesture is being dropped", async () => {
+    const batches: StreamEvent[][] = [];
+    let broken = true;
+    const channel = new TouchChannel(async (events) => {
+      if (broken) throw new Error("dead");
+      batches.push(events);
+    });
+
+    channel.push(touch("begin", 0.5, 0.5, 0));
+    await tick();
+    await tick();
+    broken = false;
+
+    // Scrolls are stateless: nothing about the dead drag makes them wrong.
+    channel.push({ kind: "scroll", dx: 0, dy: 0.2, t: 20 });
+    await tick();
+    await tick();
+    expect(batches.flat()).toEqual([{ kind: "scroll", dx: 0, dy: 0.2, t: 20 }]);
   });
 });

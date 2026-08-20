@@ -251,7 +251,9 @@ export function makeDriveTool(ctx: Ctx) {
         const socket = ctx.live.requireSocket();
         for (const [index, step] of args.steps.entries()) {
           try {
-            const result = await executeStep(socket, step, resolver);
+            const result = await executeStep(socket, step, resolver, {
+              pasteText: (text) => ctx.live.pasteText(text),
+            });
             log.push(`${index + 1}. ${result.log}`);
           } catch (error) {
             // Stop at the first failure and say where. A drive that carried on

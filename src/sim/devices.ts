@@ -367,6 +367,23 @@ export class DeviceDriver {
     }
   }
 
+  /**
+   * Put text on the *device's* pasteboard.
+   *
+   * The HID keyboard is a US layout and can type ASCII only; anything else is
+   * pasted — pbcopy here, then the ⌘V chord over the control socket.
+   */
+  async pbcopy(udid: string, text: string, signal?: AbortSignal): Promise<void> {
+    const result = await this.runner("xcrun", ["simctl", "pbcopy", udid], {
+      timeoutMs: 20_000,
+      signal,
+      stdin: text,
+    });
+    if (result.code !== 0) {
+      throw new SimctlError(result.stderr.trim() || "Could not write to the simulator's pasteboard.");
+    }
+  }
+
   /** Create the dedicated stills device, so a render never fights the one you are watching. */
   async create(name: string, deviceTypeId: string, runtimeId: string, signal?: AbortSignal): Promise<string> {
     const result = await this.runner("xcrun", ["simctl", "create", name, deviceTypeId, runtimeId], {

@@ -16,7 +16,7 @@ import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../../src/sim/wire";
 import type { Step } from "../../src/sim/steps.js";
-import { TouchChannel, type TouchPhase } from "./touch-channel";
+import { TouchChannel, type StreamEvent } from "./touch-channel";
 
 export interface LiveState {
   kind:
@@ -104,7 +104,7 @@ let inFlight = false;
 let queued = false;
 
 /**
- * The one live-touch pipe.
+ * The one live-input pipe.
  *
  * Module-level for the same reason the store is: the nav panel and a thread
  * panel are separate React trees over one device, and two channels would
@@ -114,10 +114,10 @@ let queued = false;
 let touches: TouchChannel | null = null;
 
 function touchChannel(): TouchChannel {
-  touches ??= new TouchChannel((phase, x, y) => {
+  touches ??= new TouchChannel((events) => {
     const client = rpc;
     if (client === null) return Promise.resolve();
-    return client.call("liveTouch", { phase, x, y });
+    return client.call("liveStream", { events });
   });
   return touches;
 }
@@ -201,8 +201,8 @@ export interface LiveApi extends Snapshot {
   erase: (udid: string) => Promise<void>;
   /** One input step. Rejects with the server's sentence when it refuses. */
   input: (step: Step) => Promise<{ log: string; dropped: string[] }>;
-  /** One live touch frame — fire-and-forget, ordered, moves collapse. */
-  touch: (phase: TouchPhase, x: number, y: number) => void;
+  /** One live input event — fire-and-forget, ordered, batched by the channel. */
+  stream: (event: StreamEvent) => void;
   capture: (label?: string) => Promise<{ summary: string }>;
   reportStall: () => void;
   reportAlive: () => void;
@@ -271,11 +271,11 @@ export function useLive(): LiveApi {
   );
 
   /**
-   * Pointer events, straight through. The channel orders and coalesces; this
+   * Pointer events, straight through. The channel orders and batches; this
    * wrapper only exists so the panel never holds the channel itself.
    */
-  const touch = useCallback((phase: TouchPhase, x: number, y: number) => {
-    touchChannel().push(phase, x, y);
+  const stream = useCallback((event: StreamEvent) => {
+    touchChannel().push(event);
   }, []);
 
   const capture = useCallback(
@@ -325,7 +325,7 @@ export function useLive(): LiveApi {
   }, [client]);
 
   return useMemo(
-    () => ({ ...value, refresh, start, stop, shutdown, erase, input, touch, capture, reportStall, reportAlive }),
-    [value, start, stop, shutdown, erase, input, touch, capture, reportStall, reportAlive],
+    () => ({ ...value, refresh, start, stop, shutdown, erase, input, stream, capture, reportStall, reportAlive }),
+    [value, start, stop, shutdown, erase, input, stream, capture, reportStall, reportAlive],
   );
 }

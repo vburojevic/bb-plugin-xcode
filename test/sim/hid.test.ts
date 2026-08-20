@@ -18,6 +18,7 @@ import {
   KEY_LEFT_SHIFT,
   normalizeOrientation,
   TAG,
+  TAP_DWELL_MS,
   textToKeystrokes,
 } from "../../src/sim/hid.js";
 
@@ -235,6 +236,9 @@ async function openedSocket(): Promise<{ hid: HidSocket; ws: FakeWebSocket }> {
 }
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+/** Long enough for the live pump — including the tap-dwell floor — to drain. */
+const settle = (): Promise<void> => sleepMs(TAP_DWELL_MS + 25);
 
 describe("the socket", () => {
   it("ends a tap where the tap happened — never at screen centre", async () => {
@@ -270,17 +274,19 @@ describe("the socket", () => {
     expect(tapBegin).toBeGreaterThan(pressEnd);
   });
 
-  it("streams live touches verbatim, and drops orphans", async () => {
+  it("streams live touches in order, and drops orphans", async () => {
     const { hid, ws } = await openedSocket();
 
     // A move with no finger down is meaningless and must not reach the device.
     hid.touchMove(0.9, 0.9);
     hid.touchEnd(0.9, 0.9);
+    await settle();
     expect(touchFrames(ws)).toHaveLength(0);
 
     hid.touchBegin(0.3, 0.4);
     hid.touchMove(0.35, 0.45);
     hid.touchEnd(0.4, 0.5);
+    await settle();
     expect(touchFrames(ws)).toEqual([
       { type: "begin", x: 0.3, y: 0.4 },
       { type: "move", x: 0.35, y: 0.45 },
@@ -288,11 +294,82 @@ describe("the socket", () => {
     ]);
   });
 
-  it("does not let a live touch interrupt a scripted gesture", async () => {
+  it("holds a too-fast live tap to the dwell floor", async () => {
+    // Trackpad tap-to-click puts down and up on the same millisecond — below
+    // what any iOS tap recognizer accepts as contact. The tap arrived
+    // perfectly and did nothing, which read as "I can't tap anything".
+    const { hid, ws } = await openedSocket();
+    hid.touchBegin(0.2, 0.2);
+    hid.touchEnd(0.2, 0.2);
+    await sleepMs(15);
+    expect(touchFrames(ws).map((f) => f.type)).toEqual(["begin"]);
+    await sleepMs(60);
+    expect(touchFrames(ws).map((f) => f.type)).toEqual(["begin", "end"]);
+  });
+
+  it("replays a batch at its timestamps' spacing", async () => {
+    const { hid, ws } = await openedSocket();
+    hid.streamLive([
+      { kind: "touch", phase: "begin", x: 0.5, y: 0.5, t: 1000 },
+      { kind: "touch", phase: "move", x: 0.5, y: 0.4, t: 1060 },
+    ]);
+    await sleepMs(20);
+    // The move's moment is 60ms after the begin's; it must not have gone yet.
+    expect(touchFrames(ws).map((f) => f.type)).toEqual(["begin"]);
+    await sleepMs(70);
+    expect(touchFrames(ws).map((f) => f.type)).toEqual(["begin", "move"]);
+  });
+
+  it("lifts a stale finger when a fresh begin arrives over it", async () => {
+    // A lost end — a dropped batch, a killed panel — used to wedge input for
+    // the five seconds the watchdog took to notice, because every new begin
+    // was silently swallowed.
+    const { hid, ws } = await openedSocket();
+    hid.touchBegin(0.3, 0.3);
+    hid.touchMove(0.4, 0.4);
+    await settle();
+    hid.touchBegin(0.8, 0.8);
+    await settle();
+    expect(touchFrames(ws)).toEqual([
+      { type: "begin", x: 0.3, y: 0.3 },
+      { type: "move", x: 0.4, y: 0.4 },
+      // The stale finger is lifted where it actually was...
+      { type: "end", x: 0.4, y: 0.4 },
+      // ...and the fresh gesture proceeds.
+      { type: "begin", x: 0.8, y: 0.8 },
+    ]);
+  });
+
+  it("streams two live fingers as multi-touch frames", async () => {
+    const { hid, ws } = await openedSocket();
+    hid.streamLive([
+      { kind: "multi", phase: "begin", x1: 0.4, y1: 0.4, x2: 0.6, y2: 0.6, t: 0 },
+      { kind: "multi", phase: "move", x1: 0.3, y1: 0.3, x2: 0.7, y2: 0.7, t: 8 },
+      { kind: "multi", phase: "end", x1: 0.3, y1: 0.3, x2: 0.7, y2: 0.7, t: 16 },
+    ]);
+    await settle();
+    const frames = ws.sent.map((frame) => decode(frame)).filter((frame) => frame.tag === TAG.multiTouch);
+    expect(frames.map((frame) => (frame.body as { type: string }).type)).toEqual([
+      "begin",
+      "move",
+      "end",
+    ]);
+  });
+
+  it("carries scroll events on the live stream", async () => {
+    const { hid, ws } = await openedSocket();
+    hid.streamLive([{ kind: "scroll", dx: 0, dy: -0.25, x: 0.5, y: 0.5, t: 0 }]);
+    await settle();
+    const scrolls = ws.sent.map((frame) => decode(frame)).filter((frame) => frame.tag === TAG.scroll);
+    expect(scrolls).toHaveLength(1);
+    expect(scrolls[0]!.body).toEqual({ dx: 0, dy: -0.25, x: 0.5, y: 0.5 });
+  });
+
+  it("refuses live events while a scripted gesture owns the finger", async () => {
     const { hid, ws } = await openedSocket();
     const press = hid.longPress(0.5, 0.5, 100);
     await tick(); // let the press's begin leave
-    hid.touchBegin(0.9, 0.9);
+    expect(hid.streamLive([{ kind: "touch", phase: "begin", x: 0.9, y: 0.9, t: 0 }])).toBe(false);
     await press;
     // One begin only: the live finger was refused while the gesture owned it.
     expect(touchFrames(ws).filter((f) => f.type === "begin")).toHaveLength(1);
@@ -302,8 +379,21 @@ describe("the socket", () => {
     const { hid, ws } = await openedSocket();
     hid.touchBegin(0.3, 0.4);
     hid.touchMove(0.6, 0.7);
+    await settle();
     hid.close();
     expect(touchFrames(ws).at(-1)).toEqual({ type: "end", x: 0.6, y: 0.7 });
+  });
+
+  it("lifts both fingers when a pinch is cut short", async () => {
+    // A pinch aborted with a single-finger end leaves the second finger on
+    // the glass, and a device with a phantom finger ignores every real one.
+    const { hid, ws } = await openedSocket();
+    const pinch = hid.pinch({ x: 0.5, y: 0.5 }, 0.2, 0.6, 120);
+    await sleepMs(30);
+    hid.close();
+    await pinch.catch(() => undefined);
+    const multi = ws.sent.map((frame) => decode(frame)).filter((frame) => frame.tag === TAG.multiTouch);
+    expect((multi.at(-1)!.body as { type: string }).type).toBe("end");
   });
 
   it("marks a drag from the bezel zone as the home gesture, and a mid-screen one as not", async () => {
@@ -313,6 +403,7 @@ describe("the socket", () => {
     hid.touchBegin(0.5, 0.97);
     hid.touchMove(0.5, 0.6);
     hid.touchEnd(0.5, 0.35);
+    await settle();
     const edged = ws.sent.map((frame) => decode(frame)).filter((frame) => frame.tag === TAG.touch);
     expect((edged[0]!.body as { edge?: number }).edge).toBe(EDGE_BOTTOM);
     expect((edged[1]!.body as { edge?: number }).edge).toBe(EDGE_BOTTOM);
@@ -321,6 +412,7 @@ describe("the socket", () => {
     hid.touchBegin(0.5, 0.5);
     hid.touchMove(0.5, 0.4);
     hid.touchEnd(0.5, 0.3);
+    await settle();
     const plain = ws.sent
       .map((frame) => decode(frame))
       .filter((frame) => frame.tag === TAG.touch)

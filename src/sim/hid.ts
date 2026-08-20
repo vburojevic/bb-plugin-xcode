@@ -226,6 +226,11 @@ export interface KeyStroke {
   shift: boolean;
 }
 
+/** Left GUI — the ⌘ key. iOS honours hardware-keyboard ⌘V in any text field. */
+export const KEY_LEFT_GUI = 0xe3;
+/** The `v` key, for the paste chord. */
+export const KEY_V = 0x19;
+
 /**
  * Text to keystrokes.
  *
@@ -279,6 +284,31 @@ export const TAP_DWELL_MS = 45;
 export const EDGE_BOTTOM = 3;
 
 /**
+ * One event on the live input stream.
+ *
+ * `t` is a millisecond timestamp from the sender's own clock — the panel's
+ * `event.timeStamp`, or `Date.now()` for a legacy single-event caller. Only the
+ * *deltas* are ever read: the replay pump reproduces the spacing between
+ * events, never their absolute times, so two senders with different epochs
+ * cannot corrupt each other — a jump merely rebases the clock.
+ */
+export type LiveStreamEvent =
+  | { kind: "touch"; phase: TouchPhase; x: number; y: number; t: number }
+  | { kind: "multi"; phase: TouchPhase; x1: number; y1: number; x2: number; y2: number; t: number }
+  | { kind: "scroll"; dx: number; dy: number; x?: number; y?: number; t: number };
+
+/**
+ * A computed wait longer than this is a clock artefact, not a gesture.
+ *
+ * A held finger legitimately produces long gaps — a long-press streams no
+ * moves — and those replay as real waiting because the *arrival* is equally
+ * late. A gap bigger than this with events already queued behind it means the
+ * sender's clock jumped (a suspended tab, a switched source), and the honest
+ * move is to rebase and inject now rather than to freeze input.
+ */
+export const MAX_LIVE_LAG_MS = 1500;
+
+/**
  * Where a live drag has to start to be the home gesture.
  *
  * The bottom ~6% of the screen is the bezel zone: on Face ID hardware and in
@@ -316,11 +346,22 @@ export class HidSocket {
    */
   private lastPoint = { x: 0.5, y: 0.5 };
   /**
+   * Whether the current contact is two fingers, and where they are.
+   *
+   * The guard's lift has to know: ending a pinch with a single-finger `end`
+   * leaves the second finger down, and a device with a phantom finger ignores
+   * every real one after it.
+   */
+  private isMulti = false;
+  private lastMultiPoint = { x1: 0.4, y1: 0.4, x2: 0.6, y2: 0.6 };
+  /**
    * Gestures, serialized. An overlap used to throw "a gesture is already in
    * flight" back at the user for tapping twice quickly; gestures are physical
    * things that happen one after another, so they queue one after another.
    */
   private queue: Promise<unknown> = Promise.resolve();
+  /** True while a scripted gesture's body is running; live events are refused. */
+  private scriptedActive = false;
 
   constructor(private readonly options: HidSocketOptions) {}
 
@@ -388,6 +429,7 @@ export class HidSocket {
     // The finger is down on a socket that is gone. Nothing can lift it now, and
     // the device will stay wedged — say so rather than losing it.
     this.fingerDown = false;
+    this.isMulti = false;
     try {
       this.options.onClose(reason);
     } catch {
@@ -432,13 +474,29 @@ export class HidSocket {
     this.send(encodeTouch(phase, x, y, edge));
   }
 
+  /** A multi-touch frame that also remembers where both fingers are. */
+  private multiSend(phase: TouchPhase, x1: number, y1: number, x2: number, y2: number): void {
+    this.lastMultiPoint = { x1: clamp01(x1), y1: clamp01(y1), x2: clamp01(x2), y2: clamp01(y2) };
+    this.send(encodeMultiTouch(phase, x1, y1, x2, y2));
+  }
+
   private liftFinger(): void {
     this.clearStuckTimer();
     if (!this.fingerDown) return;
     this.fingerDown = false;
+    const wasMulti = this.isMulti;
+    this.isMulti = false;
+    this.liveEdge = undefined;
     try {
-      // At the point the finger actually is — never at a default.
-      this.touchSend("end", this.lastPoint.x, this.lastPoint.y);
+      // At the point the fingers actually are — never at a default — and with
+      // as many fingers as are actually down: a pinch lifted with a
+      // single-finger end leaves the second finger wedged on the glass.
+      if (wasMulti) {
+        const m = this.lastMultiPoint;
+        this.multiSend("end", m.x1, m.y1, m.x2, m.y2);
+      } else {
+        this.touchSend("end", this.lastPoint.x, this.lastPoint.y);
+      }
     } catch {
       // The socket died mid-gesture. There is no finger to lift on a device we
       // can no longer reach.
@@ -453,10 +511,12 @@ export class HidSocket {
       throw new Error("A finger is already down on this simulator.");
     }
     this.fingerDown = true;
+    this.scriptedActive = true;
     this.armStuckTimer();
     try {
       await body({ touch: (phase, x, y, edge) => this.touchSend(phase, x, y, edge), send: this.send });
     } finally {
+      this.scriptedActive = false;
       this.liftFinger();
     }
   }
@@ -480,58 +540,193 @@ export class HidSocket {
   }
 
   // -------------------------------------------------------------------------
-  // Live touches: the panel's pointer events, streamed as-is
+  // The live stream: the panel's pointer events, replayed at their own pace
   //
-  // These are not gestures and never enter the queue: the panel sends begin,
-  // a stream of moves and an end, and iOS does all the recognising — tap,
-  // long-press, double-tap, drag — exactly as if a finger were on the glass.
+  // These are not gestures and never enter the gesture queue: the panel sends
+  // begin, a stream of moves and an end, and iOS does all the recognising —
+  // tap, long-press, double-tap, drag — exactly as if a finger were on the
+  // glass.
+  //
+  // RPC is plain HTTP with no ordering between concurrent calls, so the panel
+  // ships events in ordered *batches* — one in flight, the rest accumulating —
+  // and each event carries the timestamp of the pointer event that made it.
+  // The pump here replays the batch at those timestamps' spacing. That is the
+  // difference between a flick that arrives as three teleporting positions and
+  // one that arrives as the curve the finger actually drew: iOS computes
+  // scroll momentum from the last few samples before the lift, and momentum
+  // computed from teleports is why remote swiping felt terrible.
   // -------------------------------------------------------------------------
 
   /** The edge a live drag started on, carried by every frame until it ends. */
   private liveEdge: number | undefined;
+  private liveQueue: LiveStreamEvent[] = [];
+  private livePumping = false;
+  /** The replay clock: wall time that stands for sender time `t`. */
+  private liveBase: { wall: number; t: number } | null = null;
+  /** When the current live touch's begin was injected, for the dwell floor. */
+  private liveBeganAt = 0;
 
   /**
-   * Finger down. Silently dropped while a scripted gesture owns the finger.
+   * Take a batch of live events onto the replay queue.
    *
+   * Refused — `false`, whole batch — while a scripted gesture's body owns the
+   * finger: a drive step mid-flight cannot have a human finger spliced into
+   * it. The panel reads the boolean and says so, instead of a tap silently
+   * doing nothing.
+   */
+  streamLive(events: readonly LiveStreamEvent[]): boolean {
+    if (this.scriptedActive) return false;
+    this.liveQueue.push(...events);
+    if (!this.livePumping) void this.pumpLive();
+    return true;
+  }
+
+  /**
+   * One pump, draining in order. Every await is a deliberate pace: the queue
+   * itself is FIFO and nothing reorders it.
+   */
+  private async pumpLive(): Promise<void> {
+    this.livePumping = true;
+    try {
+      for (;;) {
+        const event = this.liveQueue.shift();
+        if (event === undefined) break;
+        await this.paceLive(event.t);
+        if (event.kind === "touch" && event.phase === "end") await this.holdTapDwell();
+        this.injectLive(event);
+      }
+    } finally {
+      this.livePumping = false;
+      // A held finger keeps the clock: the end that is coming belongs to the
+      // same gesture. A drained queue with no finger down is a boundary.
+      if (!this.fingerDown) this.liveBase = null;
+    }
+  }
+
+  /** Sleep until this event's moment on the replay clock, rebasing when late. */
+  private async paceLive(t: number): Promise<void> {
+    const now = Date.now();
+    if (this.liveBase === null) {
+      this.liveBase = { wall: now, t };
+      return;
+    }
+    const wait = this.liveBase.wall + (t - this.liveBase.t) - now;
+    if (wait <= 0 || wait > MAX_LIVE_LAG_MS) {
+      // Late — the network held a batch — or the sender's clock jumped.
+      // Inject now and measure the next delta from reality, so lateness never
+      // compounds and a clock jump never freezes input.
+      this.liveBase = { wall: now, t };
+      return;
+    }
+    await sleep(wait);
+  }
+
+  /**
+   * The dwell floor for a live tap.
+   *
+   * Trackpad tap-to-click produces down and up on the same millisecond, which
+   * is below what any iOS tap recognizer accepts as contact — the tap reaches
+   * the device perfectly and does nothing. Held to the same floor a scripted
+   * tap uses.
+   */
+  private async holdTapDwell(): Promise<void> {
+    if (!this.fingerDown || this.isMulti) return;
+    const wait = TAP_DWELL_MS - (Date.now() - this.liveBeganAt);
+    if (wait > 0) await sleep(wait);
+  }
+
+  private injectLive(event: LiveStreamEvent): void {
+    try {
+      switch (event.kind) {
+        case "scroll":
+          this.send(encodeScroll(event.dx, event.dy, event.x, event.y));
+          return;
+        case "touch":
+          this.injectLiveTouch(event);
+          return;
+        case "multi":
+          this.injectLiveMulti(event);
+          return;
+      }
+    } catch {
+      // The socket is gone; the close path reports it, and the rest of the
+      // queue drains against a device that can no longer be reached.
+    }
+  }
+
+  /**
    * A begin in the bezel zone is marked as an edge touch, so a drag from the
    * bottom of the frame is the home gesture — the same reading Simulator.app
    * gives a drag from the bottom of its window.
    */
-  touchBegin(x: number, y: number): void {
-    if (this.fingerDown) return;
-    this.fingerDown = true;
-    this.liveEdge = y >= EDGE_GESTURE_START_Y ? EDGE_BOTTOM : undefined;
-    this.armStuckTimer();
-    try {
-      this.touchSend("begin", x, y, this.liveEdge);
-    } catch {
-      this.fingerDown = false;
-      this.liveEdge = undefined;
-      this.clearStuckTimer();
+  private injectLiveTouch(event: { phase: TouchPhase; x: number; y: number }): void {
+    if (event.phase === "begin") {
+      // A begin over a finger that is already down means an end was lost —
+      // a dropped batch, a killed panel. Lift it and start clean: the old
+      // behaviour (drop the begin) wedged input for the five seconds the
+      // stuck-finger watchdog took to notice, which read as "I can't tap
+      // anything".
+      if (this.fingerDown) this.liftFinger();
+      this.fingerDown = true;
+      this.isMulti = false;
+      this.liveEdge = event.y >= EDGE_GESTURE_START_Y ? EDGE_BOTTOM : undefined;
+      this.liveBeganAt = Date.now();
+      this.armStuckTimer();
+      this.touchSend("begin", event.x, event.y, this.liveEdge);
+      return;
     }
+    // Orphans — a move or end with no finger down, or with two fingers down —
+    // are meaningless and must not reach the device.
+    if (!this.fingerDown || this.isMulti) return;
+    if (event.phase === "move") {
+      // A moving finger is demonstrably alive; only an *abandoned* one is
+      // stuck. Re-arming here is what lets a slow six-second drag finish.
+      this.armStuckTimer();
+      this.touchSend("move", event.x, event.y, this.liveEdge);
+      return;
+    }
+    this.fingerDown = false;
+    this.liveEdge = undefined;
+    this.clearStuckTimer();
+    this.touchSend("end", event.x, event.y);
+  }
+
+  /** Two live fingers — the panel's trackpad pinch, streamed like the drag. */
+  private injectLiveMulti(event: { phase: TouchPhase; x1: number; y1: number; x2: number; y2: number }): void {
+    if (event.phase === "begin") {
+      if (this.fingerDown) this.liftFinger();
+      this.fingerDown = true;
+      this.isMulti = true;
+      this.liveBeganAt = Date.now();
+      this.armStuckTimer();
+      this.multiSend("begin", event.x1, event.y1, event.x2, event.y2);
+      return;
+    }
+    if (!this.fingerDown || !this.isMulti) return;
+    if (event.phase === "move") {
+      this.armStuckTimer();
+      this.multiSend("move", event.x1, event.y1, event.x2, event.y2);
+      return;
+    }
+    this.fingerDown = false;
+    this.isMulti = false;
+    this.clearStuckTimer();
+    this.multiSend("end", event.x1, event.y1, event.x2, event.y2);
+  }
+
+  /** Finger down, as a single legacy event. `Date.now()` paces by arrival. */
+  touchBegin(x: number, y: number): void {
+    this.streamLive([{ kind: "touch", phase: "begin", x, y, t: Date.now() }]);
   }
 
   /** Finger moved. With no finger down there is nothing to move. */
   touchMove(x: number, y: number): void {
-    if (!this.fingerDown) return;
-    try {
-      this.touchSend("move", x, y, this.liveEdge);
-    } catch {
-      // The socket is gone; the close path reports it.
-    }
+    this.streamLive([{ kind: "touch", phase: "move", x, y, t: Date.now() }]);
   }
 
   /** Finger up, at the point it was lifted. */
   touchEnd(x: number, y: number): void {
-    if (!this.fingerDown) return;
-    this.fingerDown = false;
-    this.liveEdge = undefined;
-    this.clearStuckTimer();
-    try {
-      this.touchSend("end", x, y);
-    } catch {
-      // The socket is gone; the close path reports it.
-    }
+    this.streamLive([{ kind: "touch", phase: "end", x, y, t: Date.now() }]);
   }
 
   // -------------------------------------------------------------------------
@@ -611,7 +806,7 @@ export class HidSocket {
     durationMs = 300,
   ): Promise<void> {
     return this.enqueueGesture(async () => {
-      await this.gestureLocked(async ({ send }) => {
+      await this.gestureLocked(async () => {
         const steps = Math.max(2, Math.min(30, Math.round(durationMs / 16)));
         const at = (spread: number): [number, number, number, number] => [
           center.x - spread / 2,
@@ -619,15 +814,20 @@ export class HidSocket {
           center.x + spread / 2,
           center.y + spread / 2,
         ];
-        send(encodeMultiTouch("begin", ...at(fromSpread)));
+        // Marked as a two-finger contact so an abort mid-pinch — a thrown
+        // send, the watchdog — lifts *both* fingers. A pinch lifted with a
+        // single-finger end leaves the second one wedged on the glass.
+        this.isMulti = true;
+        this.multiSend("begin", ...at(fromSpread));
         for (let i = 1; i <= steps; i += 1) {
           const t = i / steps;
           await sleep(durationMs / steps);
-          send(encodeMultiTouch("move", ...at(fromSpread + (toSpread - fromSpread) * t)));
+          this.multiSend("move", ...at(fromSpread + (toSpread - fromSpread) * t));
         }
-        // Multi-touch has its own end frame; the guard's single-finger lift would
-        // leave the second finger down.
-        send(encodeMultiTouch("end", ...at(toSpread)));
+        this.multiSend("end", ...at(toSpread));
+        // Both fingers are up; the guard's lift in `finally` has nothing to do.
+        this.fingerDown = false;
+        this.isMulti = false;
       });
     });
   }
@@ -654,6 +854,24 @@ export class HidSocket {
     this.send(encodeKey("down", usage));
     await sleep(8);
     this.send(encodeKey("up", usage));
+  }
+
+  /**
+   * ⌘V, as a hardware-keyboard chord.
+   *
+   * The other half of typing: the HID keyboard is a US layout and can type
+   * ASCII only, so text with an é or an emoji goes to the *device pasteboard*
+   * (`simctl pbcopy`) and this chord pastes it — iOS honours hardware-keyboard
+   * shortcuts in any text field.
+   */
+  async pasteChord(): Promise<void> {
+    this.send(encodeKey("down", KEY_LEFT_GUI));
+    await sleep(8);
+    this.send(encodeKey("down", KEY_V));
+    await sleep(8);
+    this.send(encodeKey("up", KEY_V));
+    await sleep(8);
+    this.send(encodeKey("up", KEY_LEFT_GUI));
   }
 
   button(name: ButtonName): void {

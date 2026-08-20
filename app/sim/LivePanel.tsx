@@ -21,10 +21,19 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { liveVeil, metaLine, TONE_CLASS } from "./copy";
 import type { Action } from "./copy";
-import { contentRect, keyStep, toNormalized, wheelStep } from "./frame-input";
+import {
+  contentRect,
+  keyStep,
+  PINCH_IDLE_END_MS,
+  PINCH_INITIAL_SPREAD,
+  pinchFingers,
+  pinchSpread,
+  toNormalized,
+  wheelStep,
+} from "./frame-input";
 import { canDecodeH264, currentViewerCanReachLoopback } from "./stream-core";
 import { describeSource, streamSources, type StreamSource } from "./stream-sources";
-import type { TouchPhase } from "./touch-channel";
+import type { StreamEvent } from "./touch-channel";
 import { useStream } from "./useStream";
 import type { DeviceList, LiveState } from "./useLive";
 import type { Step } from "../../src/sim/steps.js";
@@ -50,8 +59,8 @@ export interface LivePanelProps {
   onAlive: () => void;
   onOpenDoctor: () => void;
   onStep: (step: Step) => void;
-  /** Live touch frames from the pointer — the device does the recognising. */
-  onTouch: (phase: TouchPhase, x: number, y: number) => void;
+  /** Live input frames from the pointer — the device does the recognising. */
+  onInput: (event: StreamEvent) => void;
   /** Rendered under the meta line — the Frames strip, once captures exist. */
   belowMeta?: React.ReactNode;
   /** Rendered along the bottom edge. */
@@ -67,7 +76,7 @@ export function LivePanel({
   onAlive,
   onOpenDoctor,
   onStep,
-  onTouch,
+  onInput,
   belowMeta,
   controls,
 }: LivePanelProps) {
@@ -123,7 +132,7 @@ export function LivePanel({
         onStall={onStall}
         onAlive={onAlive}
         onStep={onStep}
-        onTouch={onTouch}
+        onInput={onInput}
         onStreamFailed={() => setStreamFailed(true)}
         onStats={onStreamStats}
       />
@@ -170,7 +179,7 @@ interface LiveFrameProps {
   onStall: () => void;
   onAlive: () => void;
   onStep: (step: Step) => void;
-  onTouch: (phase: TouchPhase, x: number, y: number) => void;
+  onInput: (event: StreamEvent) => void;
   onStreamFailed: () => void;
   /** Reports the rung in use and its pace, for the meta line. */
   onStats: (source: StreamSource | null, fps: number | null) => void;
@@ -183,7 +192,7 @@ function LiveFrame({
   onStall,
   onAlive,
   onStep,
-  onTouch,
+  onInput,
   onStreamFailed,
   onStats,
 }: LiveFrameProps) {
@@ -199,6 +208,7 @@ function LiveFrame({
 
   const visible = useDocumentVisible();
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const frameRef = useRef<HTMLDivElement | null>(null);
   const [crosshair, setCrosshair] = useState<{ x: number; y: number } | null>(null);
 
   /**
@@ -282,20 +292,22 @@ function LiveFrame({
   useFrameWatchdog(active && state?.kind === "streaming", video.frames, onStall, onAlive);
 
   /**
-   * Pointer events become touch frames, verbatim.
+   * Pointer events become touch frames, verbatim and fully sampled.
    *
    * There is no gesture classification here on purpose: the panel used to
    * decide "that was a tap" or "that was a swipe", replay the gesture
    * server-side, and get it subtly wrong (a tap's `end` even went out at
    * screen centre). Streaming begin/move/end as they happen lets iOS do all
    * of the recognising — tap, double-tap, long-press, drag — at the full
-   * fidelity of a finger on glass, and the frame above it responds *while*
-   * you drag, not after you let go.
+   * fidelity of a finger on glass.
+   *
+   * Moves go out with `getCoalescedEvents()` — the full 120 Hz trail, each
+   * sample with its own timestamp — because the transport batches and the
+   * server replays at those timestamps' spacing. The per-frame latest-wins
+   * coalescing that used to live here threw the trail away, and iOS computes
+   * flick momentum from exactly the samples it discarded.
    */
   const dragging = useRef<{ pointerId: number; x: number; y: number } | null>(null);
-  /** Freshest unsent move; coalesced to one per animation frame. */
-  const pendingMove = useRef<{ x: number; y: number } | null>(null);
-  const moveFrame = useRef(0);
 
   const rectOf = useCallback((): DOMRect | null => {
     const box = canvasRef.current?.getBoundingClientRect() ?? null;
@@ -303,16 +315,42 @@ function LiveFrame({
     return contentRect(box, screen) as DOMRect;
   }, [screen]);
 
-  const flushMove = useCallback((): void => {
-    moveFrame.current = 0;
-    const move = pendingMove.current;
-    pendingMove.current = null;
-    const drag = dragging.current;
-    if (move === null || drag === null) return;
-    drag.x = move.x;
-    drag.y = move.y;
-    onTouch("move", move.x, move.y);
-  }, [onTouch]);
+  // The wheel listener attaches once; these refs keep it reading fresh facts.
+  const rectOfRef = useRef(rectOf);
+  useEffect(() => {
+    rectOfRef.current = rectOf;
+  }, [rectOf]);
+  const onInputRef = useRef(onInput);
+  useEffect(() => {
+    onInputRef.current = onInput;
+  }, [onInput]);
+
+  /**
+   * The trackpad pinch, as two live fingers.
+   *
+   * macOS delivers a pinch as wheel events with `ctrlKey` set. Each one moves
+   * a pair of synthetic fingers on a diagonal around the cursor, and a beat
+   * with no event ends the gesture — so a map or a photo zooms *while* the
+   * fingers spread, exactly like the glass.
+   */
+  const pinch = useRef<{ spread: number; x: number; y: number; timer: number } | null>(null);
+
+  const endPinch = useCallback((): void => {
+    const active = pinch.current;
+    if (active === null) return;
+    pinch.current = null;
+    window.clearTimeout(active.timer);
+    onInputRef.current({
+      kind: "multi",
+      phase: "end",
+      ...pinchFingers({ x: active.x, y: active.y }, active.spread),
+      t: performance.now(),
+    });
+  }, []);
+  const endPinchRef = useRef(endPinch);
+  useEffect(() => {
+    endPinchRef.current = endPinch;
+  }, [endPinch]);
 
   /**
    * Lift the finger wherever the drag is abandoned: unmount, tab hidden,
@@ -323,18 +361,13 @@ function LiveFrame({
    * simulator ignoring input, with no error anywhere.
    */
   const abandonDrag = useCallback((): void => {
+    endPinch();
     const drag = dragging.current;
     if (drag === null) return;
     dragging.current = null;
-    if (moveFrame.current !== 0) {
-      cancelAnimationFrame(moveFrame.current);
-      moveFrame.current = 0;
-    }
-    // The freshest position is the honest lift point, sent or not.
-    const at = pendingMove.current ?? { x: drag.x, y: drag.y };
-    pendingMove.current = null;
-    onTouch("end", at.x, at.y);
-  }, [onTouch]);
+    // The freshest position is the honest lift point.
+    onInput({ kind: "touch", phase: "end", x: drag.x, y: drag.y, t: performance.now() });
+  }, [onInput, endPinch]);
 
   // Returned as the cleanup: unmounting mid-drag lifts the finger too.
   useEffect(() => abandonDrag, [abandonDrag]);
@@ -342,26 +375,24 @@ function LiveFrame({
     if (!visible) abandonDrag();
   }, [visible, abandonDrag]);
 
-  useEffect(
-    () => () => {
-      if (moveFrame.current !== 0) cancelAnimationFrame(moveFrame.current);
-    },
-    [],
-  );
-
   const onPointerDown = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
       if (!interactive || event.button !== 0) return;
       const rect = rectOf();
       if (rect === null) return;
+      // A real finger replaces the synthetic pinch pair.
+      endPinch();
       // Capture so a drag that leaves the frame still ends here — otherwise the
       // gesture never completes and the finger stays down on the device.
       event.currentTarget.setPointerCapture(event.pointerId);
+      // Focus, explicitly: paste and the keyboard map belong to a frame that
+      // was just clicked, and not every browser focuses a tabIndex div itself.
+      event.currentTarget.focus();
       const point = toNormalized(rect, event.clientX, event.clientY);
       dragging.current = { pointerId: event.pointerId, x: point.x, y: point.y };
-      onTouch("begin", point.x, point.y);
+      onInput({ kind: "touch", phase: "begin", x: point.x, y: point.y, t: event.timeStamp });
     },
-    [interactive, rectOf, onTouch],
+    [interactive, rectOf, onInput, endPinch],
   );
 
   const onPointerMove = useCallback(
@@ -370,10 +401,19 @@ function LiveFrame({
       if (drag === null || drag.pointerId !== event.pointerId) return;
       const rect = rectOf();
       if (rect === null) return;
-      pendingMove.current = toNormalized(rect, event.clientX, event.clientY);
-      if (moveFrame.current === 0) moveFrame.current = requestAnimationFrame(flushMove);
+      // The coalesced samples are the full-rate trail this event summarizes;
+      // browsers without the API get the summary sample alone.
+      const native = event.nativeEvent;
+      const trail =
+        typeof native.getCoalescedEvents === "function" ? native.getCoalescedEvents() : [];
+      for (const sample of trail.length > 0 ? trail : [native]) {
+        const point = toNormalized(rect, sample.clientX, sample.clientY);
+        drag.x = point.x;
+        drag.y = point.y;
+        onInput({ kind: "touch", phase: "move", x: point.x, y: point.y, t: sample.timeStamp });
+      }
     },
-    [rectOf, flushMove],
+    [rectOf, onInput],
   );
 
   const endDrag = useCallback(
@@ -381,68 +421,131 @@ function LiveFrame({
       const drag = dragging.current;
       if (drag === null || drag.pointerId !== event.pointerId) return;
       dragging.current = null;
-      if (moveFrame.current !== 0) {
-        cancelAnimationFrame(moveFrame.current);
-        moveFrame.current = 0;
-      }
-      pendingMove.current = null;
       const rect = rectOf();
-      if (rect === null) return;
-      const point = toNormalized(rect, event.clientX, event.clientY);
-      onTouch("end", point.x, point.y);
+      const point =
+        rect === null
+          ? { x: drag.x, y: drag.y }
+          : toNormalized(rect, event.clientX, event.clientY);
+      onInput({ kind: "touch", phase: "end", x: point.x, y: point.y, t: event.timeStamp });
     },
-    [rectOf, onTouch],
+    [rectOf, onInput],
   );
 
   /**
-   * The wheel, accumulated per frame rather than throttled per event.
+   * The wheel, native and non-passive.
    *
-   * The old 40ms throttle *dropped* every delta that arrived inside the
-   * window — that lost distance is exactly the "scroll is slow" a trackpad
-   * user feels. Accumulating preserves every pixel and still sends at most
-   * one scroll step per animation frame, anchored under the cursor so the
-   * list being pointed at is the list that scrolls.
+   * React attaches wheel listeners passively, and a passive listener cannot
+   * `preventDefault()` — so a trackpad pinch also zoomed the whole bb window,
+   * and a scroll bled into the page behind the panel. One native listener
+   * owns both: `ctrlKey` wheels are the macOS pinch, everything else
+   * accumulates per animation frame into a scroll anchored under the cursor.
+   * Accumulating preserves every pixel of delta; the old 40ms throttle
+   * dropped them, which is exactly the "scroll is slow" a trackpad user felt.
    */
   const wheel = useRef({ dx: 0, dy: 0, clientX: 0, clientY: 0, deltaMode: 0, frame: 0 });
 
-  const onWheel = useCallback(
-    (event: React.WheelEvent<HTMLDivElement>) => {
-      if (!interactive) return;
-      const acc = wheel.current;
+  useEffect(() => {
+    const node = frameRef.current;
+    if (node === null || !interactive) return;
+    const acc = wheel.current;
+
+    const flush = (): void => {
+      acc.frame = 0;
+      const rect = rectOfRef.current();
+      if (rect === null) {
+        acc.dx = 0;
+        acc.dy = 0;
+        return;
+      }
+      const step = wheelStep(
+        rect,
+        acc.dx,
+        acc.dy,
+        toNormalized(rect, acc.clientX, acc.clientY),
+        acc.deltaMode,
+      );
+      acc.dx = 0;
+      acc.dy = 0;
+      if (step !== null && step.kind === "scroll") {
+        // `at` is always coordinates here — `wheelStep` anchors under the
+        // cursor — but the step schema also admits an element reference.
+        const at = step.at !== undefined && "x" in step.at ? step.at : undefined;
+        onInputRef.current({
+          kind: "scroll",
+          dx: step.dx,
+          dy: step.dy,
+          ...(at === undefined ? {} : { x: at.x, y: at.y }),
+          t: performance.now(),
+        });
+      }
+    };
+
+    const onNativeWheel = (event: WheelEvent): void => {
+      event.preventDefault();
+      if (event.ctrlKey) {
+        const rect = rectOfRef.current();
+        if (rect === null) return;
+        const at = toNormalized(rect, event.clientX, event.clientY);
+        let active = pinch.current;
+        if (active === null) {
+          active = { spread: PINCH_INITIAL_SPREAD, x: at.x, y: at.y, timer: 0 };
+          pinch.current = active;
+          onInputRef.current({
+            kind: "multi",
+            phase: "begin",
+            ...pinchFingers(at, active.spread),
+            t: event.timeStamp,
+          });
+        }
+        active.x = at.x;
+        active.y = at.y;
+        active.spread = pinchSpread(active.spread, event.deltaY);
+        onInputRef.current({
+          kind: "multi",
+          phase: "move",
+          ...pinchFingers(at, active.spread),
+          t: event.timeStamp,
+        });
+        window.clearTimeout(active.timer);
+        active.timer = window.setTimeout(() => endPinchRef.current(), PINCH_IDLE_END_MS);
+        return;
+      }
       acc.dx += event.deltaX;
       acc.dy += event.deltaY;
       acc.clientX = event.clientX;
       acc.clientY = event.clientY;
       acc.deltaMode = event.deltaMode;
-      if (acc.frame !== 0) return;
-      acc.frame = requestAnimationFrame(() => {
-        acc.frame = 0;
-        const rect = rectOf();
-        if (rect === null) {
-          acc.dx = 0;
-          acc.dy = 0;
-          return;
-        }
-        const step = wheelStep(
-          rect,
-          acc.dx,
-          acc.dy,
-          toNormalized(rect, acc.clientX, acc.clientY),
-          acc.deltaMode,
-        );
-        acc.dx = 0;
-        acc.dy = 0;
-        if (step !== null) onStep(step);
-      });
-    },
-    [interactive, onStep, rectOf],
-  );
+      if (acc.frame === 0) acc.frame = requestAnimationFrame(flush);
+    };
 
-  useEffect(
-    () => () => {
-      if (wheel.current.frame !== 0) cancelAnimationFrame(wheel.current.frame);
+    node.addEventListener("wheel", onNativeWheel, { passive: false });
+    return () => {
+      node.removeEventListener("wheel", onNativeWheel);
+      if (acc.frame !== 0) {
+        cancelAnimationFrame(acc.frame);
+        acc.frame = 0;
+      }
+      endPinchRef.current();
+    };
+  }, [interactive]);
+
+  /**
+   * ⌘V, pasted into the device.
+   *
+   * The frame holds focus after a click, so the paste lands here rather than
+   * in the composer — and a `type` step is the whole implementation: the
+   * server types what it can and routes the rest through the device
+   * pasteboard.
+   */
+  const onPaste = useCallback(
+    (event: React.ClipboardEvent<HTMLDivElement>) => {
+      if (!interactive) return;
+      const text = event.clipboardData.getData("text/plain");
+      if (text === "") return;
+      event.preventDefault();
+      onStep({ kind: "type", text: text.slice(0, 2000) });
     },
-    [],
+    [interactive, onStep],
   );
 
   const onKeyDown = useCallback(
@@ -475,6 +578,7 @@ function LiveFrame({
 
   return (
     <div
+      ref={frameRef}
       className="bbxs-frame min-h-0 flex-1 overflow-hidden"
       tabIndex={0}
       role="region"
@@ -483,13 +587,14 @@ function LiveFrame({
           ? "Simulator"
           : `Simulator: ${state.device.name}. Arrow keys move a crosshair, Return taps, Escape leaves.`
       }
+      style={{ touchAction: "none" }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
       onLostPointerCapture={endDrag}
-      onWheel={onWheel}
       onKeyDown={onKeyDown}
+      onPaste={onPaste}
       onBlur={() => setCrosshair(null)}
     >
       {veil.skeleton ? (

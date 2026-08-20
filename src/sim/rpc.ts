@@ -50,7 +50,8 @@ import { makeStillsHandlers } from "./stills-rpc.js";
 import type { Frame } from "./model.js";
 import { overallState } from "./preflight.js";
 import { detach } from "./safe.js";
-import { executeStep, type Step } from "./steps.js";
+import { coordinatesOnly, executeStep, type Step } from "./steps.js";
+import type { LiveStreamEvent } from "./hid.js";
 
 export type LiveStateDto = LiveState & {
   streamUrl: string | null;
@@ -387,7 +388,9 @@ export function makeRpcHandlers(ctx: Ctx) {
 
     async liveInput({ step }: { step: Step }) {
       const socket = ctx.live.requireSocket();
-      const result = await executeStep(socket, step);
+      const result = await executeStep(socket, step, coordinatesOnly, {
+        pasteText: (text) => ctx.live.pasteText(text),
+      });
       // A tap can move the foreground app, and the meta line under the frame
       // claims to say which one is there.
       if (step.kind === "tap" || step.kind === "button") {
@@ -407,6 +410,21 @@ export function makeRpcHandlers(ctx: Ctx) {
       // claims to say which one is there. Once per gesture end — never per
       // move, or the probe would run at display rate.
       if (phase === "end") {
+        detach(
+          () => ctx.live.pollForeground().then(() => undefined),
+          () => {
+            // The accessibility service warms up after the device does.
+          },
+        );
+      }
+      return { ok };
+    },
+
+    async liveStream({ events }: { events: LiveStreamEvent[] }) {
+      const ok = ctx.live.stream(events);
+      // Same probe, same discipline: once per batch that lifts a finger,
+      // never per move.
+      if (ok && events.some((event) => event.kind !== "scroll" && event.phase === "end")) {
         detach(
           () => ctx.live.pollForeground().then(() => undefined),
           () => {

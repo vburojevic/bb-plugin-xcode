@@ -81,7 +81,7 @@ function LiveRoute({ go }: { go: (next: string) => void }) {
       onRefresh={live.refresh}
       onStall={live.reportStall}
       onAlive={live.reportAlive}
-      onTouch={live.touch}
+      onInput={live.stream}
       onOpenDoctor={() => go("doctor")}
       onStep={onStep}
       belowMeta={<FramesStrip frames={live.frames} now={Date.now()} />}

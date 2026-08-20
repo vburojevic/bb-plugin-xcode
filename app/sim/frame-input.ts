@@ -170,3 +170,49 @@ function clampSigned(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.min(1, Math.max(-1, value));
 }
+
+// ---------------------------------------------------------------------------
+// Pinch: a macOS trackpad pinch arrives as a wheel event with ctrlKey set
+// ---------------------------------------------------------------------------
+
+/** Where the two synthetic fingers start, as a fraction of the frame. */
+export const PINCH_INITIAL_SPREAD = 0.25;
+export const PINCH_MIN_SPREAD = 0.04;
+export const PINCH_MAX_SPREAD = 0.7;
+/**
+ * Wheel pixels → spread factor exponent. Chosen so a comfortable two-finger
+ * spread on a Magic Trackpad roughly doubles the on-device spread — the same
+ * feel as pinching Safari.
+ */
+export const PINCH_SENSITIVITY = 0.006;
+
+/**
+ * A pinch with no event for this long has ended. The trackpad streams a
+ * pinch continuously — tens of events a second — so a beat and a half of
+ * silence is the fingers lifting, not a slow pinch.
+ */
+export const PINCH_IDLE_END_MS = 160;
+
+/** The next spread after one ctrl-wheel event. Spreading fingers zooms in. */
+export function pinchSpread(current: number, deltaY: number): number {
+  const next = current * Math.exp(-deltaY * PINCH_SENSITIVITY);
+  return Math.min(PINCH_MAX_SPREAD, Math.max(PINCH_MIN_SPREAD, next));
+}
+
+/**
+ * Two fingers on a diagonal around the cursor — the same placement the
+ * scripted pinch uses, clamped so both stay on the glass when the cursor is
+ * near a corner.
+ */
+export function pinchFingers(
+  center: { x: number; y: number },
+  spread: number,
+): { x1: number; y1: number; x2: number; y2: number } {
+  const half = spread / 2;
+  return {
+    x1: clamp01(center.x - half),
+    y1: clamp01(center.y - half),
+    x2: clamp01(center.x + half),
+    y2: clamp01(center.y + half),
+  };
+}

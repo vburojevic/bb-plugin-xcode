@@ -456,7 +456,9 @@ async function drive(ctx: Ctx, argv: string[]): Promise<CliResult> {
     const socket = ctx.live.requireSocket();
     for (const [index, step] of steps.entries()) {
       try {
-        const result = await executeStep(socket, step, resolver);
+        const result = await executeStep(socket, step, resolver, {
+          pasteText: (text) => ctx.live.pasteText(text),
+        });
         log.push(`${index + 1}. ${result.log}`);
       } catch (error) {
         log.push(`${index + 1}. ${step.kind} failed: ${error instanceof Error ? error.message : String(error)}`);
