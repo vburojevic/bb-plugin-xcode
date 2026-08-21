@@ -10,6 +10,22 @@ and the simulators they run on, streamed and fully touchable, right in your
 bb plugin install vburojevic/bb-plugin-xcode
 ```
 
+## Highlights
+
+- **Zero-config build tracking** — learns DerivedData roots from the builds
+  themselves; Xcode, `xcodebuild`, agents and CI all count.
+- **Build activity in threads** — live rows above the composer while a
+  thread's checkout builds, and a verdict card that outlives the build.
+- **Full-touch simulator streaming** — hardware H.264, tap/drag/flick/pinch/
+  paste/keyboard, momentum-faithful even over a remote bb connection.
+- **A device picker that knows your work** — booted and recently-built-against
+  devices first, searchable, with the machine named.
+- **Stills** — every SwiftUI preview rendered and diffed against a baseline.
+- **Agent tools, scoped and gated** — blocking builds with real verdicts;
+  simulator eyes and hands only behind an explicit setting.
+- **A written-down [security model](SECURITY.md)** — loopback-only capture,
+  allowlisted routes, host-owned confirmations for anything destructive.
+
 ## One panel, three tabs
 
 ### Builds
@@ -21,6 +37,17 @@ trends. Nothing to configure; the tracker learns DerivedData roots from the
 builds themselves.
 
 ![Build history with a failed run's compiler errors](docs/screenshots/builds.png)
+
+### In threads
+
+The activity follows the conversation. When a thread's checkout is building,
+the build appears as host-owned rows above that thread's composer — whether or
+not the agent ever mentions it — with live progress while it runs. Once
+everything goes quiet, the newest verdict stays as a dismissible card, so "how
+did that go" still has an answer after the transcript scrolls on. The gear
+turns the rows off if you'd rather not see them.
+
+![A live build above the composer, and the verdict card that follows it](docs/screenshots/thread-activity.png)
 
 ### Live
 
@@ -123,7 +150,14 @@ bb xcode run -- xcodebuild -scheme App -destination 'platform=macOS' test
 # …or block until it reports:
 bb xcode run --wait -- xcodebuild -scheme App test
 bb xcode wait <run-id> [--timeout 600]
+
+# The simulator half has its own verbs:
+bb xcode sim            # doctor, status, devices, live, shot, drive,
+                        # stills, look, history, baseline, diff, purge…
 ```
+
+Simulator verbs that reveal or control device content are gated behind the
+`allowAgentCapture` setting, same as the agent tools.
 
 These commands require a bb thread with a resolvable checkout, must be run from
 inside that checkout, and are scoped to it. A caller-selected thread or project
