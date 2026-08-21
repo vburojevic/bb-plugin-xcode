@@ -16,7 +16,9 @@ import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Icon } from "@/components/ui/icon";
@@ -29,7 +31,7 @@ interface UiOption {
   value: boolean;
 }
 
-export function PanelOptionsMenu() {
+export function PanelOptionsMenu({ onOpenDoctor }: { onOpenDoctor?: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [options, setOptions] = useState<UiOption[] | null>(null);
 
@@ -95,6 +97,15 @@ export function PanelOptionsMenu() {
         {options === null ? (
           <DropdownMenuLabel className="font-normal text-muted-foreground">Loading…</DropdownMenuLabel>
         ) : null}
+        {onOpenDoctor === undefined ? null : (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={onOpenDoctor} className="gap-1.5">
+              <Icon name="ListTodo" className="size-3.5" />
+              Doctor — every prerequisite and its fix
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

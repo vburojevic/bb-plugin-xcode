@@ -34,7 +34,6 @@ export function PanelRoot({ subPath = "" }: { subPath?: string }) {
 export function PanelHeader({ subPath = "" }: { subPath?: string }) {
   const navigate = useBbNavigate();
   const compact = useIsCompactViewport();
-  const live = useLive();
   const tab = tabOf(subPath);
 
   const go = (next: Tab): void =>
@@ -48,17 +47,25 @@ export function PanelHeader({ subPath = "" }: { subPath?: string }) {
         <SegmentButton active={tab === "stills"} compact={compact} icon="GridView" label="Stills" onClick={() => go("stills")} />
       </div>
 
-      {tab === "builds" ? null : (
-        <DevicePicker
-          devices={live.devices}
-          liveUdid={live.state?.device?.udid ?? null}
-          onPick={(udid) => void live.start(udid)}
-          label={compact ? null : (live.state?.device?.name ?? "Choose a simulator")}
-        />
-      )}
+      {/* Mounted only on the simulator tabs: `useLive` fetches the device
+          list on mount, and someone reading build history should not be
+          paying for a `simctl list` to do it. */}
+      {tab === "builds" ? null : <HeaderDevicePicker compact={compact} />}
 
-      <PanelOptionsMenu />
+      <PanelOptionsMenu onOpenDoctor={() => navigate.toPluginPanel(PANEL_PATH, { subPath: "doctor" })} />
     </div>
+  );
+}
+
+function HeaderDevicePicker({ compact }: { compact: boolean }) {
+  const live = useLive();
+  return (
+    <DevicePicker
+      devices={live.devices}
+      liveUdid={live.state?.device?.udid ?? null}
+      onPick={(udid) => void live.start(udid)}
+      label={compact ? null : (live.state?.device?.name ?? "Choose a simulator")}
+    />
   );
 }
 

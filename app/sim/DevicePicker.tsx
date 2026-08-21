@@ -12,7 +12,7 @@
  * stops key events from reaching Radix's typeahead: typing "iphone" must
  * filter the list, not jump focus around it.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -24,7 +24,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
-import { sectionDevices, usedClause, type PickerDevice } from "./picker-model";
+import { deviceClause, sectionDevices, type PickerDevice } from "./picker-model";
 import type { DeviceList } from "./useLive";
 
 /** Search is noise for a handful of devices and oxygen for a herd of them. */
@@ -56,6 +56,7 @@ export interface DevicePickerProps {
 
 export function DevicePicker({ devices, liveUdid, onPick, label }: DevicePickerProps) {
   const [query, setQuery] = useState("");
+  const searchRef = useRef<HTMLInputElement | null>(null);
 
   const sections = useMemo(
     () =>
@@ -82,13 +83,17 @@ export function DevicePicker({ devices, liveUdid, onPick, label }: DevicePickerP
       <DropdownMenuContent align="end" className="max-h-[26rem] w-72 overflow-y-auto">
         {searchable ? (
           <div className="sticky top-0 z-10 -mx-1 -mt-1 border-b bg-popover p-1.5">
+            {/* Radix focuses the content on open; the search field is the
+                thing a person opens a fifty-device list to use, so it takes
+                focus back one tick later. */}
+            <FocusOnMount target={searchRef} />
             <div className="relative">
               <Icon
                 name="Search"
                 className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
               />
               <Input
-                autoFocus
+                ref={searchRef}
                 value={query}
                 placeholder="Search simulators"
                 aria-label="Search simulators"
@@ -125,7 +130,11 @@ export function DevicePicker({ devices, liveUdid, onPick, label }: DevicePickerP
 
         {sections.total === 0 ? (
           <DropdownMenuItem disabled>
-            {query.trim() === "" ? "No simulators are installed." : `Nothing matches “${query.trim()}”.`}
+            {devices === null
+              ? "Looking for simulators…"
+              : query.trim() === ""
+                ? "No simulators are installed."
+                : `Nothing matches “${query.trim()}”.`}
           </DropdownMenuItem>
         ) : null}
 
@@ -170,6 +179,14 @@ export function DevicePicker({ devices, liveUdid, onPick, label }: DevicePickerP
   );
 }
 
+function FocusOnMount({ target }: { target: React.RefObject<HTMLInputElement | null> }) {
+  useEffect(() => {
+    const timer = setTimeout(() => target.current?.focus(), 0);
+    return () => clearTimeout(timer);
+  }, [target]);
+  return null;
+}
+
 function DeviceRow({
   device,
   live,
@@ -181,9 +198,16 @@ function DeviceRow({
   booted: boolean;
   onPick: (udid: string) => void;
 }) {
-  const clause = usedClause(device, Date.now());
+  const clause = deviceClause(device, Date.now());
   return (
-    <DropdownMenuItem onSelect={() => onPick(device.udid)} className="gap-2">
+    <DropdownMenuItem
+      onSelect={() => onPick(device.udid)}
+      className="gap-2"
+      // The UDID is the string every `-destination` and `simctl` invocation
+      // wants, and this hover is the one place on the machine it is readable
+      // next to the device's human name.
+      title={`${device.name} · ${device.platform} ${device.osVersion}\n${device.udid}`}
+    >
       <Icon name={familyIcon(device.family)} className="size-4 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1.5">
@@ -194,7 +218,7 @@ function DeviceRow({
               style={{ background: "light-dark(#16a34a, #4ade80)" }}
             />
           ) : null}
-          <span className="truncate">{device.name}</span>
+          <span className={live ? "truncate font-medium" : "truncate"}>{device.name}</span>
           {live ? <span className="shrink-0 text-xs text-muted-foreground">on screen</span> : null}
         </span>
         {clause !== null ? (

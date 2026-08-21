@@ -42,7 +42,7 @@ another agent navigated to, which is worse than having no eyes at all.
 blocks, and it is bounded.
 
 Do **not** paste a list of changed previews into chat. The run reports itself in
-the Simulators panel and in the prompt stack above the composer; the user is
+the Xcode panel and in the prompt stack above the composer; the user is
 already looking at it. Say what you changed and why, and let the panel show the
 pixels.
 

@@ -131,6 +131,18 @@ function touchChannel(): TouchChannel {
   return touches;
 }
 
+/**
+ * Discrete steps, serialized.
+ *
+ * RPC is per-call HTTP with no ordering between concurrent calls, and a step
+ * is not commutative: two quick keystrokes fired as parallel POSTs could land
+ * on the device as "ih". One in flight at a time keeps what you typed in the
+ * order you typed it, and gestures already queue server-side anyway. The
+ * chain never poisons — a failed step rejects to its own caller and the next
+ * step starts clean.
+ */
+let stepChain: Promise<unknown> = Promise.resolve();
+
 function emit(patch: Partial<Snapshot>): void {
   snapshot = { ...snapshot, ...patch };
   for (const listener of listeners) listener();
@@ -199,6 +211,7 @@ export function resetLiveStore(): void {
   inFlight = false;
   queued = false;
   touches = null;
+  stepChain = Promise.resolve();
   listeners.clear();
 }
 
@@ -275,7 +288,14 @@ export function useLive(): LiveApi {
 
   const input = useCallback(
     async (step: Step) => {
-      return (await client.call("liveInput", { step })) as { log: string; dropped: string[] };
+      const run = stepChain.then(
+        () => client.call("liveInput", { step }) as Promise<{ log: string; dropped: string[] }>,
+      );
+      stepChain = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
     },
     [client],
   );

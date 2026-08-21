@@ -56,6 +56,15 @@ export function lastUsedAt(device: PickerDevice): number | null {
 }
 
 /**
+ * The clause the picker row shows. A device mid-boot says so — it is the one
+ * fact more current than any history.
+ */
+export function deviceClause(device: PickerDevice, now: number): string | null {
+  if (device.state === "Booting") return "booting…";
+  return usedClause(device, now);
+}
+
+/**
  * One clause under the device name: what it was last used *for*.
  *
  * "built against" outranks "booted" when both are recent, because it is the
@@ -119,8 +128,11 @@ export function sectionDevices(
     (device) => device.isAvailable && matchesQuery(device, options.query),
   );
 
+  // A device mid-boot belongs on the Booted shelf: it is about to be the most
+  // interesting device on the machine, and burying it under a runtime group
+  // while it boots reads as the picker not noticing.
   const bootedRows = usable
-    .filter((device) => booted.has(device.udid))
+    .filter((device) => booted.has(device.udid) || device.state === "Booting")
     .sort(compareByNameWithin);
 
   const recentRows = usable

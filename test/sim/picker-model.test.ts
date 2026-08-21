@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import {
   ago,
   compareDeviceNames,
+  deviceClause,
   lastUsedAt,
   matchesQuery,
   RECENT_LIMIT,
@@ -77,6 +78,16 @@ describe("sectioning", () => {
     // Newest first, overflow onto the shelves rather than dropped.
     expect(sections.recent[0]?.udid).toBe("u0");
     expect(sections.total).toBe(herd.length);
+  });
+
+  it("shelves a device mid-boot with the booted ones, and says so", () => {
+    // `bootedUdids` is the authority for Booted, but a Booting device is about
+    // to be the most interesting one on the machine — burying it under a
+    // runtime group while it boots reads as the picker not noticing.
+    const booting = device({ udid: "a", name: "iPhone 17 Pro", state: "Booting" });
+    const sections = sectionDevices([booting], { bootedUdids: [], query: "", now: NOW });
+    expect(sections.booted.map((entry) => entry.udid)).toEqual(["a"]);
+    expect(deviceClause(booting, NOW)).toBe("booting…");
   });
 
   it("hides unavailable devices — a runtime that is gone is not a choice", () => {

@@ -140,7 +140,7 @@ export function makeCaptureTool(ctx: Ctx) {
         // still learns what happened and where to look.
         const text =
           image === null
-            ? `${result.summary} The frame was saved but could not be downscaled for this reply — open the Simulators panel to see it.`
+            ? `${result.summary} The frame was saved but could not be downscaled for this reply — open the Xcode panel to see it.`
             : result.summary;
         const content: ToolContent[] = [{ type: "text", text }];
         if (image !== null) {

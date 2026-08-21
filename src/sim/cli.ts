@@ -538,7 +538,7 @@ async function stills(
   // The run takes minutes and reports itself in the panel; blocking a terminal
   // on it would be a worse version of watching the panel.
   const queued = result.queued === 0 ? "" : ` It is queued behind ${result.queued} other run(s) on that device.\n`;
-  return { exitCode: 0, stdout: `Rendering previews. Watch it in the Simulators panel.\n${queued}` };
+  return { exitCode: 0, stdout: `Rendering previews. Watch it in the Xcode panel's Stills tab.\n${queued}` };
 }
 
 /**
