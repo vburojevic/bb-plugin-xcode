@@ -29,6 +29,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 
 import type { rpcContract } from "../src/contract";
+import { useContainerWide } from "./use-container-width";
 import { formatDuration } from "./format";
 import { EmptyState } from "./primitives";
 
@@ -68,31 +69,58 @@ export function Trends({ projectId }: { projectId: string | null }) {
   const rpc = useRpc<typeof rpcContract>();
   const [data, setData] = useState<TrendsData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+  // Two ~150px recharts side by side answer nothing; the pair splits only
+  // when the *panel* — not the window — can give each a real width.
+  const [rootRef, wide] = useContainerWide<HTMLDivElement>(720);
 
   useEffect(() => {
     setLoading(true);
     void rpc
       .call("trends", { projectId, days: 30 })
-      .then((result) => setData(result as TrendsData))
+      .then((result) => {
+        setData(result as TrendsData);
+        setFailed(false);
+      })
+      // Without this, a failed call rendered as the healthy "Not enough
+      // history yet" — and the rejection escaped through `finally` as an
+      // unhandled one.
+      .catch(() => setFailed(true))
       .finally(() => setLoading(false));
   }, [rpc, projectId]);
 
+  const pairClass = wide ? "grid gap-4 grid-cols-2" : "grid gap-4";
+
   if (loading && !data) {
     return (
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div ref={rootRef} className={pairClass}>
         <Skeleton className="h-64 w-full" />
         <Skeleton className="h-64 w-full" />
       </div>
     );
   }
 
+  if (failed && !data) {
+    return (
+      <div ref={rootRef}>
+        <EmptyState
+          icon="AlertTriangle"
+          title="Could not load trends"
+          description="The tracker did not answer. Reopen the tab to try again."
+        />
+      </div>
+    );
+  }
+
   if (!data || data.durations.length === 0) {
     return (
-      <EmptyState
-        icon="ChartColumn"
-        title="Not enough history yet"
-        description="Trends appear once a few builds have been recorded. Keep building — the tracker collects automatically."
-      />
+      <div ref={rootRef}>
+        <EmptyState
+          icon="ChartColumn"
+          title="Not enough history yet"
+          description="Trends appear once a few builds have been recorded. Keep building — the tracker collects automatically."
+        />
+      </div>
     );
   }
 
@@ -106,8 +134,8 @@ export function Trends({ projectId }: { projectId: string | null }) {
   }));
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="grid gap-4 lg:grid-cols-2">
+    <div ref={rootRef} className="flex flex-col gap-4">
+      <div className={pairClass}>
         <Card>
           <CardHeader>
             <CardTitle>Build duration</CardTitle>

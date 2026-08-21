@@ -15,8 +15,9 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { useRpc } from "@bb/plugin-sdk/app";
+import { useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
 import { DevicePicker } from "./DevicePicker";
+import { PANEL_PATH } from "./route";
 import { LivePanel } from "./LivePanel";
 import { ControlBar } from "./ControlBar";
 import { useLive } from "./useLive";
@@ -39,6 +40,7 @@ interface PickResult {
 
 export function ThreadSimulator({ threadId }: { threadId: string }) {
   const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
   const live = useLive();
   const [pick, setPick] = useState<PickResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -135,8 +137,9 @@ export function ThreadSimulator({ threadId }: { threadId: string }) {
         onAlive={live.reportAlive}
         onInput={live.stream}
         // The doctor lives in the nav panel; from here the honest move is to
-        // say so rather than render a second copy of it in a 400px column.
-        onOpenDoctor={() => toast.info("Open the Xcode panel for the doctor.")}
+        // take the user there rather than render a second copy of it in a
+        // 400px column — or worse, a toast telling them to walk.
+        onOpenDoctor={() => navigate.toPluginPanel(PANEL_PATH, { subPath: "doctor" })}
         onStep={onStep}
         controls={
           live.state === null ? null : (

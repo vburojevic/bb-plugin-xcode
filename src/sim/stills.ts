@@ -325,15 +325,23 @@ async function runStillsInner(input: StillsRunInput): Promise<StillsRunResult> {
 
   const missing = manifest.filter((name) => !imported.names.has(name));
 
+  // "Did not render" is SnapshottingTests' 10-second layout timeout; the
+  // translation is worth more than the raw string, and falls through to it.
+  const describeFailure = (detail: string): string => explainRenderFailure(detail) ?? detail;
+
   // A crash mid-run leaves a truncated but perfectly valid-looking export, so a
   // failed render with frames on disk is still worth importing — and still a
   // failure.
-  if (!render.ok && imported.count === 0) return fail(render.detail);
+  if (!render.ok && imported.count === 0) return fail(describeFailure(render.detail));
 
   // Found previews, produced none of them. `explainEmptyRender` has the why.
   const emptyRender = render.ok && manifestRan && manifest.length > 0 && imported.count === 0;
   const ok = render.ok && !emptyRender;
-  const error = emptyRender ? explainEmptyRender(manifest.length) : render.ok ? null : render.detail;
+  const error = emptyRender
+    ? explainEmptyRender(manifest.length)
+    : render.ok
+      ? null
+      : describeFailure(render.detail);
 
   meta.manifest = manifest;
   updateLook(input.db, input.lookId, {

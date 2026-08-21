@@ -22,7 +22,7 @@
  */
 import type { Db } from "./store.js";
 import { checkpoint } from "./store.js";
-import { allLooks, evictionCandidates, staleBaselinedLooks, updateLook } from "./frames.js";
+import { allLooks, evictionCandidates, updateLook } from "./frames.js";
 import type { FrameStore } from "./framestore.js";
 import type { Look } from "./model.js";
 import { lstat, readdir, rm } from "node:fs/promises";
@@ -94,18 +94,13 @@ export function planPrune(input: PruneInput): PrunePlan {
       total -= look.bytesTotal;
     }
   }
-  if (total > input.diskBudgetBytes) {
-    // Second tier: baselined looks beyond the newest per (scope, device). The
-    // newest baseline per device class is never evicted — losing it would turn
-    // the next run into a first run.
-    for (const look of staleBaselinedLooks(input.db)) {
-      if (total <= input.diskBudgetBytes) break;
-      if (seen.has(look.id) || look.bytesTotal === 0) continue;
-      seen.add(look.id);
-      evict.push(look);
-      total -= look.bytesTotal;
-    }
-  }
+  // There is deliberately no second tier. One existed on paper — "baselined
+  // looks beyond the newest per (scope, device)" — but the baselines table's
+  // primary key IS (scope_key, device_key), so that set is empty by schema
+  // and the tier never evicted a byte in its life. The honest property is:
+  // protected looks (baselines, thread links) are never evicted, and a budget
+  // exceeded purely by protected looks stays exceeded until a person purges
+  // or moves the baseline.
 
   const byBudget = evict.length - byCount;
   return {

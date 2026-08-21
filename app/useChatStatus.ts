@@ -107,8 +107,10 @@ export function useChatStatus(
 export function useLiveTick(active: boolean): void {
   const [, setTick] = useState(0);
   useEffect(() => {
-    if (!active) return;
-    const timer = setInterval(() => setTick((n) => n + 1), 1000);
+    // Slow when idle rather than off: the settled card's "2m ago" tail is
+    // rendered from the same clock, and without any tick it froze at
+    // whatever it said when the build finished.
+    const timer = setInterval(() => setTick((n) => n + 1), active ? 1000 : 60_000);
     return () => clearInterval(timer);
   }, [active]);
 }

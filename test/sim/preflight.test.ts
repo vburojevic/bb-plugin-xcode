@@ -103,7 +103,7 @@ describe("the capture addon probe", () => {
     // be a dead end.
     const probe = addonProbe(false, "missing");
     expect(probe.detail).not.toContain("npm rebuild");
-    expect(probe.detail).toContain("bb plugin update xcode-simulators");
+    expect(probe.detail).toContain("bb plugin update xcode");
     expect(probe.detail).toContain("node_modules/serve-sim/dist/native/");
   });
 });

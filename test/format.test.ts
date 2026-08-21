@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   runPhrase,
   runStatusLabel,
-  statusHint,
   statusIcon,
   statusLabel,
 } from "../app/format";
@@ -23,7 +22,6 @@ describe("terminal process presentation", () => {
   it("admits it has no verdict rather than implying one", () => {
     expect(statusLabel("ended")).toBe("No result");
     expect(statusLabel("ended")).not.toBe("Finished");
-    expect(statusHint("ended")).toBeNull();
     expect(statusIcon("ended")).toBe("CircleDashed");
   });
 

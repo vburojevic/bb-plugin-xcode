@@ -205,7 +205,7 @@ export function addonProbe(loaded: boolean, error: string | null): Probe {
     // the addon prebuilt, so rebuilding rebuilds nothing and the stranger's one
     // instruction is a dead end.
     detail:
-      "serve-sim's native capture addon did not load. Reinstall with `bb plugin update xcode-simulators`; " +
+      "serve-sim's native capture addon did not load. Reinstall with `bb plugin update xcode`; " +
       "if that does not fix it, node_modules/serve-sim/dist/native/ is missing.",
     value: error ?? undefined,
   };

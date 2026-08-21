@@ -12,12 +12,12 @@ import { activityMetaClass } from "./activity-styles";
 import {
   formatClock,
   formatDuration,
+  basename,
   formatLocation,
   kindLabel,
   phaseLabel,
   runStatusLabel,
   runTitle,
-  statusHint,
 } from "./format";
 import { isLive, statusClass, type ChatStatus, type RunDto } from "./status-types";
 import { WorkerSwarm } from "./WorkerSwarm";
@@ -50,8 +50,10 @@ export function RunDetail({
     live && run.typicalMs !== null
       ? Math.max(0, run.typicalMs - (Date.now() - run.startedAt)) || null
       : null;
+  // `testTotal > 0`, not merely non-null: a green "0 tests passed" chip is a
+  // claim of success about a run that proved nothing.
   const testsBadge =
-    run.testTotal !== null
+    run.testTotal !== null && run.testTotal > 0
       ? (run.testFailed ?? 0) > 0
         ? {
             label: `${run.testFailed} of ${run.testTotal} tests failed`,
@@ -62,13 +64,6 @@ export function RunDetail({
 
   return (
     <div className="max-h-72 overflow-y-auto px-3 pb-2 pt-1.5">
-      {statusHint(run.status) ? (
-        <div className="flex items-start gap-1.5 pb-1.5 text-[11px] text-muted-foreground">
-          <Icon name="Info" className="mt-0.5 size-3 shrink-0" aria-hidden />
-          <span>{statusHint(run.status)!.replaceAll("`", "")}</span>
-        </div>
-      ) : null}
-
       {live ? <WorkerSwarm run={run} /> : null}
 
       {/* Identity first — the simulator and what was pointed at it. This is
@@ -250,13 +245,6 @@ function splitDestination(label: string | null): [string | null, string | null] 
   const parts = label.split("·").map((part) => part.trim());
   if (parts.length < 2) return [label, null];
   return [parts[0] ?? null, parts.slice(1).join(" · ")];
-}
-
-function basename(path: string | null): string | null {
-  if (!path) return null;
-  const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
-  const index = trimmed.lastIndexOf("/");
-  return index === -1 ? trimmed : trimmed.slice(index + 1);
 }
 
 function Fact({

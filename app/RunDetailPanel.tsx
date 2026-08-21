@@ -112,6 +112,11 @@ export function RunDetailPanel({
         setFindings(result.findings as Finding[]);
         setTests(result.tests as TestResult[]);
       })
+      .catch(() => {
+        // The pane is keyed by run id, so a failed load renders the
+        // "Not found" state below rather than another run's data — and a
+        // rejection must not escape as an unhandled one.
+      })
       .finally(() => setLoading(false));
   };
 
@@ -128,7 +133,7 @@ export function RunDetailPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, runId]);
 
-  const now = useNow(active ?? false);
+  const now = useNow(active);
 
   if (loading && !run) {
     return (

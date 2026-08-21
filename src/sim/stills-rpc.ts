@@ -103,7 +103,13 @@ export function makeStillsHandlers(ctx: Ctx) {
           ],
           confirmLabel: "Render previews",
         });
-        if (!approved) throw new Error("The preview render was not confirmed.");
+        if (!approved) {
+          // `false` covers both a person declining and no thread existing to
+          // ask; the sentence must not accuse a person who never saw a dialog.
+          throw new Error(
+            "The preview render was not confirmed. If no dialog appeared, run this from an active bb thread so someone can approve it.",
+          );
+        }
         const enqueued = await ctx.stills.enqueue(scope, device ?? null);
         return { lookId: enqueued.lookId, queued: enqueued.queued, error: null };
       } catch (error) {

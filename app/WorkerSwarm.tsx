@@ -66,7 +66,9 @@ export function WorkerSwarm({ run }: { run: RunDto }) {
         aria-label={`${statusLabel(run.status)} ${runTitle(run)}`}
         aria-valuenow={live}
         aria-valuemin={0}
-        aria-valuemax={slots}
+        // Never below valuenow: the dot row caps at MAX_WORKER_DOTS but a
+        // 32-compiler build must not report "32 of 24" to a screen reader.
+        aria-valuemax={Math.max(slots, live)}
         aria-valuetext={label}
       >
         <div className="flex flex-wrap items-center gap-1" aria-hidden>
@@ -98,9 +100,3 @@ export function WorkerSwarm({ run }: { run: RunDto }) {
 function Slot({ children }: { children: React.ReactNode }) {
   return <div className="flex flex-col gap-1.5 px-3.5 pb-3">{children}</div>;
 }
-
-/**
- * Card frame: theme card surface whose 1px border carries a quiet status
- * tint. The border's eased color transition IS the card's motion moment —
- * a verdict landing reads as the frame settling from activity to outcome.
- */

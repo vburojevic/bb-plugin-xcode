@@ -83,7 +83,10 @@ export function XcodeActivityRow({
 
   const state = runActivityState(run.status);
   const live = isLive(run);
-  const elapsed = live ? Date.now() - run.startedAt : run.durationMs;
+  // Clamped like every other elapsed in this app: clock skew between the
+  // server's startedAt and this client can go negative, and a live row
+  // rendering "—" reads as broken.
+  const elapsed = live ? Math.max(0, Date.now() - run.startedAt) : run.durationMs;
   const collapsible = Boolean(children);
   const progress = elapsedProgress(run, elapsed);
 
@@ -298,7 +301,9 @@ function Headline({ run }: { run: RunDto }) {
   );
   const verbEl = <span className="bbx-text font-medium">{verb}</span>;
   return (
-    <span className="max-w-full truncate" title={`${name} — ${verb}`}>
+    // No title here: the outer row already carries the full-meta tooltip, and
+    // an inner one shadows it over most of the hover area.
+    <span className="max-w-full truncate">
       {verbFirst ? (
         <>
           {verbEl} {nameEl}

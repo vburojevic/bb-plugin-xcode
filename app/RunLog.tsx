@@ -22,6 +22,7 @@ import {
   kindLabel,
   phaseTail,
   runTitle,
+  statusLabel,
 } from "./format";
 import { StatusGlyph, SweepBar } from "./primitives";
 
@@ -52,12 +53,18 @@ export function isActive(run: RunSummary): boolean {
   return run.status === "running" || run.status === "finishing";
 }
 
-/** Ticks once a second while anything is active. */
+/**
+ * Ticks once a second while anything is active, and once a minute otherwise.
+ *
+ * The idle tick is not decoration: `now` drives every "5m ago", the
+ * clock-vs-relative switch and the "Today" day groups, and a panel left open
+ * overnight with no builds used to keep all three frozen at mount time —
+ * yesterday's runs under "Today", "5m ago" forever.
+ */
 export function useNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!active) return;
-    const timer = setInterval(() => setNow(Date.now()), 1000);
+    const timer = setInterval(() => setNow(Date.now()), active ? 1000 : 60_000);
     return () => clearInterval(timer);
   }, [active]);
   return now;
@@ -230,8 +237,12 @@ function LogRow({
       )}
     >
       <StatusGlyph status={run.status} />
+      {/* The glyph is aria-hidden and the counts are bare numbers, so without
+          this a passed, cancelled and no-result row all read identically to a
+          screen reader. */}
+      <span className="sr-only">{statusLabel(run.status)}</span>
 
-      <span className="flex min-w-0 flex-1 items-baseline gap-2">
+      <span className="flex min-w-0 flex-1 items-baseline gap-2 overflow-hidden">
         {/* The scheme always wins the shrink war: a row reading "I.. test
             perf/cache-po…" had truncated the one thing that identifies it
             while spelling out the context in full. */}

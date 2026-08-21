@@ -41,11 +41,14 @@ export function PanelHeader({ subPath = "" }: { subPath?: string }) {
 
   return (
     <div className="flex min-w-0 items-center gap-1">
-      <div className="flex shrink-0 items-center rounded-md border p-0.5" role="tablist">
+      {/* Navigation, not ARIA tabs: the panels live in another React tree, so
+          the tablist contract (roving tabindex, aria-controls, arrow keys)
+          cannot be honoured — and half of it is worse than none. */}
+      <nav aria-label="Xcode panel sections" className="flex shrink-0 items-center rounded-md border p-0.5">
         <SegmentButton active={tab === "builds"} compact={compact} icon="Toolbox" label="Builds" onClick={() => go("builds")} />
         <SegmentButton active={tab === "live"} compact={compact} icon="Play" label="Live" onClick={() => go("live")} />
         <SegmentButton active={tab === "stills"} compact={compact} icon="GridView" label="Stills" onClick={() => go("stills")} />
-      </div>
+      </nav>
 
       {/* Mounted only on the simulator tabs: `useLive` fetches the device
           list on mount, and someone reading build history should not be
@@ -84,8 +87,7 @@ function SegmentButton({
 }) {
   return (
     <Button
-      role="tab"
-      aria-selected={active}
+      aria-current={active ? "page" : undefined}
       aria-label={label}
       variant={active ? "secondary" : "ghost"}
       size="sm"

@@ -21,7 +21,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import type { Ctx } from "./context.js";
 import { overallState } from "./preflight.js";
 import { SimctlError } from "./devices.js";
-import { getLook, listFrames } from "./frames.js";
+import { getLook, listFrames, scopeCount, totalBytes } from "./frames.js";
 import { LOOK_ID_PATTERN } from "./model.js";
 import { formatBytes } from "./format.js";
 import { DEMO_BANNER_STATES, isDemoBannerState } from "./demos.js";
@@ -95,17 +95,20 @@ export const CLI_COMMANDS = [
   {
     name: "shot",
     summary: "Capture one frame",
-    usage: "bb xcode sim shot [--out <path>] [--label <s>]",
+    usage: "bb xcode sim shot [--out <path>] [--label <s>] [--json]",
   },
   {
     name: "stills",
     summary: "Render every SwiftUI preview and diff it against the last run",
-    usage: "bb xcode sim stills [--device <d>] [--set-baseline]",
+    // No `--set-baseline` here: the flag was advertised for months while the
+    // handler read only `--device`, silently ignoring the promise. Baselines
+    // are set on a finished run, where the look id exists to name.
+    usage: "bb xcode sim stills [--device <d>]  (then: baseline set <lookId>)",
   },
   {
     name: "onboard",
     summary: "Show the exact changes Stills needs — changes nothing without --apply",
-    usage: "bb xcode sim onboard [--apply] [--project <path>]",
+    usage: "bb xcode sim onboard [--apply] [--project <path>] [--json]",
   },
   {
     name: "look",
@@ -191,6 +194,16 @@ export function forInvocation(ctx: Ctx, cliCtx: CliContext): Ctx {
     // request. It carries no authority to inherit the first project in bb.
     scopeForThread: () =>
       hasInvocationCheckout ? ctx.scopeForInvocation(hints) : Promise.resolve(null),
+    // Handlers built on this ctx re-resolve scope from their own hints; fold
+    // the invocation `cwd` in so a bare-terminal `stills` resolves the repo
+    // the caller is standing in, never "whichever project bb lists first".
+    // `cwd` is the weakest rung in `resolveScopeFor`, so a thread or project
+    // hint still wins when one exists.
+    scopeForInvocation: (handlerHints) =>
+      ctx.scopeForInvocation({
+        ...handlerHints,
+        ...(cliCtx.cwd === undefined ? {} : { cwd: cliCtx.cwd }),
+      }),
   };
 }
 
@@ -211,7 +224,8 @@ export function makeCli(base: Ctx) {
     if (!ctx.settings().allowAgentCapture && AGENT_CAPTURE_COMMANDS.has(command)) {
       return {
         exitCode: 1,
-        stderr: "Simulator agent access is disabled in Xcode plugin settings. Use the human-owned panel instead.\n",
+        stderr:
+          "Simulator agent access is disabled in Xcode plugin settings (allowAgentCapture). Use the human-owned panel instead.\n",
       };
     }
     switch (command) {
@@ -226,7 +240,7 @@ export function makeCli(base: Ctx) {
       case "shot":
         return shot(ctx, argv, cliCtx);
       case "drive":
-        return drive(ctx, argv);
+        return drive(ctx, argv, cliCtx);
       case "stills":
         return stills(ctx, argv, cliCtx);
       case "onboard":
@@ -273,7 +287,10 @@ async function doctor(ctx: Ctx, argv: string[]): Promise<CliResult> {
     return json({
       overall,
       probes: preflight.probes,
-      diskBytes: 0,
+      // The real number, matching the panel and `purge --dry-run` — a script
+      // reading a hardcoded 0 here was being told nothing is stored.
+      diskBytes: totalBytes(ctx.db),
+      scopeCount: scopeCount(ctx.db),
       checkedAt: preflight.checkedAt,
     });
   }
@@ -466,7 +483,7 @@ async function shot(ctx: Ctx, argv: string[], cliCtx: CliContext): Promise<CliRe
  * parse failure names the statement it failed on, because a script that fails
  * on step four should not read as a script that failed.
  */
-async function drive(ctx: Ctx, argv: string[]): Promise<CliResult> {
+async function drive(ctx: Ctx, argv: string[], cliCtx: CliContext = {}): Promise<CliResult> {
   const script = positionals(argv).join(" ");
   if (script.trim() === "") {
     return {
@@ -490,15 +507,28 @@ async function drive(ctx: Ctx, argv: string[]): Promise<CliResult> {
     return { exitCode: 1, stderr: "No simulator is running. Start one with `bb xcode sim live`.\n" };
   }
 
-  // The CLI takes the lease the same way an agent does: a person driving while
-  // an agent drives produces exactly the same interleaving.
-  const lease = ctx.leases.acquire(null);
+  // The lease holder is the invoking *thread*, exactly as the agent tools
+  // pass it. `null` here was every CLI caller sharing one identity: two agent
+  // threads driving via the CLI were re-entrant to each other and interleaved
+  // gestures — the precise failure the lease exists to prevent — and a thread
+  // already holding the lease through simulator_drive was refused its own CLI.
+  const lease = ctx.leases.acquire(cliCtx.threadId ?? null);
   if (!lease.ok) return { exitCode: 1, stderr: `${lease.reason}\n` };
 
   const resolver = makeResolver(ctx, device.udid);
   const log: string[] = [];
   try {
-    const socket = ctx.live.requireSocket();
+    let socket;
+    try {
+      socket = ctx.live.requireSocket();
+    } catch (error) {
+      // Between the device guard above and a live socket sits "still booting"
+      // and "reconnecting"; a sentence beats a raw stack either way.
+      return {
+        exitCode: 1,
+        stderr: `${error instanceof Error ? error.message : String(error)}\n`,
+      };
+    }
     for (const [index, step] of steps.entries()) {
       try {
         const result = await executeStep(socket, step, resolver, {
@@ -537,7 +567,8 @@ async function stills(
   if (result.error !== null) return { exitCode: 1, stderr: `${result.error}\n` };
   // The run takes minutes and reports itself in the panel; blocking a terminal
   // on it would be a worse version of watching the panel.
-  const queued = result.queued === 0 ? "" : ` It is queued behind ${result.queued} other run(s) on that device.\n`;
+  const queued =
+    result.queued === 0 ? "" : `It is queued behind ${result.queued} other run(s) on that device.\n`;
   return { exitCode: 0, stdout: `Rendering previews. Watch it in the Xcode panel's Stills tab.\n${queued}` };
 }
 

@@ -16,7 +16,6 @@ import {
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { Icon } from "@/components/ui/icon";
 import {
   Select,
@@ -38,6 +37,8 @@ import { cn } from "@/lib/utils";
 import { XCODE_CHANNEL } from "../src/channel";
 import type { rpcContract } from "../src/contract";
 import { formatRelative } from "./format";
+import { PANEL_PATH } from "./sim/route";
+import { useContainerWide } from "./use-container-width";
 import { RunDetailPanel } from "./RunDetailPanel";
 import { RunLog, type RunSummary, isActive } from "./RunLog";
 import { Trends } from "./Trends";
@@ -68,13 +69,15 @@ function XcodePanelView({
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const connection = useRealtimeConnectionState();
-  // The shared, listener-deduplicating hook rather than a private matchMedia
-  // effect: every row, tooltip and overlay in this panel already goes through
-  // it, so this adds no second browser listener.
-  const wide = useMediaQuery("(min-width: 1024px)");
+  const navigate = useBbNavigate();
+  // Measured on the panel, not the window: a 1600px viewport with this panel
+  // docked at 380px used to engage the two-pane layout and squeeze the detail
+  // pane to zero pixels. Two panes need the 26rem list plus a readable detail.
+  const [rootRef, wide] = useContainerWide<HTMLDivElement>(760);
 
   const [overview, setOverview] = useState<Overview | null>(null);
   const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [kind, setKind] = useState<"build" | "test" | null>(null);
   const [view, setView] = useState<View>("activity");
@@ -83,8 +86,14 @@ function XcodePanelView({
   const refresh = useCallback(() => {
     void rpc
       .call("overview", { projectId, kind, limit: 100 })
-      .then((result) => setOverview(result as unknown as Overview))
-      .catch(() => undefined)
+      .then((result) => {
+        setOverview(result as unknown as Overview);
+        setFailed(false);
+      })
+      // With durable state on screen, keep it; with nothing, say the truth —
+      // a swallowed failure used to render as a healthy "No Xcode activity
+      // yet", which is the panel lying about the machine.
+      .catch(() => setFailed(true))
       .finally(() => setLoading(false));
   }, [rpc, projectId, kind]);
 
@@ -114,7 +123,7 @@ function XcodePanelView({
   const showList = wide || selectedId === null;
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div ref={rootRef} className="flex h-full min-h-0 flex-col">
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
         <ToggleGroup
           type="single"
@@ -172,10 +181,18 @@ function XcodePanelView({
           {(overview?.simulators.length ?? 0) > 0 ? (
             <Tooltip>
               <TooltipTrigger asChild>
-                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                {/* A button since the merge gave this panel a Live tab: the
+                    booted count is now a door, not just a fact. Focusable,
+                    which also makes the tooltip reachable by keyboard. */}
+                <button
+                  type="button"
+                  className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+                  aria-label={`${overview!.simulators.length} booted simulator${overview!.simulators.length === 1 ? "" : "s"} — open Live`}
+                  onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: "live" })}
+                >
                   <Icon name="Smartphone" aria-hidden />
                   <span className="tabular-nums">{overview!.simulators.length}</span>
-                </span>
+                </button>
               </TooltipTrigger>
               <TooltipContent>
                 <div className="flex flex-col gap-0.5">
@@ -207,7 +224,7 @@ function XcodePanelView({
             // ambiguous — an empty list means "nothing built", not "not looking".
             <Tooltip>
               <TooltipTrigger asChild>
-                <span className="text-xs tabular-nums text-muted-foreground">
+                <span tabIndex={0} className="text-xs tabular-nums text-muted-foreground">
                   {overview.total} run{overview.total === 1 ? "" : "s"}
                 </span>
               </TooltipTrigger>
@@ -285,6 +302,21 @@ function XcodePanelView({
                   <Skeleton className="h-10 w-full" />
                   <Skeleton className="h-10 w-full" />
                 </div>
+              ) : failed && !overview ? (
+                // A failed call with nothing durable to keep must not render
+                // as a healthy "No Xcode activity yet" — that is the panel
+                // lying about the machine.
+                <div className="p-2">
+                  <EmptyState
+                    icon="AlertTriangle"
+                    title="Could not reach the tracker"
+                    description={
+                      <Button size="sm" variant="outline" onClick={refresh}>
+                        Try again
+                      </Button>
+                    }
+                  />
+                </div>
               ) : runs.length === 0 ? (
                 <div className="p-2">
                   <EmptyState
@@ -313,7 +345,12 @@ function XcodePanelView({
           ) : null}
 
           {showDetail ? (
+            // Keyed so a new selection mounts fresh: the un-keyed pane kept
+            // run A's header and issues on screen until run B's RPC landed,
+            // lost the race when A's slower answer arrived second, and left
+            // the tabs on whatever the previous run had open.
             <RunDetailPanel
+              key={effectiveId}
               runId={effectiveId}
               showBack={!wide}
               closable={!wide}
@@ -445,7 +482,7 @@ export function XcodePanel({ subPath = "" }: { subPath?: string }) {
         // segment itself, so pre-encoding double-encoded it and the echo came
         // back as a bogus "r%3A…" id (measured — it made every tap show
         // "Not found").
-        navigate.toPluginPanel("xcode", { subPath: id ?? "", replace: true });
+        navigate.toPluginPanel(PANEL_PATH, { subPath: id ?? "", replace: true });
       } catch {
         // URL sync is cosmetic; selection must never depend on it.
       }

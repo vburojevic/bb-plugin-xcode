@@ -739,26 +739,6 @@ export function evictionCandidates(db: Db, scopeKey: string | null): Look[] {
   return rows.map(toLook);
 }
 
-/**
- * Baselined looks beyond the newest per `(scope, device)` — the second tier of
- * eviction, reached only when the byte budget is still exceeded after the
- * unprotected looks are gone.
- */
-export function staleBaselinedLooks(db: Db): Look[] {
-  const rows = db
-    .prepare(
-      `SELECT l.* FROM looks l
-       JOIN baselines b ON b.look_id = l.id
-       WHERE l.id NOT IN (
-         SELECT look_id FROM baselines b2
-         WHERE b2.scope_key = l.scope_key AND b2.device_key = l.device_key
-       )
-       ORDER BY l.started_at ASC`,
-    )
-    .all() as LookRow[];
-  return rows.map(toLook);
-}
-
 export function countLooksInScope(db: Db, scopeKey: string, kind: LookKind): number {
   const row = db
     .prepare(`SELECT COUNT(*) AS n FROM looks WHERE scope_key = ? AND kind = ?`)

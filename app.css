@@ -80,21 +80,6 @@
   border-color: color-mix(in srgb, var(--bbx) 28%, transparent);
 }
 /*
- * Status presence on the card frame: a 1px border tint, not a colored edge
- * stripe. The transition is the card's one authored motion moment — when a
- * verdict lands, the whole frame eases from activity-blue to its outcome.
- */
-.bbx-frame {
-  border-color: color-mix(in srgb, var(--bbx) 28%, var(--border));
-  transition:
-    border-color 500ms cubic-bezier(0.16, 1, 0.3, 1),
-    box-shadow 500ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-span.bbx-dot > span {
-  background-color: var(--bbx);
-}
-
-/*
  * Live progress (shadcn Progress, indeterminate): a soft comet — a gradient
  * segment sweeping the track with an eased return, not a hard block bouncing
  * corner to corner. `finishing` switches to a full-width breath: the work is
@@ -146,20 +131,6 @@ span.bbx-dot > span {
   }
 }
 
-/* The verdict icon's landing: scale-settle once, on appearance only. */
-.bbx-verdict-in {
-  animation: bbx-verdict-in 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
-}
-@keyframes bbx-verdict-in {
-  from {
-    opacity: 0;
-    transform: scale(0.55);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
 
 /*
  * The compiler swarm. A lit dot is one live compiler process; an idle slot is
@@ -206,9 +177,6 @@ span.bbx-dot > span {
     animation: none;
     opacity: 1;
     transform: none;
-  }
-  .bbx-verdict-in {
-    animation: none;
   }
 }
 

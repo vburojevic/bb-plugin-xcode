@@ -121,7 +121,7 @@ boundary.
 
 ## Files and generated output
 
-`bb sims shot --out` requires a thread checkout, rejects absolute and escaping
+`bb xcode sim shot --out` requires a thread checkout, rejects absolute and escaping
 paths before capture, supplies the checkout as the daemon-enforced write root,
 and uses atomic create-only writes with mode `0600`.
 

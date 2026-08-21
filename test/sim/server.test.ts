@@ -384,6 +384,43 @@ describe("server-side destructive authorization", () => {
   });
 });
 
+describe("the gear menu's allowlist, at the RPC boundary", () => {
+  it("refuses a trust-shaped key with a sentence, before any write", async () => {
+    // `bb.sdk.plugins.updateSettings` is deliberately NOT stubbed here: if the
+    // handler reached for it, the fake host would throw naming the unstubbed
+    // path instead of this sentence — so the message match also proves the
+    // write was never attempted.
+    const harness = await load();
+    await expect(
+      harness.callRpc("uiOptionSet", { key: "allowAgentCapture", value: true }),
+    ).rejects.toThrow(/not a toggle this menu owns/);
+  });
+
+  it("flips a whitelisted display toggle and answers the new truth", async () => {
+    const box: { setSettings: ((next: Record<string, boolean>) => Promise<void>) | null } = {
+      setSettings: null,
+    };
+    const harness = await load({
+      sdk: {
+        ...sdkStubs(),
+        plugins: {
+          updateSettings: async ({ values }: { values: Record<string, boolean> }) => {
+            await box.setSettings?.(values);
+            return {};
+          },
+        },
+      },
+    });
+    box.setSettings = (next) => harness.setSettings(next);
+
+    const result = (await harness.callRpc("uiOptionSet", {
+      key: "showDeviceChrome",
+      value: true,
+    })) as { options: Array<{ key: string; value: boolean }> };
+    expect(result.options.find((option) => option.key === "showDeviceChrome")?.value).toBe(true);
+  });
+});
+
 describe("the service", () => {
   it("resolves when its signal aborts, rather than looping", async () => {
     const harness = await load();

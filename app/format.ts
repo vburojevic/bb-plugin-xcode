@@ -35,9 +35,13 @@ export function formatRelative(at: number, now: number = Date.now()): string {
   if (delta < 86_400_000) return `${Math.round(delta / 3_600_000)}h ago`;
   const days = Math.round(delta / 86_400_000);
   if (days < 14) return `${days}d ago`;
-  return new Date(at).toLocaleDateString(undefined, {
+  const date = new Date(at);
+  // "Jul 30" from last year is indistinguishable from this year's without it.
+  const sameYear = date.getFullYear() === new Date(now).getFullYear();
+  return date.toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
+    ...(sameYear ? {} : { year: "numeric" }),
   });
 }
 
@@ -178,11 +182,6 @@ export function runPhrase(run: {
     case "ended":
       return { name, verb: "— no result", verbFirst: false };
   }
-}
-
-/** Optional explanation for states whose label alone needs clarification. */
-export function statusHint(_status: RunStatus): string | null {
-  return null;
 }
 
 export function statusIcon(status: RunStatus): IconName {
