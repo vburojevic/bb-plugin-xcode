@@ -76,8 +76,8 @@ export async function discoverDefaultRoots(): Promise<string[]> {
  * Scan a project worktree for DerivedData roots.
  *
  * Bounded by `maxDepth` because worktrees can be large, and deliberately
- * includes dot-directories — TypeDock's real build output lives in
- * `TypeDockKit/.build-sim`, which a conventional scan would skip entirely.
+ * includes dot-directories — Almanac's real build output lives in
+ * `AlmanacKit/.build-sim`, which a conventional scan would skip entirely.
  */
 export async function discoverProjectRoots(
   worktree: string,

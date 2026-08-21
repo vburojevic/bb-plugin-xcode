@@ -135,7 +135,7 @@ export function parseManifest(xml: string): ManifestEntry[] {
 /**
  * Best-effort scheme name from a manifest title.
  *
- * Xcode writes titles like `Building workspace TypeDock with scheme TypeDock`;
+ * Xcode writes titles like `Building workspace Almanac with scheme Almanac`;
  * the scheme is the only part worth surfacing in a table.
  */
 export function schemeFromTitle(title: string | null): string | null {

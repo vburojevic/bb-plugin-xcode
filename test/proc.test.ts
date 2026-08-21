@@ -250,7 +250,7 @@ describe("activityKey", () => {
 describe("metadata queries are not builds (regression)", () => {
   it("ignores -list / -version / -showBuildSettings invocations", () => {
     const stdout = [
-      `500 1 00:11 /Applications/Xcode-26.6.0.app/Contents/Developer/usr/bin/xcodebuild -project TypeDock.xcodeproj -list`,
+      `500 1 00:11 /Applications/Xcode-26.6.0.app/Contents/Developer/usr/bin/xcodebuild -project Almanac.xcodeproj -list`,
       `501 1 00:02 /Applications/Xcode-26.6.0.app/Contents/Developer/usr/bin/xcodebuild -version`,
       `502 1 00:02 /Applications/Xcode-26.6.0.app/Contents/Developer/usr/bin/xcodebuild -scheme A -showBuildSettings`,
     ].join("\n");

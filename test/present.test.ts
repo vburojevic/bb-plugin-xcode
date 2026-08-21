@@ -90,9 +90,9 @@ describe("describeRun", () => {
   it("resolves a project id through the supplied lookup", () => {
     const line = describeRun(run({ projectId: "proj_1" }), {
       now: NOW,
-      projectName: (id) => (id === "proj_1" ? "Packerly" : null),
+      projectName: (id) => (id === "proj_1" ? "Almanac" : null),
     });
-    expect(line).toContain("Packerly");
+    expect(line).toContain("Almanac");
   });
 });
 

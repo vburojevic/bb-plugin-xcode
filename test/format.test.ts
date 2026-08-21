@@ -38,16 +38,16 @@ describe("terminal process presentation", () => {
 });
 
 describe("runPhrase", () => {
-  const base = { scheme: "Packerly", container: null, root: null };
+  const base = { scheme: "Almanac", container: null, root: null };
 
   it("leads with the verb while the work is happening", () => {
     expect(runPhrase({ ...base, status: "running", kind: "build" })).toEqual({
-      name: "Packerly",
+      name: "Almanac",
       verb: "Building",
       verbFirst: true,
     });
     expect(runPhrase({ ...base, status: "running", kind: "test" })).toEqual({
-      name: "Packerly",
+      name: "Almanac",
       verb: "Testing",
       verbFirst: true,
     });
@@ -61,7 +61,7 @@ describe("runPhrase", () => {
       ["cancelled", "cancelled"],
     ] as const) {
       expect(runPhrase({ ...base, status, kind: "build" })).toEqual({
-        name: "Packerly",
+        name: "Almanac",
         verb,
         verbFirst: false,
       });
@@ -70,7 +70,7 @@ describe("runPhrase", () => {
 
   it("says outright when there is no outcome to report", () => {
     expect(runPhrase({ ...base, status: "ended", kind: "build" })).toEqual({
-      name: "Packerly",
+      name: "Almanac",
       verb: "— no result",
       verbFirst: false,
     });

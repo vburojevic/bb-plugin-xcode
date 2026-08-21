@@ -154,11 +154,11 @@ export function runStatusLabel(run: {
  * said it a second time. Composing them removes both problems: the line reads
  * as one clause, and its grammar carries the state.
  *
- *   running/finishing  →  "Building Packerly"   (verb first, present)
- *   passed/warnings    →  "Packerly succeeded"  (verb last, past)
- *   failed             →  "Packerly failed"
- *   cancelled          →  "Packerly cancelled"
- *   ended              →  "Packerly — no result"
+ *   running/finishing  →  "Building Almanac"   (verb first, present)
+ *   passed/warnings    →  "Almanac succeeded"  (verb last, past)
+ *   failed             →  "Almanac failed"
+ *   cancelled          →  "Almanac cancelled"
+ *   ended              →  "Almanac — no result"
  */
 export function runPhrase(run: {
   status: RunStatus;

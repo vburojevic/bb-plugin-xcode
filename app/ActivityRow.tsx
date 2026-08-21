@@ -7,7 +7,7 @@
  *     `PromptStackCard` (see `.bbx-stack-card` in app.css) so the row sits in
  *     bb's prompt stack as a peer of "Running background command".
  *  2. The CONTENTS are ours. The row opens with a phrase, not a badge:
- *     "Building Packerly" while it runs, "Packerly succeeded" once it lands.
+ *     "Building Almanac" while it runs, "Almanac succeeded" once it lands.
  *     State and identity are one clause whose grammar does the work, in the
  *     run's own colour. Everything else — simulator, branch, counts — is
  *     supporting detail that may wrap behind it.
@@ -291,7 +291,7 @@ function elapsedProgress(
  * twice. Composing them fixes both: one clause, whose grammar carries the
  * state, and the kind token is gone because the verb already is the kind.
  *
- * The whole phrase is a single wrapping unit, so "Packerly succeeded" never
+ * The whole phrase is a single wrapping unit, so "Almanac succeeded" never
  * breaks across lines with the verb orphaned from its subject.
  */
 function Headline({ run }: { run: RunDto }) {

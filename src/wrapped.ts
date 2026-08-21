@@ -58,7 +58,7 @@ let activeWrappedBuilds = 0;
  *
  * DELIBERATELY DETACHED from whatever asked for it: holding a CLI request open
  * for a whole build meant bb's CLI proxy timeout (~5 min, measured live on a
- * Packerly build) aborted its signal, which SIGTERM'd xcodebuild mid-build and
+ * Almanac build) aborted its signal, which SIGTERM'd xcodebuild mid-build and
  * left an unfinalized result bundle. A build's lifetime belongs to the build.
  * `killSignal` is the one way to end it early, and only `xcode_build`'s own
  * timeout passes one.

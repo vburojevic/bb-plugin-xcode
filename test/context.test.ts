@@ -65,13 +65,13 @@ describe("gitInfoFor", () => {
     await writeFile(join(worktreeGitDir, "HEAD"), "ref: refs/heads/fix/crash\n");
 
     const linked = await scratch();
-    const app = join(linked, "TypeDock");
+    const app = join(linked, "Almanac");
     await mkdir(app, { recursive: true });
     await writeFile(join(app, ".git"), `gitdir: ${worktreeGitDir}\n`);
 
     const info = await gitInfoFor(app);
     expect(info?.branch).toBe("fix/crash");
-    expect(info?.worktree).toBe("TypeDock");
+    expect(info?.worktree).toBe("Almanac");
     expect(info?.isLinkedWorktree).toBe(true);
   });
 
