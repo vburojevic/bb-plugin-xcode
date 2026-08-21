@@ -106,6 +106,14 @@ export interface Ctx {
    * Never throws: a hosts API that cannot answer is an empty answer.
    */
   machines(): Promise<{ current: string | null; others: string[] }>;
+  /** The whole plugin's raw settings — both halves share one handle. */
+  rawSettings(): Promise<import("./settings.js").RawSettings>;
+  /**
+   * Write one settings key through bb, so `onChange` fires in both halves
+   * and bb's own settings screen stays the source of truth. Callers gate the
+   * key; this gates nothing.
+   */
+  writeSetting(key: string, value: boolean): Promise<void>;
   /** Prune and enforce the disk ceiling before generated frames are copied. */
   beforeFrameImport(incomingBytes: number): Promise<void>;
   /** HEAD for a checkout, so a frame records what it was a picture of. */

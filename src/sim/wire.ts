@@ -603,6 +603,12 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
     gitHead,
     recentDestinations: (limit) => host.recentDestinations(limit),
 
+    rawSettings: () => settingsApi.get(),
+
+    async writeSetting(key, value) {
+      await bb.sdk.plugins.updateSettings({ pluginId: bb.pluginId, values: { [key]: value } });
+    },
+
     /**
      * The machine dimension, for the device picker. Failure-tolerant by
      * contract: a hosts API that cannot answer must not take the device list

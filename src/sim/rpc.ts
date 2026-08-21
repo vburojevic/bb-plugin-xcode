@@ -64,6 +64,7 @@ import { overallState } from "./preflight.js";
 import { detach } from "./safe.js";
 import { coordinatesOnly, executeStep, type Step } from "./steps.js";
 import type { LiveStreamEvent } from "./hid.js";
+import { isUiOptionKey, uiOptions } from "./options.js";
 
 export type LiveStateDto = LiveState & {
   streamUrl: string | null;
@@ -465,6 +466,20 @@ export function makeRpcHandlers(ctx: Ctx) {
         );
       }
       return { ok };
+    },
+
+    async uiOptions() {
+      return { options: uiOptions(await ctx.rawSettings()) };
+    },
+
+    async uiOptionSet({ key, value }: { key: string; value: boolean }) {
+      // The allowlist is the security boundary: this route is reachable by any
+      // same-user local caller, so only presentation may live behind it.
+      if (!isUiOptionKey(key)) {
+        throw new Error(`"${key}" is not a toggle this menu owns. Use the plugin's settings screen.`);
+      }
+      await ctx.writeSetting(key, value);
+      return { options: uiOptions(await ctx.rawSettings()) };
     },
 
     async liveStream({ events }: { events: LiveStreamEvent[] }) {

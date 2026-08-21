@@ -226,6 +226,8 @@ export const rpcContract = defineRpcContract({
       })
       .strict(),
     output: z.object({
+      /** Whether the thread banner should render at all. Data flows either way. */
+      showActivity: z.boolean(),
       /** The pinned run, or the most relevant run in scope. */
       run: runSchema.nullable(),
       /** Other currently active runs in the same scope. */

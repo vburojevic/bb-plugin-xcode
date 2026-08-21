@@ -93,6 +93,13 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       label: "Scan project worktrees for DerivedData",
       default: true,
     },
+    showThreadActivity: {
+      type: "boolean",
+      label: "Show build activity in threads",
+      description:
+        "Live builds appear as rows above the composer while they run. Tracking continues either way; this only decides whether threads show it.",
+      default: true,
+    },
     extraRoots: {
       type: "string",
       label: "Extra DerivedData roots (comma separated)",
@@ -126,6 +133,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       bundleRetentionDays: positive(values.bundleRetentionDays, 2),
       bundleBudgetBytes: positive(values.bundleBudgetGb, 5) * 1024 ** 3,
       scanProjects: values.scanProjects,
+      showThreadActivity: values.showThreadActivity,
       extraRoots: values.extraRoots
         .split(",")
         .map((entry) => entry.trim())
@@ -303,6 +311,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     if (disposed) return;
     current = next;
     collector.updateSettings(current);
+    // A toggled banner must not wait for the next build event to disappear:
+    // the publish makes every mounted banner re-ask chatStatus now.
+    publishSoon();
   });
 
   // -------------------------------------------------------- thread scopes
@@ -467,6 +478,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       rescan: runRescan,
       publishSoon,
       detach: (work) => detach(work),
+      showThreadActivity: () => current.showThreadActivity,
     }),
   );
 

@@ -136,7 +136,7 @@ export function ThreadSimulator({ threadId }: { threadId: string }) {
         onInput={live.stream}
         // The doctor lives in the nav panel; from here the honest move is to
         // say so rather than render a second copy of it in a 400px column.
-        onOpenDoctor={() => toast.info("Open the Simulators panel for the doctor.")}
+        onOpenDoctor={() => toast.info("Open the Xcode panel for the doctor.")}
         onStep={onStep}
         controls={
           live.state === null ? null : (

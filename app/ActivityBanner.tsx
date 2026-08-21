@@ -86,7 +86,12 @@ export function XcodeActivityBanner() {
 function XcodeActivityBannerLoaded({ threadId }: { threadId: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const { data } = useChatStatus(threadId, null);
-  const live = liveRuns(data?.run ?? null, data?.active ?? []);
+  // The gear menu's "Build activity in threads" toggle, answered by the same
+  // call that carries the rows — so flipping it takes effect on the next
+  // publish, not after some cache expires. Computed before the early return
+  // below because hooks must run unconditionally.
+  const hidden = data != null && data.showActivity === false;
+  const live = hidden ? [] : liveRuns(data?.run ?? null, data?.active ?? []);
   useLiveTick(live.length > 0);
 
   const dismiss = useCallback(
@@ -109,8 +114,9 @@ function XcodeActivityBannerLoaded({ threadId }: { threadId: string }) {
         : [];
 
   // Nothing to report renders nothing at all — frame included, so the stack
-  // closes up rather than keeping an empty card above the composer.
-  if (runs.length === 0) return null;
+  // closes up rather than keeping an empty card above the composer. A hidden
+  // banner is the same nothing, settled fallback included.
+  if (hidden || runs.length === 0) return null;
 
   const showingSettled = live.length === 0;
   const shown = runs.slice(0, MAX_ROWS);

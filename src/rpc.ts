@@ -56,6 +56,8 @@ export interface RpcDeps {
   rescan(): void;
   publishSoon(): void;
   detach(work: () => Promise<unknown>): void;
+  /** Whether threads should show live build rows above the composer. */
+  showThreadActivity(): boolean;
 }
 
 export function createRpcHandlers(deps: RpcDeps) {
@@ -235,6 +237,10 @@ export function createRpcHandlers(deps: RpcDeps) {
 
       const dtoOf = (entry: Run): RunDto => dto.toDto(entry);
       return {
+        // The data is always answered — the run detail panel and the pinned
+        // card read this too. The flag is for the *banner*, which is the one
+        // surface the toggle is about.
+        showActivity: deps.showThreadActivity(),
         run: run ? dtoOf(run) : null,
         active: unresolved.filter((entry) => entry.id !== run?.id).map(dtoOf),
         recent: finished.filter((entry) => entry.id !== run?.id).map(dtoOf),

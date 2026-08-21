@@ -20,58 +20,33 @@
  * is actually building, and disappears the moment nothing is.
  */
 
-import { definePluginApp, useBbNavigate } from "@bb/plugin-sdk/app";
+import { definePluginApp } from "@bb/plugin-sdk/app";
 
 import "./app.css";
 
 import { XcodeActivityBanner } from "./app/ActivityBanner";
-import { XcodePanel } from "./app/XcodePanel";
+import { PanelHeader, PanelRoot } from "./app/PanelRoot";
 
-import { SimulatorsPanel } from "./app/sim/SimulatorsPanel";
 import { StillsDirective } from "./app/sim/StillsDirective";
 import { ActivityBanner as SimulatorBanner } from "./app/sim/ActivityBanner";
 import { ServerConfirm } from "./app/sim/ServerConfirm";
-import { DeviceBar } from "./app/sim/DeviceBar";
 import { ThreadSimulator } from "./app/sim/ThreadSimulator";
-import { useLive } from "./app/sim/useLive";
-import { PANEL_PATH, subPathForTab, tabOf } from "./app/sim/route";
-
-/**
- * The Simulators panel's header accessory.
- *
- * It reads from the same module-level store as the panel body — the host
- * renders this inside its own title bar, a separate React tree, and a
- * per-instance fetch here would double every `simctl` call the panel makes.
- */
-function SimulatorsHeader({ subPath }: { subPath: string }) {
-  const navigate = useBbNavigate();
-  const live = useLive();
-  return (
-    <DeviceBar
-      tab={tabOf(subPath)}
-      onTab={(tab) => navigate.toPluginPanel(PANEL_PATH, { subPath: subPathForTab(tab) })}
-      state={live.state}
-      devices={live.devices}
-      onPick={(udid) => void live.start(udid)}
-    />
-  );
-}
+import { PANEL_PATH } from "./app/sim/route";
 
 export default definePluginApp((app) => {
+  /**
+   * One sidebar entry for the whole plugin. Builds, Live and Stills are tabs
+   * inside it — the tab is the `subPath`, so deep links and browser history
+   * keep working. Two panels was one panel too many: they answered the same
+   * question ("what is my Xcode work doing") from two doors.
+   */
   app.slots.navPanel({
     id: "xcode",
     title: "Xcode",
     icon: "Toolbox",
-    path: "xcode",
-    component: XcodePanel,
-  });
-  app.slots.navPanel({
-    id: "simulators",
-    title: "Simulators",
-    icon: "Smartphone",
     path: PANEL_PATH,
-    component: SimulatorsPanel,
-    headerContent: SimulatorsHeader,
+    component: PanelRoot,
+    headerContent: PanelHeader,
   });
 
   /**

@@ -483,6 +483,46 @@ export const rpcContract = defineRpcContract({
    * loopback link a batch is one or two events; over a remote bb connection it is a
    * whole stretch of the drag, delivered smooth instead of as teleports.
    */
+  /**
+   * The gear menu's toggles: an allowlisted slice of the plugin's settings.
+   *
+   * Presentation only, by design — `src/sim/options.ts` says why nothing
+   * trust-shaped can ever ride this pair.
+   */
+  uiOptions: {
+    input: z.null(),
+    output: z
+      .object({
+        options: z.array(
+          z
+            .object({
+              key: z.string(),
+              label: z.string(),
+              detail: z.string(),
+              value: z.boolean(),
+            })
+            .strict(),
+        ),
+      })
+      .strict(),
+  },
+  uiOptionSet: {
+    input: z.object({ key: z.string(), value: z.boolean() }).strict(),
+    output: z
+      .object({
+        options: z.array(
+          z
+            .object({
+              key: z.string(),
+              label: z.string(),
+              detail: z.string(),
+              value: z.boolean(),
+            })
+            .strict(),
+        ),
+      })
+      .strict(),
+  },
   liveStream: {
     input: z
       .object({

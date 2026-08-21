@@ -61,6 +61,8 @@ export type RunDto = {
 };
 
 export type ChatStatus = {
+  /** Whether the thread banner should render at all. Data flows either way. */
+  showActivity: boolean;
   run: RunDto | null;
   active: RunDto[];
   recent: RunDto[];
