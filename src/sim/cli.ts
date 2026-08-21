@@ -1,5 +1,5 @@
 /**
- * `bb sims …`
+ * `bb xcode sim …`
  *
  * Three rules this file exists to respect.
  *
@@ -84,73 +84,73 @@ export function positionals(argv: readonly string[]): string[] {
 }
 
 export const CLI_COMMANDS = [
-  { name: "doctor", summary: "Every prerequisite, its state, and the fix", usage: "bb sims doctor [--json]" },
-  { name: "status", summary: "Live device and current state", usage: "bb sims status [--json]" },
+  { name: "doctor", summary: "Every prerequisite, its state, and the fix", usage: "bb xcode sim doctor [--json]" },
+  { name: "status", summary: "Live device and current state", usage: "bb xcode sim status [--json]" },
   {
     name: "devices",
     summary: "Simulators, marking booted and which is live",
-    usage: "bb sims devices [--json]",
+    usage: "bb xcode sim devices [--json]",
   },
-  { name: "live", summary: "Start or stop the live surface", usage: "bb sims live [<device>] [--stop]" },
+  { name: "live", summary: "Start or stop the live surface", usage: "bb xcode sim live [<device>] [--stop]" },
   {
     name: "shot",
     summary: "Capture one frame",
-    usage: "bb sims shot [--out <path>] [--label <s>]",
+    usage: "bb xcode sim shot [--out <path>] [--label <s>]",
   },
   {
     name: "stills",
     summary: "Render every SwiftUI preview and diff it against the last run",
-    usage: "bb sims stills [--device <d>] [--set-baseline]",
+    usage: "bb xcode sim stills [--device <d>] [--set-baseline]",
   },
   {
     name: "onboard",
     summary: "Show the exact changes Stills needs — changes nothing without --apply",
-    usage: "bb sims onboard [--apply] [--project <path>]",
+    usage: "bb xcode sim onboard [--apply] [--project <path>]",
   },
   {
     name: "look",
     summary: "One run's verdict",
-    usage: "bb sims look [<lookId>] [--json]",
+    usage: "bb xcode sim look [<lookId>] [--json]",
   },
   {
     name: "history",
     summary: "One preview's frames over time, with commits",
-    usage: "bb sims history <identity> [--json]",
+    usage: "bb xcode sim history <identity> [--json]",
   },
   {
     name: "baseline",
     summary: "Show, set or clear the baseline",
-    usage: "bb sims baseline [show | set <lookId> | clear]",
+    usage: "bb xcode sim baseline [show | set <lookId> | clear]",
   },
   {
     name: "demos",
     summary: "List the demo states this plugin can render with no hardware",
-    usage: "bb sims demos",
+    usage: "bb xcode sim demos",
   },
   {
     name: "demo-banner",
     summary: "Render one demo banner in this thread's composer for five minutes",
-    usage: "bb sims demo-banner <state|off>",
+    usage: "bb xcode sim demo-banner <state|off>",
   },
   {
     name: "purge",
     summary: "Report and then remove every frame this plugin has stored",
-    usage: "bb sims purge [--dry-run]",
+    usage: "bb xcode sim purge [--dry-run]",
   },
   {
     name: "card",
     summary: "Print the canonical directive for a run",
-    usage: "bb sims card <lookId>",
+    usage: "bb xcode sim card <lookId>",
   },
   {
     name: "diff",
     summary: "Compare two runs",
-    usage: "bb sims diff <lookA> <lookB> [--json]",
+    usage: "bb xcode sim diff <lookA> <lookB> [--json]",
   },
   {
     name: "drive",
     summary: "Run a short sequence of gestures",
-    usage: 'bb sims drive "tap 0.5,0.9; type hello; swipe up; rotate landscape-left"',
+    usage: 'bb xcode sim drive "tap 0.5,0.9; type hello; swipe up; rotate landscape-left"',
   },
 ];
 
@@ -242,7 +242,7 @@ export function makeCli(base: Ctx) {
       case "demos":
         return {
           exitCode: 0,
-          stdout: `${DEMO_BANNER_STATES.join("\n")}\n\nbb sims demo-banner <state>\n`,
+          stdout: `${DEMO_BANNER_STATES.join("\n")}\n\nbb xcode sim demo-banner <state>\n`,
         };
       case "demo-banner":
         return demoBannerCommand(ctx, argv);
@@ -359,7 +359,7 @@ async function live(ctx: Ctx, argv: string[]): Promise<CliResult> {
       stderr:
         wanted === null
           ? "No simulator to watch. Install an iOS runtime in Xcode → Settings → Components.\n"
-          : `No simulator matched "${wanted}". Run \`bb sims devices\` to see what is installed.\n`,
+          : `No simulator matched "${wanted}". Run \`bb xcode sim devices\` to see what is installed.\n`,
     };
   }
   return {
@@ -471,7 +471,7 @@ async function drive(ctx: Ctx, argv: string[]): Promise<CliResult> {
   if (script.trim() === "") {
     return {
       exitCode: 2,
-      stderr: 'Nothing to run. Try: bb sims drive "tap 0.5,0.9; type hello; swipe up"\n',
+      stderr: 'Nothing to run. Try: bb xcode sim drive "tap 0.5,0.9; type hello; swipe up"\n',
     };
   }
 
@@ -487,7 +487,7 @@ async function drive(ctx: Ctx, argv: string[]): Promise<CliResult> {
 
   const device = ctx.live.currentDevice();
   if (device === null) {
-    return { exitCode: 1, stderr: "No simulator is running. Start one with `bb sims live`.\n" };
+    return { exitCode: 1, stderr: "No simulator is running. Start one with `bb xcode sim live`.\n" };
   }
 
   // The CLI takes the lease the same way an agent does: a person driving while
@@ -661,7 +661,7 @@ async function look(ctx: Ctx, argv: string[]): Promise<CliResult> {
 async function history(ctx: Ctx, argv: string[]): Promise<CliResult> {
   const identity = positionals(argv)[0];
   if (identity === undefined) {
-    return { exitCode: 2, stderr: "Which preview? Try: bb sims history preview:MyApp_LoginView.swift_Dark.png\n" };
+    return { exitCode: 2, stderr: "Which preview? Try: bb xcode sim history preview:MyApp_LoginView.swift_Dark.png\n" };
   }
   if ((await ctx.scopeForThread(null)) === null) {
     return { exitCode: 1, stderr: NO_INVOCATION_SCOPE };
@@ -718,7 +718,7 @@ async function baseline(
   }
   if (sub === "set") {
     const lookId = positionals(argv)[1];
-    if (lookId === undefined) return { exitCode: 2, stderr: "Which run? bb sims baseline set <lookId>\n" };
+    if (lookId === undefined) return { exitCode: 2, stderr: "Which run? bb xcode sim baseline set <lookId>\n" };
     if ((await scopedLook(ctx, lookId)) === null) {
       return { exitCode: 1, stderr: `No run called ${lookId}.\n` };
     }
@@ -741,7 +741,7 @@ async function baseline(
           : `${lookId} is the baseline, replacing the one from ${result.replaced.slice(0, 7)}.\n`,
     };
   }
-  return { exitCode: 2, stderr: "bb sims baseline [show | set <lookId> | clear]\n" };
+  return { exitCode: 2, stderr: "bb xcode sim baseline [show | set <lookId> | clear]\n" };
 }
 
 /**
@@ -752,7 +752,7 @@ async function baseline(
  */
 async function card(ctx: Ctx, argv: string[]): Promise<CliResult> {
   const lookId = positionals(argv)[0];
-  if (lookId === undefined) return { exitCode: 2, stderr: "Which run? bb sims card <lookId>\n" };
+  if (lookId === undefined) return { exitCode: 2, stderr: "Which run? bb xcode sim card <lookId>\n" };
   if (!LOOK_ID_PATTERN.test(lookId)) {
     return { exitCode: 2, stderr: `"${lookId}" is not a run id.\n` };
   }
@@ -771,7 +771,7 @@ async function card(ctx: Ctx, argv: string[]): Promise<CliResult> {
 async function diffRuns(ctx: Ctx, argv: string[]): Promise<CliResult> {
   const [a, b] = positionals(argv);
   if (a === undefined || b === undefined) {
-    return { exitCode: 2, stderr: "bb sims diff <lookA> <lookB>\n" };
+    return { exitCode: 2, stderr: "bb xcode sim diff <lookA> <lookB>\n" };
   }
   const [lookA, lookB] = await Promise.all([scopedLook(ctx, a), scopedLook(ctx, b)]);
   if (lookA === null || lookB === null) {

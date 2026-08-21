@@ -110,7 +110,7 @@ export class FrameStore {
     await rm(dir, { recursive: true, force: true });
   }
 
-  /** Remove everything. `bb sims purge` and nothing else. */
+  /** Remove everything. `bb xcode sim purge` and nothing else. */
   async removeAll(): Promise<void> {
     await rm(this.framesRoot, { recursive: true, force: true });
   }

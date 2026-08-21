@@ -2,7 +2,7 @@
  * Every user-facing sentence this plugin can say, and the number formatting
  * underneath them.
  *
- * The sentences live together because they are the contract: `bb sims doctor`,
+ * The sentences live together because they are the contract: `bb xcode sim doctor`,
  * the panel's Doctor section and the empty state must render the *same* words,
  * or a stranger reading one and then the other learns there are two
  * vocabularies for one state. The frontend tests assert these strings, not

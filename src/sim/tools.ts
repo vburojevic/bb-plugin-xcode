@@ -331,7 +331,7 @@ export function makeStillsTool(ctx: Ctx) {
         summary = await ctx.stills.run(scope, args.device ?? null);
       } catch (error) {
         // On an un-onboarded project this is a tool **error** whose message is
-        // the onboarding text, so the model can offer to run `bb sims onboard`
+        // the onboarding text, so the model can offer to run `bb xcode sim onboard`
         // instead of inventing a reason.
         return textError(error instanceof Error ? error.message : String(error));
       }

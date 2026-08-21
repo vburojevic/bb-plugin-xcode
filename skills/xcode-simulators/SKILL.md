@@ -1,6 +1,6 @@
 ---
 name: xcode-simulators
-description: Look at, touch and diff an iOS simulator. Use when you have changed SwiftUI and want to show the result rather than describe it, when you need to demonstrate a flow on a real device, or when you want to know whether a change moved any other preview. Also covers `bb sims` commands.
+description: Look at, touch and diff an iOS simulator. Use when you have changed SwiftUI and want to show the result rather than describe it, when you need to demonstrate a flow on a real device, or when you want to know whether a change moved any other preview. Also covers `bb xcode sim` commands.
 ---
 
 # Xcode Simulators
@@ -47,7 +47,7 @@ already looking at it. Say what you changed and why, and let the panel show the
 pixels.
 
 On a project with no snapshot target, `simulator_stills` returns an error whose
-message is the onboarding text. Offer to run `bb sims onboard` — which prints
+message is the onboarding text. Offer to run `bb xcode sim onboard` — which prints
 the exact changes and writes nothing — rather than inventing a reason.
 
 ## Never expose the simulator
@@ -60,21 +60,21 @@ bb panel.
 ## The commands
 
 ```
-bb sims doctor              every prerequisite, its state, and the fix
-bb sims devices             simulators, marking booted and which is live
-bb sims live [<device>]     start watching one
-bb sims shot [--label <s>]  capture one frame
-bb sims drive "<script>"    tap 0.5,0.9; type hello; swipe up; rotate landscape-left
-bb sims stills              render every preview and diff it
-bb sims look [<lookId>]     one run's verdict
-bb sims history <identity>  one preview's frames over time, with commits
-bb sims baseline            show, set or clear what runs compare against
-bb sims onboard [--apply]   what Stills needs from this repo
-bb sims card <lookId>       the directive for a run — never hand-write one
-bb sims purge [--dry-run]   report, then remove, every stored frame
+bb xcode sim doctor              every prerequisite, its state, and the fix
+bb xcode sim devices             simulators, marking booted and which is live
+bb xcode sim live [<device>]     start watching one
+bb xcode sim shot [--label <s>]  capture one frame
+bb xcode sim drive "<script>"    tap 0.5,0.9; type hello; swipe up; rotate landscape-left
+bb xcode sim stills              render every preview and diff it
+bb xcode sim look [<lookId>]     one run's verdict
+bb xcode sim history <identity>  one preview's frames over time, with commits
+bb xcode sim baseline            show, set or clear what runs compare against
+bb xcode sim onboard [--apply]   what Stills needs from this repo
+bb xcode sim card <lookId>       the directive for a run — never hand-write one
+bb xcode sim purge [--dry-run]   report, then remove, every stored frame
 ```
 
-`bb sims doctor` is the first thing to run when something does not work. Every
+`bb xcode sim doctor` is the first thing to run when something does not work. Every
 line it prints has the fix in it.
 
 ## Things that will surprise you

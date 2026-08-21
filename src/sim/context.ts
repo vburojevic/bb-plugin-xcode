@@ -79,7 +79,7 @@ export interface Ctx {
    * The scope for a CLI invocation.
    *
    * A bare terminal invocation has no thread, so `cwd` is the strongest
-   * evidence available — and it is the difference between `bb sims onboard`
+   * evidence available — and it is the difference between `bb xcode sim onboard`
    * analysing the repo you are standing in and analysing whichever project bb
    * happens to list first. `projectId` beats it when the caller knew one.
    */
@@ -123,7 +123,7 @@ export interface Ctx {
      * Enqueue a render. Returns as soon as it is queued, never when it is done.
      *
      * The **scope is passed in** rather than resolved inside. It used to be
-     * resolved from the default project, which meant `bb sims stills` rendered
+     * resolved from the default project, which meant `bb xcode sim stills` rendered
      * whichever project bb listed first instead of the one the caller meant.
      */
     enqueue(scope: ThreadScope, device: string | null): Promise<{ lookId: string | null; queued: number }>;

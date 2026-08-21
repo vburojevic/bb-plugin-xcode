@@ -227,7 +227,7 @@ describe("the CLI", () => {
     const harness = await load();
     const help = await harness.runCli([]);
     expect(help.exitCode).toBe(0);
-    expect(help.stdout).toContain("bb sims doctor");
+    expect(help.stdout).toContain("bb xcode sim doctor");
 
     const unknown = await harness.runCli(["frobnicate"]);
     expect(unknown.exitCode).toBe(2);

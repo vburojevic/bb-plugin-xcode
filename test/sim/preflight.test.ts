@@ -13,7 +13,7 @@ import {
 } from "../../src/sim/preflight.js";
 
 /**
- * `bb sims doctor`, the panel's Doctor section and the empty state render
+ * `bb xcode sim doctor`, the panel's Doctor section and the empty state render
  * **the same sentences**. Each assertion here is on the sentence, not on the
  * state token, because the sentence is the contract.
  */

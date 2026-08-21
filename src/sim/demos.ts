@@ -1,7 +1,7 @@
 /**
  * Fixtures that need no hardware.
  *
- * `bb sims demos` and `bb sims demo-banner <state>` render these in the real
+ * `bb xcode sim demos` and `bb xcode sim demo-banner <state>` render these in the real
  * composer location for five minutes. That is the design-review loop, working
  * with no simulator and no project — which matters more than it sounds, because
  * the states worth reviewing are the failure states, and those are exactly the

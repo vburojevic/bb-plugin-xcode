@@ -89,7 +89,28 @@ if the request disconnects or the wait times out, the build carries on and
 `bb xcode status` still finds it. Both exit non-zero on a failed build, so they
 compose with `&&`.
 
-The **Xcode** nav panel shows the live strip, history and trends.
+## The panel
+
+One **Xcode** entry in the sidebar, three tabs in its header:
+
+- **Builds** — the live strip, machine-wide history and trends, with a
+  drill-in per run.
+- **Live** — a booted simulator, streamed and fully interactive: tap, drag,
+  flick, trackpad pinch, ⌘V paste, keyboard. Input ships as timestamped
+  batches and is replayed at the finger's own pace, so it stays faithful over
+  a remote bb connection too.
+- **Stills** — every SwiftUI preview rendered and diffed against the last run.
+
+The device picker shelves what matters: **Booted** first (live dot, "on
+screen" marker), then **Recent** — last booted *or* last targeted by a tracked
+build, which is evidence Xcode's own picker does not have — then everything
+else grouped by runtime, searchable once the herd grows. The gear beside it
+toggles what the plugin shows in threads (build activity, preview results,
+device chrome) and opens the doctor; trust-shaped settings deliberately stay
+in bb's own settings screen.
+
+A per-thread simulator also opens beside any conversation ("Open simulator"),
+picking its device from what that thread has actually been building.
 
 ### For agents
 

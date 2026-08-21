@@ -275,7 +275,7 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
    * The scope, from whatever the caller knew.
    *
    * Order matters and was arrived at by getting it wrong: a bare
-   * `bb sims onboard` in a terminal has no thread, so falling straight through
+   * `bb xcode sim onboard` in a terminal has no thread, so falling straight through
    * to "bb's first project" made it analyse a completely different repository
    * from the one the user was standing in. `cwd` is the strongest evidence a
    * terminal invocation carries.
@@ -433,7 +433,7 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
       }
       if (project.snapshotTestTarget === null) {
         throw new Error(
-          "Stills needs a hosted unit-test target linking SnapshottingTests. Run `bb sims onboard` to see the exact changes.",
+          "Stills needs a hosted unit-test target linking SnapshottingTests. Run `bb xcode sim onboard` to see the exact changes.",
         );
       }
 

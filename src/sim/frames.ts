@@ -776,7 +776,7 @@ export function scopeCount(db: Db): number {
   return row.n;
 }
 
-/** Every look, for `bb sims purge` and for the doctor's disk figure. */
+/** Every look, for `bb xcode sim purge` and for the doctor's disk figure. */
 export function allLooks(db: Db): Look[] {
   const rows = db.prepare(`SELECT * FROM looks ORDER BY started_at ASC`).all() as LookRow[];
   return rows.map(toLook);

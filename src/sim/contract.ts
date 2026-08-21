@@ -370,7 +370,7 @@ export const rpcContract = defineRpcContract({
   },
   onboardPlan: {
     /**
-     * `wait` is for a foreground caller — someone who typed `bb sims onboard`
+     * `wait` is for a foreground caller — someone who typed `bb xcode sim onboard`
      * and is looking at a terminal. The panel never sets it: a mount must not
      * hold a handler open for the tens of seconds `xcodebuild -list` takes.
      */

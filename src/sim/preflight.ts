@@ -1,7 +1,7 @@
 /**
  * Prerequisites, probed once and cached.
  *
- * `bb sims doctor`, the panel's Doctor section and the empty state render **the
+ * `bb xcode sim doctor`, the panel's Doctor section and the empty state render **the
  * same sentences** — there is no second vocabulary of status tokens. Every
  * check returns a `Probe` whose `detail` is the sentence a person reads, so a
  * new surface cannot invent its own wording for a state that already has one.

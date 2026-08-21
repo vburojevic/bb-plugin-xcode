@@ -3,7 +3,7 @@
  *
  * Split out from the components so the frontend tests can assert **the
  * sentence** — the sentence is the contract, not the class name — and so the
- * panel, `bb sims doctor` and the empty state cannot drift into three
+ * panel, `bb xcode sim doctor` and the empty state cannot drift into three
  * vocabularies for one situation.
  */
 import { joinWords } from "../../src/sim/format.js";

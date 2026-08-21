@@ -1,7 +1,7 @@
 /**
  * The Doctor section.
  *
- * Renders exactly the sentences `bb sims doctor` prints — same source, same
+ * Renders exactly the sentences `bb xcode sim doctor` prints — same source, same
  * order, same wording. Someone who read one and then opens the other must not
  * have to learn a second vocabulary.
  */

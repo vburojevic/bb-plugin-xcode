@@ -503,7 +503,7 @@ export function makeRpcHandlers(ctx: Ctx) {
 /**
  * Capture, with the context the store needs assembled in one place.
  *
- * Shared by the RPC handler, the agent tool and `bb sims shot`, so a frame taken
+ * Shared by the RPC handler, the agent tool and `bb xcode sim shot`, so a frame taken
  * three ways is one frame taken one way.
  */
 export async function captureNow(

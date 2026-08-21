@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-xcode",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "bb": ">=0.35",
@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "Xcode",
-    "description": "Track Xcode builds, tests and every other Xcode process across all your projects — live, with no per-project configuration.",
+    "description": "Track Xcode builds and tests with no per-project configuration, and drive the simulators they run on — live streaming, full touch input, and SwiftUI preview diffs.",
     "branding": {
       "icon": "Toolbox"
     },

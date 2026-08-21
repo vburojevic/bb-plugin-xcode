@@ -1,5 +1,5 @@
 /**
- * The drive script: `bb sims drive "tap 0.5,0.9; type hello; swipe up"`.
+ * The drive script: `bb xcode sim drive "tap 0.5,0.9; type hello; swipe up"`.
  *
  * A tiny language, on purpose. It exists so a person at a terminal can drive a
  * simulator without writing JSON, and so the CLI and the agent tool run the
