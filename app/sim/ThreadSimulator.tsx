@@ -16,14 +16,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { useRpc } from "@bb/plugin-sdk/app";
-import { Button } from "@/components/ui/button";
-import { Icon } from "@/components/ui/icon";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { DevicePicker } from "./DevicePicker";
 import { LivePanel } from "./LivePanel";
 import { ControlBar } from "./ControlBar";
 import { useLive } from "./useLive";
@@ -106,7 +99,6 @@ export function ThreadSimulator({ threadId }: { threadId: string }) {
   );
 
   const current = live.state?.device ?? null;
-  const alternatives = pick?.alternatives ?? [];
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -124,22 +116,13 @@ export function ThreadSimulator({ threadId }: { threadId: string }) {
           ) : null}
         </div>
 
-        {alternatives.length > 1 ? (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button size="sm" variant="ghost" disabled={busy}>
-                <Icon name="Smartphone" className="size-4" />
-                Change
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              {alternatives.map((device) => (
-                <DropdownMenuItem key={device.udid} onSelect={() => switchTo(device.udid)}>
-                  {device.name} · {device.osVersion}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
+        {(live.devices?.devices.length ?? 0) > 0 ? (
+          <DevicePicker
+            devices={live.devices}
+            liveUdid={current?.udid ?? null}
+            onPick={switchTo}
+            label="Change"
+          />
         ) : null}
       </div>
 

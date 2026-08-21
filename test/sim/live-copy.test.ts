@@ -31,13 +31,15 @@ const IPAD = { udid: "u2", name: "iPad Pro 13-inch", osVersion: "26.5" };
 function devices(over: Partial<DeviceList> = {}): DeviceList {
   return {
     devices: [
-      { udid: IPHONE.udid, name: IPHONE.name, state: "Shutdown", osVersion: "26.5", platform: "iOS", isAvailable: true },
-      { udid: IPAD.udid, name: IPAD.name, state: "Shutdown", osVersion: "26.5", platform: "iPadOS", isAvailable: true },
+      { udid: IPHONE.udid, name: IPHONE.name, state: "Shutdown", osVersion: "26.5", platform: "iOS", family: "iphone", isAvailable: true, lastBootedAt: null, lastBuiltAt: null },
+      { udid: IPAD.udid, name: IPAD.name, state: "Shutdown", osVersion: "26.5", platform: "iPadOS", family: "ipad", isAvailable: true, lastBootedAt: null, lastBuiltAt: null },
     ],
     bootedUdids: [],
     suggested: IPHONE,
     hasDrivableRuntime: true,
     installedPlatforms: ["iOS", "iPadOS"],
+    machine: null,
+    otherMachines: [],
     error: null,
     ...over,
   };

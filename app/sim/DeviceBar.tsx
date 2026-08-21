@@ -4,16 +4,9 @@
  * device picker then collapses to the bare chevron.
  */
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { useIsCompactViewport } from "@/components/ui/hooks/use-compact-viewport";
+import { DevicePicker } from "./DevicePicker";
 import type { DeviceList, LiveState } from "./useLive";
 
 export type Tab = "live" | "stills";
@@ -29,10 +22,6 @@ export interface DeviceBarProps {
 export function DeviceBar({ tab, onTab, state, devices, onPick }: DeviceBarProps) {
   const compact = useIsCompactViewport();
   const current = state?.device ?? null;
-  const booted = new Set(devices?.bootedUdids ?? []);
-  const available = (devices?.devices ?? []).filter((device) => device.isAvailable);
-  const running = available.filter((device) => booted.has(device.udid));
-  const rest = available.filter((device) => !booted.has(device.udid));
 
   return (
     <div className="flex min-w-0 items-center gap-1">
@@ -47,39 +36,12 @@ export function DeviceBar({ tab, onTab, state, devices, onPick }: DeviceBarProps
         />
       </div>
 
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button variant="ghost" size="sm" className="min-w-0 gap-1">
-            {compact ? null : (
-              <span className="truncate">{current?.name ?? "Choose a simulator"}</span>
-            )}
-            <Icon name="ChevronDown" className="size-3.5 shrink-0" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="max-h-96 w-64 overflow-y-auto">
-          {running.length > 0 ? (
-            <>
-              <DropdownMenuLabel>Already running</DropdownMenuLabel>
-              {running.map((device) => (
-                <DropdownMenuItem key={device.udid} onSelect={() => onPick(device.udid)}>
-                  <span className="truncate">{device.name}</span>
-                  <span className="ml-auto text-xs text-muted-foreground">{device.osVersion}</span>
-                </DropdownMenuItem>
-              ))}
-              <DropdownMenuSeparator />
-            </>
-          ) : null}
-          {rest.length === 0 && running.length === 0 ? (
-            <DropdownMenuItem disabled>No simulators are installed.</DropdownMenuItem>
-          ) : null}
-          {rest.map((device) => (
-            <DropdownMenuItem key={device.udid} onSelect={() => onPick(device.udid)}>
-              <span className="truncate">{device.name}</span>
-              <span className="ml-auto text-xs text-muted-foreground">{device.osVersion}</span>
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuContent>
-      </DropdownMenu>
+      <DevicePicker
+        devices={devices}
+        liveUdid={current?.udid ?? null}
+        onPick={onPick}
+        label={compact ? null : (current?.name ?? "Choose a simulator")}
+      />
     </div>
   );
 }

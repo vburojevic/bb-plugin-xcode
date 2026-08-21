@@ -45,7 +45,18 @@ export const deviceSchema = z
     state: z.string(),
     osVersion: z.string(),
     platform: z.string(),
+    /** The hardware family, for the picker's icon: iphone, ipad, tv, … */
+    family: z.string(),
     isAvailable: z.boolean(),
+    /** When simctl last booted it, or `null` for a device never booted. */
+    lastBootedAt: z.number().nullable(),
+    /**
+     * When a tracked build last targeted it, or `null`. Evidence the tracker
+     * half already collects — `-destination 'id=<UDID>'` off every xcodebuild
+     * — and exactly the "recently used" a picker should mean: the device your
+     * work has actually been running on, not merely one that was booted.
+     */
+    lastBuiltAt: z.number().nullable(),
   })
   .strict();
 
@@ -60,6 +71,16 @@ export const devicesSchema = z
     suggested: liveDeviceSchema.nullable(),
     hasDrivableRuntime: z.boolean(),
     installedPlatforms: z.array(z.string()),
+    /**
+     * Where these simulators live, and every other enrolled machine.
+     *
+     * Simulators run on the machine that runs the bb server; the plugin has
+     * no remote-execution or tunnelling path to another Mac's CoreSimulator
+     * (see SECURITY.md), so other machines are *named* rather than offered —
+     * an honest disabled row beats a picker that pretends.
+     */
+    machine: z.string().nullable(),
+    otherMachines: z.array(z.string()),
     /** A failed `simctl list` is never "no devices exist". */
     error: z.string().nullable(),
   })

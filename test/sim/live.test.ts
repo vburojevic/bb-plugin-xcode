@@ -100,7 +100,9 @@ const DEVICE: SimDevice = {
   runtimeId: "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
   osVersion: "26.5",
   platform: "iOS",
+  family: "iphone",
   isAvailable: true,
+  lastBootedAt: null,
 };
 
 let now = 1_000_000;

@@ -602,6 +602,25 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
     scopeForInvocation,
     gitHead,
     recentDestinations: (limit) => host.recentDestinations(limit),
+
+    /**
+     * The machine dimension, for the device picker. Failure-tolerant by
+     * contract: a hosts API that cannot answer must not take the device list
+     * down with it — the picker simply shows no machine line.
+     */
+    async machines() {
+      try {
+        const [hosts, serverId] = await Promise.all([bb.sdk.hosts.list(), resolveHostId()]);
+        const current = hosts.find((entry) => entry.id === serverId)?.name ?? null;
+        const others = hosts
+          .filter((entry) => entry.id !== serverId)
+          .map((entry) => entry.name)
+          .sort((a, b) => a.localeCompare(b));
+        return { current, others };
+      } catch {
+        return { current: null, others: [] };
+      }
+    },
     beforeFrameImport: (incomingBytes) => reserveFrameBytes(incomingBytes),
 
     /**

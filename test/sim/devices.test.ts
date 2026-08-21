@@ -78,6 +78,37 @@ describe("parsing", () => {
     expect(devices).toEqual([]);
   });
 
+  it("parses lastBootedAt, and reads an unparseable stamp as never booted", () => {
+    const devices = parseDeviceList({
+      devices: {
+        [IOS_26_5]: [
+          { udid: udid(1), name: "A", state: "Shutdown", lastBootedAt: "2026-08-18T06:26:36Z" },
+          { udid: udid(2), name: "B", state: "Shutdown", lastBootedAt: "not a date" },
+          { udid: udid(3), name: "C", state: "Shutdown" },
+        ],
+      },
+    });
+    expect(devices[0]?.lastBootedAt).toBe(Date.parse("2026-08-18T06:26:36Z"));
+    // Epoch zero would sort "never booted" as "booted in 1970", which is a lie
+    // with a date on it.
+    expect(devices[1]?.lastBootedAt).toBeNull();
+    expect(devices[2]?.lastBootedAt).toBeNull();
+  });
+
+  it("derives the family from the device type, falling back to the name", () => {
+    const rows = parseDeviceList({
+      devices: {
+        [IOS_26_5]: [
+          // A renamed device still carries its hardware in the identifier.
+          { udid: udid(1), name: "Checkout flow", state: "Shutdown", deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro" },
+          { udid: udid(2), name: "iPad Pro 13-inch", state: "Shutdown" },
+          { udid: udid(3), name: "Apple TV 4K", state: "Shutdown", deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.Apple-TV-4K-3rd-generation-4K" },
+        ],
+      },
+    });
+    expect(rows.map((device) => device.family)).toEqual(["iphone", "ipad", "tv"]);
+  });
+
   it("parses runtimes", () => {
     const runtimes = parseRuntimeList({
       runtimes: [{ identifier: IOS_26_5, version: "26.5", name: "iOS 26.5", isAvailable: true }],

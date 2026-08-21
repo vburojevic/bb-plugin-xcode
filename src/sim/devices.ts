@@ -20,10 +20,33 @@ export interface SimDevice {
   /** `26.5`, parsed from the runtime identifier — never from a display string. */
   osVersion: string;
   platform: Platform;
+  family: Family;
   isAvailable: boolean;
+  /** Epoch ms of simctl's `lastBootedAt`, or `null` for a device never booted. */
+  lastBootedAt: number | null;
 }
 
 export type Platform = "iOS" | "iPadOS" | "tvOS" | "watchOS" | "visionOS" | "unknown";
+
+/** The hardware family, for the picker's icon and nothing load-bearing. */
+export type Family = "iphone" | "ipad" | "tv" | "watch" | "vision" | "unknown";
+
+/**
+ * The family, from the device-type identifier first and the name second.
+ *
+ * `com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro` names the hardware
+ * unambiguously; a device someone renamed "Checkout flow" still carries it.
+ * The name regex is only for rows where simctl omitted the identifier.
+ */
+export function familyOf(deviceTypeIdentifier: string | null, name: string): Family {
+  const key = deviceTypeIdentifier ?? name;
+  if (/ipad/i.test(key)) return "ipad";
+  if (/iphone|ipod/i.test(key)) return "iphone";
+  if (/apple.?tv/i.test(key)) return "tv";
+  if (/watch/i.test(key)) return "watch";
+  if (/vision|xr/i.test(key)) return "vision";
+  return "unknown";
+}
 
 /** Families Live can drive. watchOS and visionOS are excluded deliberately. */
 export const DRIVABLE_PLATFORMS: readonly Platform[] = ["iOS", "iPadOS", "tvOS"];
@@ -34,6 +57,8 @@ interface SimctlDeviceRow {
   state?: unknown;
   isAvailable?: unknown;
   availabilityError?: unknown;
+  deviceTypeIdentifier?: unknown;
+  lastBootedAt?: unknown;
 }
 
 interface SimctlListDevices {
@@ -98,6 +123,10 @@ export function parseDeviceList(json: SimctlListDevices): SimDevice[] {
     const platformFromRuntime = platformOfRuntime(runtimeId);
     for (const row of rows) {
       if (typeof row.udid !== "string" || typeof row.name !== "string") continue;
+      const deviceType = typeof row.deviceTypeIdentifier === "string" ? row.deviceTypeIdentifier : null;
+      // simctl writes an ISO timestamp; an unparseable one reads as never
+      // booted rather than as booted at epoch zero.
+      const bootedStamp = typeof row.lastBootedAt === "string" ? Date.parse(row.lastBootedAt) : Number.NaN;
       out.push({
         udid: row.udid,
         name: row.name,
@@ -107,7 +136,9 @@ export function parseDeviceList(json: SimctlListDevices): SimDevice[] {
         // iPads report an iOS runtime; the family lives in the device name.
         platform:
           platformFromRuntime === "iOS" && /ipad/i.test(row.name) ? "iPadOS" : platformFromRuntime,
+        family: familyOf(deviceType, row.name),
         isAvailable: row.isAvailable !== false && row.availabilityError === undefined,
+        lastBootedAt: Number.isFinite(bootedStamp) ? bootedStamp : null,
       });
     }
   }

@@ -97,6 +97,15 @@ export interface Ctx {
    * simulator it means out loud.
    */
   recentDestinations(limit: number): readonly import("./pick.js").RunDestination[];
+  /**
+   * The machine the simulators run on, and every other enrolled machine.
+   *
+   * `current` is the bb server host's name — CoreSimulator, the capture host
+   * and every `simctl` call live there. `others` exist so the picker can name
+   * them honestly as out of reach rather than hiding the machine dimension.
+   * Never throws: a hosts API that cannot answer is an empty answer.
+   */
+  machines(): Promise<{ current: string | null; others: string[] }>;
   /** Prune and enforce the disk ceiling before generated frames are copied. */
   beforeFrameImport(incomingBytes: number): Promise<void>;
   /** HEAD for a checkout, so a frame records what it was a picture of. */

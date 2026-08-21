@@ -10,7 +10,7 @@
 import type { Ctx } from "./context.js";
 import type { LiveState } from "./live.js";
 import { DRIVABLE_PLATFORMS, pickDefaultDevice, SimctlError, type SimDevice } from "./devices.js";
-import { pickSimulator } from "./pick.js";
+import { pickSimulator, udidFromDestination, type RunDestination } from "./pick.js";
 
 /**
  * How far back the picker looks for a `-destination`.
@@ -19,6 +19,18 @@ import { pickSimulator } from "./pick.js";
  * answer, shallow enough that the query stays an index scan.
  */
 const RECENT_DESTINATION_LIMIT = 200;
+
+/** The newest tracked build per simulator, keyed by upper-cased UDID. */
+export function latestBuildPerDevice(runs: readonly RunDestination[]): Map<string, number> {
+  const newest = new Map<string, number>();
+  for (const run of runs) {
+    const udid = udidFromDestination(run.destination);
+    if (udid === null) continue;
+    const seen = newest.get(udid);
+    if (seen === undefined || run.startedAt > seen) newest.set(udid, run.startedAt);
+  }
+  return newest;
+}
 
 /** Booted first, then `pickDefaultDevice`'s order, applied repeatedly. */
 function rankedAlternatives<T extends { udid: string; booted: boolean }>(
@@ -255,8 +267,13 @@ export function makeRpcHandlers(ctx: Ctx) {
     },
 
     async devices() {
+      const machines = await ctx.machines();
       try {
         const result = await ctx.live.devices();
+        // The tracker half already parses `-destination` off every xcodebuild
+        // it sees; folding it in here is what makes "recently used" mean "the
+        // device your work ran on", not merely "a device that was booted".
+        const lastBuilt = latestBuildPerDevice(ctx.recentDestinations(RECENT_DESTINATION_LIMIT));
         return {
           devices: result.devices.map((device) => ({
             udid: device.udid,
@@ -264,12 +281,17 @@ export function makeRpcHandlers(ctx: Ctx) {
             state: device.state,
             osVersion: device.osVersion,
             platform: device.platform,
+            family: device.family,
             isAvailable: device.isAvailable,
+            lastBootedAt: device.lastBootedAt,
+            lastBuiltAt: lastBuilt.get(device.udid.toUpperCase()) ?? null,
           })),
           bootedUdids: result.bootedUdids,
           suggested: result.suggested,
           hasDrivableRuntime: result.hasDrivableRuntime,
           installedPlatforms: result.installedPlatforms,
+          machine: machines.current,
+          otherMachines: machines.others,
           error: null,
         };
       } catch (error) {
@@ -282,6 +304,8 @@ export function makeRpcHandlers(ctx: Ctx) {
           suggested: null,
           hasDrivableRuntime: false,
           installedPlatforms: [],
+          machine: machines.current,
+          otherMachines: machines.others,
           error:
             error instanceof SimctlError
               ? `Xcode Simulators could not ask about simulators — ${error.message}`

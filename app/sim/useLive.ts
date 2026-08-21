@@ -70,12 +70,21 @@ export interface DeviceList {
     state: string;
     osVersion: string;
     platform: string;
+    /** The hardware family, for the picker's icon: iphone, ipad, tv, … */
+    family: string;
     isAvailable: boolean;
+    /** When simctl last booted it, or `null` for a device never booted. */
+    lastBootedAt: number | null;
+    /** When a tracked build last targeted it, or `null`. */
+    lastBuiltAt: number | null;
   }>;
   bootedUdids: string[];
   suggested: { udid: string; name: string; osVersion: string } | null;
   hasDrivableRuntime: boolean;
   installedPlatforms: string[];
+  /** The machine the simulators run on; other enrolled machines are named only. */
+  machine: string | null;
+  otherMachines: string[];
   error: string | null;
 }
 
