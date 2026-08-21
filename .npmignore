@@ -1,7 +1,7 @@
 .github/
 .impeccable/
 dist/
-docs/superpowers/
+docs/
 node_modules/
 scratch/
 test/

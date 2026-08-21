@@ -1,11 +1,62 @@
-# bb-plugin-xcode
+# Xcode for bb
 
-Tracks Xcode builds, tests and every other Xcode process across all your
-projects — live, with **no per-project configuration**.
+**Every Xcode build on your machine, tracked live with zero configuration —
+and the simulators they run on, streamed and fully touchable, right in your
+[bb](https://getbb.app) sidebar.**
 
+![The live simulator with the device picker open](docs/screenshots/live-picker.png)
+
+```sh
+bb plugin install vburojevic/bb-plugin-xcode
 ```
-bb plugin install ~/Git/bb-plugin-xcode
-```
+
+## One panel, three tabs
+
+### Builds
+
+Start a build anywhere — Xcode, `xcodebuild`, an agent, a CI script wrapping
+either — and it appears within seconds: live progress while it runs, then the
+verdict, errors and failed tests with `file:line`, per-project history, and
+trends. Nothing to configure; the tracker learns DerivedData roots from the
+builds themselves.
+
+![Build history with a failed run's compiler errors](docs/screenshots/builds.png)
+
+### Live
+
+A booted simulator, streamed over hardware H.264 and fully interactive: tap,
+drag, flick, long-press, trackpad pinch, ⌘V paste, keyboard. Input ships as
+timestamped batches and is replayed at the finger's own pace, so a flick keeps
+its momentum even over a remote bb connection.
+
+The device picker shelves what matters: **Booted** first (live dot, an
+*on screen* marker), then **Recent** — last booted *or* last targeted by one
+of your tracked builds, evidence Xcode's own picker does not have — then
+everything else grouped by runtime, searchable the moment the herd grows. It
+also names the machine the simulators live on. Hover a row for the UDID your
+next `-destination` wants.
+
+### Stills
+
+Every SwiftUI preview in the project, rendered on a real simulator and diffed
+against the last run — a visual regression net that reports itself in the
+panel and, when you want it to, as a banner in the thread that changed the
+code.
+
+### The gear
+
+Quick toggles for what the plugin shows in threads — build activity above the
+composer, preview-result banners, device chrome — plus the doctor, which lists
+every prerequisite and its fix. Trust-shaped settings (like whether agents may
+see simulator frames at all) deliberately live only in bb's own settings
+screen; the [security model](SECURITY.md) explains why the gear cannot touch
+them.
+
+![The gear menu over a live simulator](docs/screenshots/gear.png)
+
+A per-thread simulator also opens beside any conversation ("Open simulator"),
+picking its device from what that thread has actually been building — and
+saying why it picked it.
 
 ## Why it needs no configuration
 
@@ -89,36 +140,21 @@ if the request disconnects or the wait times out, the build carries on and
 `bb xcode status` still finds it. Both exit non-zero on a failed build, so they
 compose with `&&`.
 
-## The panel
-
-One **Xcode** entry in the sidebar, three tabs in its header:
-
-- **Builds** — the live strip, machine-wide history and trends, with a
-  drill-in per run.
-- **Live** — a booted simulator, streamed and fully interactive: tap, drag,
-  flick, trackpad pinch, ⌘V paste, keyboard. Input ships as timestamped
-  batches and is replayed at the finger's own pace, so it stays faithful over
-  a remote bb connection too.
-- **Stills** — every SwiftUI preview rendered and diffed against the last run.
-
-The device picker shelves what matters: **Booted** first (live dot, "on
-screen" marker), then **Recent** — last booted *or* last targeted by a tracked
-build, which is evidence Xcode's own picker does not have — then everything
-else grouped by runtime, searchable once the herd grows. The gear beside it
-toggles what the plugin shows in threads (build activity, preview results,
-device chrome) and opens the doctor; trust-shaped settings deliberately stay
-in bb's own settings screen.
-
-A per-thread simulator also opens beside any conversation ("Open simulator"),
-picking its device from what that thread has actually been building.
-
-### For agents
+## For agents
 
 | Tool | Answers |
 |---|---|
 | `xcode_build` | Runs xcodebuild, **waits**, returns a verdict with errors and failed tests |
 | `xcode_status` | What is running now, and how this thread's recent runs finished |
 | `xcode_last_failure` | Errors and failed tests from the last failure, with file:line |
+| `simulator_capture` | A screenshot of the running simulator, as an image the model can see |
+| `simulator_drive` | A short gesture sequence — tap by coordinates *or by accessibility label* — ending in a frame |
+| `simulator_stills` | Renders every SwiftUI preview and reports what changed |
+
+The three simulator tools are off by default and gated behind the
+`allowAgentCapture` setting — captured frames go to your model provider, and
+that is a decision the plugin refuses to make for you. Flipping it off revokes
+already-registered tools on their next call.
 
 `xcode_build` exists because the alternative is worse. Telling a model to start
 a detached build and then check on it is telling it to write a poll loop — and
