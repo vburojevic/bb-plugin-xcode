@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "Xcode",
-    "description": "Track Xcode builds and tests with no per-project configuration, and drive the simulators they run on — live streaming, full touch input, and SwiftUI preview diffs.",
+    "description": "Track Xcode builds and tests with no per-project configuration, and drive the simulators they run on \u2014 live streaming, full touch input, and SwiftUI preview diffs.",
     "branding": {
       "icon": "Toolbox"
     },
@@ -61,5 +61,10 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm run test"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vburojevic/bb-plugin-xcode.git"
   }
 }
