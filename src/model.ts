@@ -111,7 +111,7 @@ export function isEphemeralRun(run: { kind: RunKind }): boolean {
  * exits non-zero and the xcresult says `failedTests: N`, all of it truthful
  * and all of it misleading: the recording did exactly what was asked.
  *
- * Observed in production (thr_yivibempsv, r:66968): the agent reported "build
+ * Observed in production (a production run): the agent reported "build
  * succeeded and all verified" while this plugin showed a red failed run, and
  * both were faithfully reporting the same xcresult.
  *

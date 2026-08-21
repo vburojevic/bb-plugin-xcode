@@ -70,7 +70,7 @@ describe("isEphemeralRun", () => {
 
 describe("isSnapshotRecording", () => {
   /**
-   * Verbatim from thr_yivibempsv / r:66968, where the agent reported "build
+   * Verbatim from a production run, where the agent reported "build
    * succeeded and all verified" while this plugin showed a red failed run —
    * both faithfully reporting the same xcresult.
    */

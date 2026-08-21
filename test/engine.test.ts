@@ -436,7 +436,7 @@ describe("bundle folding (verified rank)", () => {
   });
 
   /**
-   * thr_yivibempsv / r:66968: the agent reported "build succeeded and all
+   * a production run: the agent reported "build succeeded and all
    * verified"; the plugin showed a red failed run. Both were reporting the
    * same xcresult truthfully — swift-snapshot-testing fails every test it
    * records, because record mode has nothing to assert against yet.
