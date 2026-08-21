@@ -45,7 +45,10 @@ export function PanelHeader({ subPath = "" }: { subPath?: string }) {
           the tablist contract (roving tabindex, aria-controls, arrow keys)
           cannot be honoured — and half of it is worse than none. */}
       <nav aria-label="Xcode panel sections" className="flex shrink-0 items-center rounded-md border p-0.5">
-        <SegmentButton active={tab === "builds"} compact={compact} icon="Toolbox" label="Builds" onClick={() => go("builds")} />
+        {/* Not the Toolbox glyph: that is the panel's own icon in the host
+          title bar, and on a compact viewport the two sit adjacent with the
+          labels dropped — reading as one control rendered twice. */}
+        <SegmentButton active={tab === "builds"} compact={compact} icon="ListView" label="Builds" onClick={() => go("builds")} />
         <SegmentButton active={tab === "live"} compact={compact} icon="Play" label="Live" onClick={() => go("live")} />
         <SegmentButton active={tab === "stills"} compact={compact} icon="GridView" label="Stills" onClick={() => go("stills")} />
       </nav>
@@ -91,7 +94,7 @@ function SegmentButton({
       aria-label={label}
       variant={active ? "secondary" : "ghost"}
       size="sm"
-      className="h-6 gap-1.5 px-2"
+      className="h-7 gap-1.5 px-2 pointer-coarse:h-9 pointer-coarse:px-2.5"
       onClick={onClick}
     >
       <Icon name={icon} className="size-3.5" />

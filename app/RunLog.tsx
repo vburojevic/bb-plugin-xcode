@@ -263,11 +263,11 @@ function LogRow({
 
       <Counts run={run} />
 
-      <span className="w-14 shrink-0 text-right text-sm tabular-nums text-foreground/90">
+      <span className="w-14 shrink-0 whitespace-nowrap text-right text-sm tabular-nums text-foreground/90">
         {formatDuration(run.durationMs)}
       </span>
       <span
-        className="w-16 shrink-0 text-right text-xs tabular-nums text-muted-foreground"
+        className="w-16 shrink-0 whitespace-nowrap text-right text-xs tabular-nums text-muted-foreground"
         title={formatClock(run.startedAt)}
       >
         {recent ? formatTime(run.startedAt) : formatRelative(run.startedAt, now)}

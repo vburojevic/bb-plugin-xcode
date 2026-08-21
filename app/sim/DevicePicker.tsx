@@ -75,7 +75,15 @@ export function DevicePicker({ devices, liveUdid, onPick, label }: DevicePickerP
   return (
     <DropdownMenu onOpenChange={(open) => open || setQuery("")}>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="sm" className="min-w-0 gap-1">
+        {/* The name is never conditional on the label: on a compact viewport
+            the label collapses to nothing and the trigger becomes a bare
+            chevron, which left it as an unnamed button to a screen reader. */}
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label={`Choose a simulator${label == null ? "" : `, currently ${label}`}`}
+          className="min-w-0 gap-1 pointer-coarse:h-9"
+        >
           {label == null ? null : <span className="truncate">{label}</span>}
           <Icon name="ChevronDown" className="size-3.5 shrink-0" />
         </Button>

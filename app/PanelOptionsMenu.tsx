@@ -73,7 +73,7 @@ export function PanelOptionsMenu({ onOpenDoctor }: { onOpenDoctor?: () => void }
   return (
     <DropdownMenu onOpenChange={load}>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="sm" aria-label="Panel options">
+        <Button variant="ghost" size="sm" aria-label="Panel options" className="pointer-coarse:size-9">
           <Icon name="Settings" className="size-4" />
         </Button>
       </DropdownMenuTrigger>

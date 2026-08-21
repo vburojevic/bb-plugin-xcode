@@ -54,7 +54,7 @@ export function ControlBar({
 
   return (
     <div className="flex items-center gap-1 border-t px-2 py-1.5">
-      <Button size="sm" disabled={!live || busy} onClick={onCapture} className="gap-1.5">
+      <Button size="sm" disabled={!live || busy} onClick={onCapture} className="gap-1.5 pointer-coarse:h-9">
         <Icon name="Eye" className="size-3.5" />
         Capture
       </Button>
@@ -94,7 +94,7 @@ export function ControlBar({
 
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="sm" className="size-7 p-0" aria-label="More controls">
+            <Button variant="ghost" size="sm" className="size-7 p-0 pointer-coarse:size-9" aria-label="More controls">
               <Icon name="MoreHorizontal" className="size-3.5" />
             </Button>
           </DropdownMenuTrigger>
@@ -188,7 +188,7 @@ function Control({
         <Button
           variant="ghost"
           size="sm"
-          className="size-7 p-0"
+          className="size-7 p-0 pointer-coarse:size-9"
           aria-label={label}
           disabled={disabled}
           onClick={onClick}
