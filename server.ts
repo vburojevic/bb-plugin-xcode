@@ -203,8 +203,13 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     error: safely(isDisposed, (m: string) => bb.log.error(m)),
   };
 
-  const listProjects = async (): Promise<CollectorProject[]> => {
-    const projects = await bb.sdk.projects.list({ includePersonal: true });
+  const listProjects = async (
+    signal?: AbortSignal,
+  ): Promise<CollectorProject[]> => {
+    const projects = await bb.sdk.projects.list({
+      includePersonal: true,
+      signal,
+    });
     const out: CollectorProject[] = [];
     for (const project of projects) {
       const sources =

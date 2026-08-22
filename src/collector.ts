@@ -40,7 +40,7 @@ export interface CollectorProject {
 export interface CollectorDeps {
   store: Store;
   engine: Engine;
-  listProjects(): Promise<CollectorProject[]>;
+  listProjects(signal?: AbortSignal): Promise<CollectorProject[]>;
   log: { debug(m: string): void; warn(m: string): void };
   dataDir: string;
   /**
@@ -63,12 +63,43 @@ export interface CollectorDeps {
  */
 const SIM_REFRESH_BUSY_MS = 20_000;
 const SIM_REFRESH_IDLE_MS = 10 * 60_000;
+/**
+ * The project list is a loopback HTTP fetch into the bb server; under heavy
+ * host load or around sleep/wake it can fail or hang. The timeout keeps a
+ * hung fetch from stalling the whole scan (undici's own limits are
+ * minutes-class), and the breaker keeps a sustained outage from warning on
+ * every 4–30s scan: first failure warns, the breaker-open warns once more,
+ * everything else is debug, and while open the fetch is skipped entirely —
+ * the last good list keeps serving project attribution.
+ */
+const PROJECT_LIST_TIMEOUT_MS = 10_000;
+const PROJECT_LIST_BREAKER_AFTER = 3;
+const PROJECT_LIST_COOLDOWN_MS = 5 * 60_000;
 /** Xcode's plist is normally KB; this prevents a corrupt root from exhausting the server. */
 export const MAX_LOG_MANIFEST_BYTES = 32 * 1024 * 1024;
 
 export interface CollectorSettings {
   scanProjects: boolean;
   extraRoots: string[];
+}
+
+/**
+ * Network failures reach us as undici's bare "TypeError: fetch failed" with
+ * the actual ECONNREFUSED/ETIMEDOUT buried in `cause`; walk the chain so the
+ * log says what actually broke.
+ */
+export function describeError(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; current !== undefined && current !== null && depth < 4; depth += 1) {
+    parts.push(
+      current instanceof Error
+        ? `${current.name}: ${current.message}`
+        : String(current),
+    );
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return parts.join(" ← ");
 }
 
 export class Collector {
@@ -87,6 +118,10 @@ export class Collector {
   private readonly reparsedBundles = new Set<string>();
   /** Last upsertRoot per root — throttles per-tick WAL churn. */
   private readonly rootUpsertAt = new Map<string, number>();
+  /** Consecutive listProjects failures; arms the breaker below. */
+  private projectFailureStreak = 0;
+  /** Epoch ms before which refreshProjects skips its fetch (breaker open). */
+  private projectRetryAt = 0;
 
   constructor(
     private readonly deps: CollectorDeps,
@@ -278,11 +313,39 @@ export class Collector {
 
   // -------------------------------------------------------------- discovery
 
-  async refreshProjects(): Promise<void> {
+  async refreshProjects(now = Date.now(), signal?: AbortSignal): Promise<void> {
+    if (now < this.projectRetryAt) return;
+    const bounded = AbortSignal.any([
+      ...(signal ? [signal] : []),
+      AbortSignal.timeout(PROJECT_LIST_TIMEOUT_MS),
+    ]);
     try {
-      this.projects = await this.deps.listProjects();
+      this.projects = await this.deps.listProjects(bounded);
+      if (this.projectFailureStreak >= PROJECT_LIST_BREAKER_AFTER) {
+        this.deps.log.debug("project list recovered");
+      }
+      this.projectFailureStreak = 0;
+      this.projectRetryAt = 0;
     } catch (error: unknown) {
-      this.deps.log.warn(`project list failed: ${String(error)}`);
+      // A reload abort is not a failure; keep the last list and stay quiet.
+      if (signal?.aborted) return;
+      this.projectFailureStreak += 1;
+      const detail = describeError(error);
+      if (this.projectFailureStreak === 1) {
+        this.deps.log.warn(`project list failed: ${detail}`);
+      } else if (this.projectFailureStreak === PROJECT_LIST_BREAKER_AFTER) {
+        this.projectRetryAt = now + PROJECT_LIST_COOLDOWN_MS;
+        this.deps.log.warn(
+          `project list failed ${this.projectFailureStreak}x in a row (${detail}); pausing refresh for ${PROJECT_LIST_COOLDOWN_MS / 60_000}m`,
+        );
+      } else {
+        // Past the breaker and still failing: sit out another cooldown
+        // without re-warning — one warn per outage, not per attempt.
+        if (this.projectFailureStreak > PROJECT_LIST_BREAKER_AFTER) {
+          this.projectRetryAt = now + PROJECT_LIST_COOLDOWN_MS;
+        }
+        this.deps.log.debug(`project list failed: ${detail}`);
+      }
     }
   }
 
@@ -504,7 +567,7 @@ export class Collector {
 
   /** Full pass: projects, roots, manifests, bundles, timeouts. */
   async fullScan(now = Date.now(), signal?: AbortSignal): Promise<boolean> {
-    await this.refreshProjects();
+    await this.refreshProjects(now, signal);
     if (signal?.aborted) return false;
     await this.discoverRoots(now);
     if (signal?.aborted) return false;
