@@ -14,7 +14,7 @@
  */
 import { useCallback, useState } from "react";
 import { toast } from "sonner";
-import { useBbNavigate } from "@bb/plugin-sdk/app";
+import { useBbNavigate } from "@get-bb/plugin-sdk/app";
 import { LivePanel } from "./LivePanel";
 import { ControlBar } from "./ControlBar";
 import { FramesStrip } from "./FramesStrip";

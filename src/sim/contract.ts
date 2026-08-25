@@ -11,7 +11,7 @@
  *    values and `undefined` is rejected rather than coerced, so an absent field
  *    is `null` on the wire. Inputs may be optional; outputs may not.
  */
-import { defineRpcContract } from "@bb/plugin-sdk";
+import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { stepSchema } from "./steps.js";
 

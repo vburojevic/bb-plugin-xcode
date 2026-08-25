@@ -5,7 +5,7 @@
  * its zod dependency are erased from the app bundle.
  */
 
-import { defineRpcContract } from "@bb/plugin-sdk";
+import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 export { XCODE_CHANNEL } from "./channel";

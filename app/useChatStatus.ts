@@ -9,7 +9,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useRealtime, useRpc } from "@bb/plugin-sdk/app";
+import { useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 
 import { XCODE_CHANNEL } from "../src/channel";
 import type { rpcContract } from "../src/contract";

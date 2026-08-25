@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-xcode",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "engines": {
     "bb": ">=0.35",
@@ -43,6 +43,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.17",
     "@radix-ui/react-dialog": "^1.1.19",
     "@types/better-sqlite3": "^7.6.12",
     "@types/lodash": "^4.17.25",

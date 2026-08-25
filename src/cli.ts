@@ -6,7 +6,7 @@
  * is thin: the work belongs to the store, the collector and `wrapped.ts`.
  */
 
-import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@bb/plugin-sdk";
+import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@get-bb/plugin-sdk";
 import { resolve } from "node:path";
 
 import { confinedBuildCwd, validateBuildArguments } from "./build-security";

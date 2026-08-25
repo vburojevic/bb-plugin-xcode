@@ -118,9 +118,11 @@ export function makeCaptureTool(ctx: Ctx) {
     description:
       "Take a screenshot of the running iOS simulator and look at it. Returns the frame as an image plus a line naming the app that was on screen.",
     instructions: CAPTURE_INSTRUCTIONS,
-    experimental_statusLabels: {
-      pending: "Looking at the simulator",
-      completed: "Looked at the simulator",
+    presentation: {
+      label: {
+        pending: "Looking at the simulator",
+        completed: "Looked at the simulator",
+      },
     },
     parameters: captureParameters,
     async execute(
@@ -235,9 +237,11 @@ export function makeDriveTool(ctx: Ctx) {
       "Use this to demonstrate a flow rather than to assert one. Prefer naming an on-screen element over guessing coordinates.",
       "The simulator is shared: if a call reports another thread is driving it, wait rather than retrying.",
     ].join(" "),
-    experimental_statusLabels: {
-      pending: "Driving the simulator",
-      completed: "Drove the simulator",
+    presentation: {
+      label: {
+        pending: "Driving the simulator",
+        completed: "Drove the simulator",
+      },
     },
     parameters: driveParameters,
     async execute(
@@ -313,9 +317,11 @@ export function makeStillsTool(ctx: Ctx) {
       "Render every SwiftUI preview in this project and report what changed since the last run. Blocking and bounded.",
     instructions:
       "Preview renders report themselves in the panel and in the prompt stack above the composer, so never paste a list of changed previews into chat — the user is already looking at it.",
-    experimental_statusLabels: {
-      pending: "Rendering previews",
-      completed: "Rendered previews",
+    presentation: {
+      label: {
+        pending: "Rendering previews",
+        completed: "Rendered previews",
+      },
     },
     parameters: stillsParameters,
     async execute(args: z.infer<typeof stillsParameters>): Promise<ToolResult> {

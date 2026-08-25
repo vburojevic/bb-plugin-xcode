@@ -13,7 +13,7 @@ import {
   useRealtime,
   useRealtimeConnectionState,
   useRpc,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../../src/sim/wire";
 import type { CapturedFrame } from "./useLive";
 

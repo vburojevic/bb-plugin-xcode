@@ -9,16 +9,38 @@ import { fileURLToPath } from "node:url";
  */
 export default defineConfig({
   // The Simulators half's suite drives the plugin factory itself, so it needs
-  // the two SDK entry points resolved to stubs — there is no `@bb/plugin-sdk`
-  // package on disk, only the declarations in `types/`.
+  // the SDK's two *value* entry points resolved to stubs: bb supplies those
+  // in-process, so the npm package ships declarations with no runtime behind
+  // them.
+  //
+  // `internal/host-policy` is the exception and is deliberately NOT stubbed —
+  // it is real, executable code in the package, and `tool-registration.test.ts`
+  // checks our tool registrations against that genuine host validator.
+  //
+  // The array form is load-bearing. Aliases match on exact-or-`/` prefix and
+  // are tried in order, so the bare `@get-bb/plugin-sdk` entry would otherwise
+  // swallow every subpath and rewrite it to `<stub>.ts/<subpath>`. Most
+  // specific first.
   resolve: {
-    alias: {
-      "@": fileURLToPath(new URL("./", import.meta.url)),
-      "@bb/plugin-sdk": fileURLToPath(new URL("./test/sim/stubs/plugin-sdk.ts", import.meta.url)),
-      "@bb/plugin-sdk/app": fileURLToPath(
-        new URL("./test/sim/stubs/plugin-sdk-app.ts", import.meta.url),
-      ),
-    },
+    alias: [
+      {
+        find: "@get-bb/plugin-sdk/internal/host-policy",
+        replacement: fileURLToPath(
+          new URL("./node_modules/@get-bb/plugin-sdk/dist/internal/host-policy.js", import.meta.url),
+        ),
+      },
+      {
+        find: "@get-bb/plugin-sdk/app",
+        replacement: fileURLToPath(
+          new URL("./test/sim/stubs/plugin-sdk-app.ts", import.meta.url),
+        ),
+      },
+      {
+        find: "@get-bb/plugin-sdk",
+        replacement: fileURLToPath(new URL("./test/sim/stubs/plugin-sdk.ts", import.meta.url)),
+      },
+      { find: "@", replacement: fileURLToPath(new URL("./", import.meta.url)) },
+    ],
   },
   test: {
     environment: "node",

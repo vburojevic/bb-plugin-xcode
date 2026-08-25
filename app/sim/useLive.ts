@@ -13,7 +13,7 @@
  * has told the user something false.
  */
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
-import { useBbContext, useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
+import { useBbContext, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../../src/sim/wire";
 import type { Step } from "../../src/sim/steps.js";
 import { TouchChannel, type StreamEvent } from "./touch-channel";

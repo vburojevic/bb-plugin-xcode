@@ -16,7 +16,7 @@
  * **Remote viewing stays in bb.** The CLI never opens, shares, or returns a
  * simulator network endpoint. The main bb panel owns that surface.
  */
-import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@bb/plugin-sdk";
+import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@get-bb/plugin-sdk";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { Ctx } from "./context.js";
 import { overallState } from "./preflight.js";

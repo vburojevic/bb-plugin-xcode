@@ -15,7 +15,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
+import { useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import { DevicePicker } from "./DevicePicker";
 import { PANEL_PATH } from "./route";
 import { LivePanel } from "./LivePanel";

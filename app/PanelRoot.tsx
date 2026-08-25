@@ -8,7 +8,7 @@
  * run drill-in, `SimulatorsPanel` still owns live/stills/doctor. This file is
  * only the seam: one header, one route split, no duplicated state.
  */
-import { useBbNavigate } from "@bb/plugin-sdk/app";
+import { useBbNavigate } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { useIsCompactViewport } from "@/components/ui/hooks/use-compact-viewport";

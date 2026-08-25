@@ -15,7 +15,7 @@
  * bb server down. Every `bb.*` call that can outlive this load goes through
  * `safely`, and every fire-and-forget through `detach`.
  */
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 

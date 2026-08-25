@@ -7,7 +7,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { useRpc } from "@bb/plugin-sdk/app";
+import { useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../../src/sim/wire";
 import { formatBytes } from "../../src/sim/format.js";
 

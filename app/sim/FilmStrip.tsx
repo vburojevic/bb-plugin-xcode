@@ -10,7 +10,7 @@ import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Icon } from "@/components/ui/icon";
-import { useRpc } from "@bb/plugin-sdk/app";
+import { useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../../src/sim/wire";
 import { formatAgo, shortSha } from "../../src/sim/format.js";
 import type { CapturedFrame } from "./useLive";

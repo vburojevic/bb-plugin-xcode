@@ -24,7 +24,7 @@
  * never used as a path.
  */
 import { useEffect, useState } from "react";
-import { useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
+import { useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
 import type { rpcContract } from "../../src/sim/wire";
 import { LOOK_ID_PATTERN } from "../../src/sim/model.js";

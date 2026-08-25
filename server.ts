@@ -10,7 +10,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
 import { XCODE_CHANNEL } from "./src/channel";
 import { CLI_COMMANDS, createCli } from "./src/cli";

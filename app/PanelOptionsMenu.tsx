@@ -10,7 +10,7 @@
  */
 import { useCallback, useState } from "react";
 import { toast } from "sonner";
-import { useRpc } from "@bb/plugin-sdk/app";
+import { useRpc } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,

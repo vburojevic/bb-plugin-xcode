@@ -3,7 +3,7 @@
  */
 
 import { useEffect, useState } from "react";
-import { useRpc } from "@bb/plugin-sdk/app";
+import { useRpc } from "@get-bb/plugin-sdk/app";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";

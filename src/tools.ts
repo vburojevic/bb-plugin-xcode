@@ -66,9 +66,11 @@ export function createTools(deps: ToolDeps) {
     description:
       "Report Xcode build/test activity: what is running now and how recent runs finished, scoped to this thread's checkout when possible. Use instead of grepping build logs.",
     instructions: AGENT_INSTRUCTIONS,
-    experimental_statusLabels: {
-      pending: "Checking Xcode activity",
-      completed: "Checked Xcode activity",
+    presentation: {
+      label: {
+        pending: "Checking Xcode activity",
+        completed: "Checked Xcode activity",
+      },
     },
     parameters: z.object({
       limit: z.number().int().min(1).max(25).optional(),
@@ -111,9 +113,11 @@ export function createTools(deps: ToolDeps) {
     name: "xcode_last_failure",
     description:
       "Return the errors and failed tests from the most recent failed Xcode run, with file paths and line numbers.",
-    experimental_statusLabels: {
-      pending: "Reading last Xcode failure",
-      completed: "Read last Xcode failure",
+    presentation: {
+      label: {
+        pending: "Reading last Xcode failure",
+        completed: "Read last Xcode failure",
+      },
     },
     parameters: z.object({
       projectId: z.string().max(200).optional(),
@@ -149,9 +153,11 @@ export function createTools(deps: ToolDeps) {
     description:
       "Run xcodebuild and WAIT for it, returning a real pass/fail verdict with errors and failed tests. Prefer this over running xcodebuild through a shell: it captures a result bundle, so the outcome is read from Xcode's own artifact rather than inferred from log text. Do not poll xcode_status after calling this — it has already waited.",
     instructions: AGENT_INSTRUCTIONS,
-    experimental_statusLabels: {
-      pending: "Running Xcode build",
-      completed: "Xcode build finished",
+    presentation: {
+      label: {
+        pending: "Running Xcode build",
+        completed: "Xcode build finished",
+      },
     },
     parameters: z.object({
       args: z

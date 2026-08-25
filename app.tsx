@@ -20,7 +20,7 @@
  * is actually building, and disappears the moment nothing is.
  */
 
-import { definePluginApp } from "@bb/plugin-sdk/app";
+import { definePluginApp } from "@get-bb/plugin-sdk/app";
 
 import "./app.css";
 

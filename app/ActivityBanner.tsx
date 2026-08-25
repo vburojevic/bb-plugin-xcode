@@ -55,7 +55,7 @@
  */
 
 import { useCallback } from "react";
-import { useComposerView, useRpc } from "@bb/plugin-sdk/app";
+import { useComposerView, useRpc } from "@get-bb/plugin-sdk/app";
 
 import { cn } from "@/lib/utils";
 

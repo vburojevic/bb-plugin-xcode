@@ -10,7 +10,7 @@
  * downward.
  */
 import { useCallback, useEffect, useState } from "react";
-import { useBbContext, useBbNavigate, useRealtime, useRpc } from "@bb/plugin-sdk/app";
+import { useBbContext, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import type { rpcContract } from "../../src/sim/wire";
