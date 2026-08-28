@@ -33,11 +33,13 @@ import { createMjpegParser } from "./mjpeg-frames";
 import { MjpegAdmission, pullMjpegFrames } from "./mjpeg-admission";
 import {
   DecoderGeneration,
+  DECODER_DRAIN_TIMEOUT_MS,
   shouldDropToKeyframe,
   shouldPauseForDecoder,
-  shouldResumeDecoding,
   timestampFor,
+  waitForDecoderDrain,
 } from "./stream-core";
+import { isStreamRecoveryEvidence } from "./reconnect-policy";
 import {
   H264SyncGate,
   type H264DecoderConfiguration,
@@ -70,6 +72,8 @@ export interface StreamStats {
   telemetry: LiveStreamSample | null;
   /** Set once the stream fails terminally; the caller advances the ladder. */
   failed: boolean;
+  /** Codec-specific evidence, excluding the H.264 bootstrap JPEG. */
+  recovered: boolean;
 }
 
 /**
@@ -90,6 +94,7 @@ export function useStream(
   const [frames, setFrames] = useState(0);
   const [telemetry, setTelemetry] = useState<LiveStreamSample | null>(null);
   const [failed, setFailed] = useState(false);
+  const [recovered, setRecovered] = useState(false);
   // Counted outside React so a burst of frames is one render, not thirty.
   const counter = useRef(0);
   const url = source?.url ?? null;
@@ -102,6 +107,7 @@ export function useStream(
     setFailed(false);
     setFrames(0);
     setTelemetry(null);
+    setRecovered(false);
     counter.current = 0;
   }, [url]);
 
@@ -115,6 +121,7 @@ export function useStream(
     counter.current = 0;
     setFrames(0);
     setTelemetry(null);
+    setRecovered(false);
 
     if (started.current) reconnects.current += 1;
     started.current = true;
@@ -135,6 +142,7 @@ export function useStream(
     let disposed = false;
     let frameIndex = 0;
     let painting = false;
+    let recoveryProven = false;
     /**
      * Only the newest frame may paint. Bitmaps decode asynchronously, and
      * without a sequence the JPEG bootstrap frame can resolve *after* the
@@ -170,6 +178,7 @@ export function useStream(
       width: number,
       height: number,
       packet: PacketEvent,
+      paintKind: "bootstrap" | "decoded",
       surfaceId?: string,
     ): void => {
       if (context === null) return;
@@ -180,6 +189,10 @@ export function useStream(
         canvas.height = codedHeight;
       }
       context.drawImage(source, 0, 0, codedWidth, codedHeight);
+      if (!recoveryProven && isStreamRecoveryEvidence(codec, paintKind)) {
+        recoveryProven = true;
+        setRecovered(true);
+      }
       publish(
         tracker.paint({
           ...packet,
@@ -198,6 +211,7 @@ export function useStream(
     const decodeJpeg = async (
       data: Uint8Array<ArrayBuffer>,
       packet: PacketEvent,
+      paintKind: "bootstrap" | "decoded",
     ): Promise<void> => {
       const seq = ++paintSeq;
       const surfaceId = frameFingerprint(data);
@@ -208,7 +222,7 @@ export function useStream(
       const bitmap = await createImageBitmap(new Blob([data], { type: "image/jpeg" }));
       try {
         if (disposed || seq !== paintSeq) return;
-        paint(bitmap, bitmap.width, bitmap.height, packet, surfaceId);
+        paint(bitmap, bitmap.width, bitmap.height, packet, paintKind, surfaceId);
       } finally {
         // A stale sequence and an unmounted canvas own exactly the same GPU
         // cleanup obligation as a painted bitmap.
@@ -226,7 +240,7 @@ export function useStream(
     ): void => {
       if (pendingBootstrapBitmaps >= 4) return;
       pendingBootstrapBitmaps += 1;
-      void decodeJpeg(data, packet)
+      void decodeJpeg(data, packet, "bootstrap")
         .catch(() => {})
         .finally(() => {
           pendingBootstrapBitmaps -= 1;
@@ -301,41 +315,10 @@ export function useStream(
         const packet = packetsByTimestamp.get(videoFrame.timestamp);
         if (packet === undefined) return;
         packetsByTimestamp.delete(videoFrame.timestamp);
-        paint(videoFrame, videoFrame.displayWidth, videoFrame.displayHeight, packet);
+        paint(videoFrame, videoFrame.displayWidth, videoFrame.displayHeight, packet, "decoded");
       },
       error: () => recoverDecoder(),
     });
-
-    /**
-     * Wait until the decoder queue has drained.
-     *
-     * `dequeue` fires as the queue empties; the interval is the fallback for
-     * implementations that never fire it. Either way this resolves, because a
-     * backpressure wait that can hang is a stall detector's worst false alarm.
-     */
-    const waitForDecoderDrain = (): Promise<void> =>
-      new Promise<void>((resolve) => {
-        const current = decoderOwner?.current ?? null;
-        if (current === null) {
-          resolve();
-          return;
-        }
-        const check = (): void => {
-          if (
-            disposed ||
-            decoderOwner?.current !== current ||
-            shouldResumeDecoding(current.decodeQueueSize)
-          ) {
-            current.removeEventListener("dequeue", check);
-            clearInterval(fallback);
-            resolve();
-          }
-        };
-        const fallback = setInterval(check, 50);
-        fallback.unref?.();
-        current.addEventListener("dequeue", check);
-        check();
-      });
 
     const runH264 = async (
       reader: ReadableStreamDefaultReader<Uint8Array>,
@@ -371,7 +354,11 @@ export function useStream(
           pullDecoder.state === "configured" &&
           shouldPauseForDecoder(pullDecoder.decodeQueueSize)
         ) {
-          await waitForDecoderDrain();
+          await waitForDecoderDrain(pullDecoder, {
+            signal: abort.signal,
+            current: () => decoderOwner?.current === pullDecoder,
+            timeoutMs: DECODER_DRAIN_TIMEOUT_MS,
+          });
           continue;
         }
 
@@ -503,7 +490,7 @@ export function useStream(
             decoderQueue,
           };
           publish(tracker.packet(packet), false);
-          await decodeJpeg(part.jpeg, packet);
+          await decodeJpeg(part.jpeg, packet, "decoded");
         },
         dropped: (count) => publish(tracker.statelessDrops(count), false),
       });
@@ -567,5 +554,5 @@ export function useStream(
     telemetryConfig.onSample,
   ]);
 
-  return { frames, telemetry, failed };
+  return { frames, telemetry, failed, recovered };
 }

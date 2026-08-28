@@ -366,6 +366,7 @@ export class SharedAvccFanout {
       viewers: new Set(),
       upstream: null,
       opening: false,
+      openingController: null,
       transition: Promise.resolve(),
       scheduled: false,
       requested: null,
@@ -389,6 +390,13 @@ export class SharedAvccFanout {
     if (action === "restart") {
       if (state.restartPending) return;
       state.restartPending = true;
+      // Fence the old encoder synchronously. Its next `data` event can arrive
+      // before the queued transition closes it, and no byte from that epoch is
+      // safe once recovery evidence has failed.
+      state.synced = false;
+      state.description = null;
+      state.nalLengthSize = null;
+      this.cancelOpening(state);
     }
     if (action === "restart" || state.requested === null) state.requested = action;
     if (state.scheduled) return;
@@ -426,13 +434,21 @@ export class SharedAvccFanout {
     if (state.viewers.size === 0) return;
 
     state.opening = true;
+    const opening = new AbortController();
+    state.openingController = opening;
     let upstream;
     try {
-      upstream = await this.options.openUpstream(state.udid);
+      upstream = await this.options.openUpstream(state.udid, opening.signal);
+    } catch (error) {
+      if (opening.signal.aborted) return;
+      throw error;
     } finally {
-      state.opening = false;
+      if (state.openingController === opening) {
+        state.openingController = null;
+        state.opening = false;
+      }
     }
-    if (state.viewers.size === 0) {
+    if (opening.signal.aborted || state.viewers.size === 0) {
       upstream.destroy();
       return;
     }
@@ -456,7 +472,7 @@ export class SharedAvccFanout {
   }
 
   consume(state, upstream, chunk) {
-    if (state.upstream !== upstream) return;
+    if (state.upstream !== upstream || state.restartPending) return;
     let frames;
     try {
       frames = state.parser.push(chunk);
@@ -470,11 +486,11 @@ export class SharedAvccFanout {
         const lengthSize = avccNalLengthSize(frame.data);
         if (lengthSize === null) {
           this.request(state, "restart");
-          continue;
+          return;
         }
         if (state.description !== null && !sameBuffer(state.description, frame.data)) {
           this.request(state, "restart");
-          continue;
+          return;
         }
         state.description = Buffer.from(frame.data);
         state.nalLengthSize = lengthSize;
@@ -484,13 +500,13 @@ export class SharedAvccFanout {
           !avccAccessUnitHasIdr(frame.data, state.nalLengthSize)
         ) {
           this.request(state, "restart");
-          continue;
+          return;
         }
         state.synced = true;
         state.drainRestartPending = false;
       } else if (frame.type === MEDIA_KIND_DELTA && !state.synced) {
         this.request(state, "restart");
-        continue;
+        return;
       }
 
       const packet = immutableBuffer(state.envelope.encode({
@@ -554,9 +570,11 @@ export class SharedAvccFanout {
     const upstream = state.upstream;
     state.upstream = null;
     upstream?.destroy();
+    this.cancelOpening(state);
   }
 
   async closeUpstream(state) {
+    this.cancelOpening(state);
     const upstream = state.upstream;
     state.upstream = null;
     if (upstream === null || upstream.destroyed) return;
@@ -574,5 +592,12 @@ export class SharedAvccFanout {
     }
     void this.closeUpstream(state);
     for (const viewer of [...state.viewers]) viewer.response.destroy();
+  }
+
+  cancelOpening(state) {
+    const opening = state.openingController;
+    state.openingController = null;
+    state.opening = false;
+    opening?.abort();
   }
 }

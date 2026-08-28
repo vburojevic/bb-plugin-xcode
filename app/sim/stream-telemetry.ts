@@ -285,23 +285,30 @@ export class StreamTelemetry {
   }
 }
 
-/** One id per browser renderer/tab; split panels in that renderer share it. */
+/** One stable id per mounted pipeline, namespaced by its browser renderer. */
 export function streamViewerId(): string {
-  if (typeof window === "undefined") return "viewer-server";
+  if (typeof window === "undefined") {
+    const pipeline = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+    return `viewer-server:${pipeline}`;
+  }
+  let renderer: string | null = null;
   try {
     const existing = window.sessionStorage.getItem(VIEWER_KEY);
-    if (existing !== null && existing !== "") return existing;
+    if (existing !== null && existing !== "") renderer = existing;
   } catch {
-    // Embedded browsers may deny storage. The in-memory fallback still keeps
-    // samples distinct for the life of this renderer.
+    // Embedded browsers may deny storage. Per-pipeline entropy still keeps
+    // simultaneous samples distinct.
   }
-  const id = globalThis.crypto?.randomUUID?.() ?? `viewer-${Math.random().toString(36).slice(2)}`;
-  try {
-    window.sessionStorage.setItem(VIEWER_KEY, id);
-  } catch {
-    // Best effort only.
+  if (renderer === null) {
+    renderer = globalThis.crypto?.randomUUID?.() ?? `viewer-${Math.random().toString(36).slice(2)}`;
+    try {
+      window.sessionStorage.setItem(VIEWER_KEY, renderer);
+    } catch {
+      // Best effort only.
+    }
   }
-  return id;
+  const pipeline = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+  return `${renderer}:${pipeline}`;
 }
 
 /** A bounded fingerprint: enough to count repeated MJPEG surfaces, never a hash job. */

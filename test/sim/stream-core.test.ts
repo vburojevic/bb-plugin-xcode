@@ -4,7 +4,7 @@
  * that used to be discovered by failing — two doomed fetches per stream for a
  * remote viewer, a wedged decoder that looked like a stalled device.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DecoderGeneration,
   DECODE_DROP_AT,
@@ -15,7 +15,12 @@ import {
   shouldResumeDecoding,
   timestampFor,
   viewerCanReachLoopback,
+  waitForDecoderDrain,
 } from "../../app/sim/stream-core.js";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 class FakeFrame {
   closeCalls = 0;
@@ -75,6 +80,38 @@ describe("decoder backpressure", () => {
     expect(shouldDropToKeyframe(DECODE_DROP_AT)).toBe(false);
     // Dropping begins far above pausing: pause first, drop only when losing.
     expect(DECODE_DROP_AT).toBeGreaterThan(DECODE_PAUSE_AT);
+  });
+
+  it("bounds a stuck drain wait and removes every listener on the deadline", async () => {
+    vi.useFakeTimers();
+    const decoder = Object.assign(new EventTarget(), { decodeQueueSize: DECODE_PAUSE_AT + 1 });
+    const abort = new AbortController();
+
+    const waiting = expect(
+      waitForDecoderDrain(decoder, {
+        signal: abort.signal,
+        current: () => true,
+        timeoutMs: 125,
+      }),
+    ).rejects.toThrow(/decoder queue did not drain/i);
+    await vi.advanceTimersByTimeAsync(125);
+    await waiting;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("ends a drain wait immediately when its stream is aborted", async () => {
+    vi.useFakeTimers();
+    const decoder = Object.assign(new EventTarget(), { decodeQueueSize: DECODE_PAUSE_AT + 1 });
+    const abort = new AbortController();
+    const waiting = waitForDecoderDrain(decoder, {
+      signal: abort.signal,
+      current: () => true,
+      timeoutMs: 125,
+    });
+
+    abort.abort();
+    await expect(waiting).resolves.toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

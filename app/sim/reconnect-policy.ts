@@ -38,6 +38,14 @@ export class RetryBudget {
   }
 }
 
+/** Bootstrap pixels make startup feel instant; only the selected codec proves recovery. */
+export function isStreamRecoveryEvidence(
+  codec: "h264" | "mjpeg",
+  paint: "bootstrap" | "decoded",
+): boolean {
+  return codec === "mjpeg" || paint === "decoded";
+}
+
 interface ReattachState {
   kind: string;
   device: { udid: string } | null;

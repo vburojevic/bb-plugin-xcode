@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { RetryBudget, VisibleReattachGate } from "../../app/sim/reconnect-policy.js";
+import {
+  isStreamRecoveryEvidence,
+  RetryBudget,
+  VisibleReattachGate,
+} from "../../app/sim/reconnect-policy.js";
 
 describe("the full-ladder retry budget", () => {
   beforeEach(() => vi.useFakeTimers());
@@ -62,6 +66,12 @@ describe("the full-ladder retry budget", () => {
 
     await vi.advanceTimersByTimeAsync(10_000);
     expect(retry).not.toHaveBeenCalled();
+  });
+
+  it("does not treat an H.264 bootstrap JPEG as codec recovery", () => {
+    expect(isStreamRecoveryEvidence("h264", "bootstrap")).toBe(false);
+    expect(isStreamRecoveryEvidence("h264", "decoded")).toBe(true);
+    expect(isStreamRecoveryEvidence("mjpeg", "decoded")).toBe(true);
   });
 });
 

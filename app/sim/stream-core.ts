@@ -96,6 +96,61 @@ export function shouldDropToKeyframe(queueSize: number): boolean {
   return queueSize > DECODE_DROP_AT;
 }
 
+export const DECODER_DRAIN_TIMEOUT_MS = 1_000;
+
+interface DecoderDrainTarget {
+  readonly decodeQueueSize: number;
+  addEventListener(type: "dequeue", listener: () => void): void;
+  removeEventListener(type: "dequeue", listener: () => void): void;
+}
+
+export class DecoderDrainTimeoutError extends Error {
+  constructor() {
+    super("decoder queue did not drain before the deadline");
+    this.name = "DecoderDrainTimeoutError";
+  }
+}
+
+/**
+ * Wait for one decoder generation to drain, but never retain the fetch reader.
+ * `dequeue` is the normal event path; one deadline is the browser-bug fence.
+ */
+export function waitForDecoderDrain(
+  decoder: DecoderDrainTarget,
+  options: { signal: AbortSignal; current: () => boolean; timeoutMs?: number },
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      decoder.removeEventListener("dequeue", check);
+      options.signal.removeEventListener("abort", aborted);
+      clearTimeout(deadline);
+      if (error === undefined) resolve();
+      else reject(error);
+    };
+    const check = (): void => {
+      if (
+        options.signal.aborted ||
+        !options.current() ||
+        shouldResumeDecoding(decoder.decodeQueueSize)
+      ) {
+        finish();
+      }
+    };
+    const aborted = (): void => finish();
+    const deadline = setTimeout(
+      () => finish(new DecoderDrainTimeoutError()),
+      options.timeoutMs ?? DECODER_DRAIN_TIMEOUT_MS,
+    );
+    deadline.unref?.();
+    decoder.addEventListener("dequeue", check);
+    options.signal.addEventListener("abort", aborted, { once: true });
+    check();
+  });
+}
+
 /**
  * A plausible monotonic timestamp for a frame, in microseconds.
  *

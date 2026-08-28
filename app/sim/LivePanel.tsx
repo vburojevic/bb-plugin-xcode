@@ -340,10 +340,10 @@ function LiveFrame({
   }, [video.failed, rung, sources.length, onStreamFailed]);
 
   useEffect(() => {
-    if (video.frames === 0) return;
+    if (!video.recovered) return;
     retryBudget.current?.reset();
     onStreamRecovered();
-  }, [video.frames, onStreamRecovered]);
+  }, [video.recovered, onStreamRecovered]);
 
   useEffect(
     () => onStats(active ? source : null, video.telemetry),

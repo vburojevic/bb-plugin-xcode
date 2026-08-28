@@ -65,7 +65,7 @@ async function start(
     write: (b: unknown) => boolean;
     end: (b?: unknown) => void;
   }, req: { url?: string; headers: Record<string, string | string[] | undefined> }) => void,
-  options: { internalKey?: string } = {},
+  options: { internalKey?: string; upstreamHeadersTimeoutMs?: number } = {},
 ): Promise<Harness> {
   const reached: string[] = [];
   const middleware = ((
@@ -98,7 +98,7 @@ async function start(
     master: string,
     onError: (error: unknown) => void,
     key: string | null,
-    rawOptions: { internalKey?: string },
+    rawOptions: { internalKey?: string; upstreamHeadersTimeoutMs?: number },
   ) => import("node:http").Server;
   const server = create(middleware, secret, () => {}, streamToken, options);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -106,7 +106,10 @@ async function start(
   const harness: Harness = {
     base: `http://127.0.0.1:${port}`,
     reached,
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    close: () => new Promise<void>((resolve) => {
+      server.close(() => resolve());
+      server.closeAllConnections();
+    }),
   };
   open.push(harness);
   return harness;
@@ -287,6 +290,33 @@ describe("the allow list", () => {
     expect((await fetch(`${harness.base}/exec`, { headers })).status).toBe(404);
     expect((await fetch(`${harness.base}/exec-ws`, { headers })).status).toBe(404);
     expect((await fetch(`${harness.base}/devtools`, { headers })).status).toBe(404);
+    expect(harness.reached).toEqual([`/helper/${UDID}/stream.avcc`]);
+  });
+
+  it("bounds the shared AVCC request while middleware withholds response headers", async () => {
+    const streamKey = "v".repeat(43);
+    const capability = deriveStreamCapability(streamKey, UDID);
+    const harness = await start(SECRET, streamKey, () => {
+      // Accepted by the loopback middleware, then deliberately never answered.
+    }, { upstreamHeadersTimeoutMs: 20 });
+    const controller = new AbortController();
+    const request = fetch(`${harness.base}/helper/${UDID}/stream.avcc?k=${capability}`, {
+      signal: controller.signal,
+    }).then(
+      async (response) => {
+        await response.arrayBuffer();
+        return "ended" as const;
+      },
+      () => "failed" as const,
+    );
+    const outcome = await Promise.race([
+      request,
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 100)),
+    ]);
+    controller.abort();
+    await request;
+
+    expect(outcome).not.toBe("pending");
     expect(harness.reached).toEqual([`/helper/${UDID}/stream.avcc`]);
   });
 

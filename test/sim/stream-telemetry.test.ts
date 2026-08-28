@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   StreamTelemetry,
   TELEMETRY_PAINT_CADENCE,
+  streamViewerId,
   type PaintEvent,
   type StreamTelemetryConfig,
 } from "../../app/sim/stream-telemetry.js";
@@ -35,9 +36,33 @@ function paint(sequence: number): PaintEvent {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 describe("renderer stream evidence", () => {
+  it("gives two mounted pipelines in one tab distinct identities", () => {
+    let stored: string | null = null;
+    const ids = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+    ];
+    vi.stubGlobal("window", {
+      sessionStorage: {
+        getItem: () => stored,
+        setItem: (_key: string, value: string) => { stored = value; },
+      },
+    });
+    vi.stubGlobal("crypto", { randomUUID: () => ids.shift()! });
+
+    const navViewer = streamViewerId();
+    const threadViewer = streamViewerId();
+
+    expect(navViewer).toBe("11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222");
+    expect(threadViewer).toBe("11111111-1111-4111-8111-111111111111:33333333-3333-4333-8333-333333333333");
+    expect(navViewer).not.toBe(threadViewer);
+  });
+
   it("publishes configuration immediately and then one replacement every thirty paints", () => {
     const telemetry = new StreamTelemetry(CONFIG);
 

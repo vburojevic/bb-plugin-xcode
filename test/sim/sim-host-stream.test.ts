@@ -45,7 +45,10 @@ interface RawStreamModule {
     upstreamRestart(): Uint8Array;
   };
   SharedAvccFanout: new (options: {
-    openUpstream(udid: string): Promise<PassThrough & { statusCode: number; headers: Record<string, string> }>;
+    openUpstream(
+      udid: string,
+      signal?: AbortSignal,
+    ): Promise<PassThrough & { statusCode: number; headers: Record<string, string> }>;
     nowMicros?: () => bigint;
     nowMs?: () => number;
   }) => {
@@ -385,6 +388,53 @@ describe("the child-side shared AVCC fanout", () => {
       expect(kinds(viewer).slice(lastDiscontinuity)).toEqual([5, 1, 2, 3]);
     }
     expect(fanout.status("device-a")).toMatchObject({ generation: 3, restarts: 2 });
+  });
+
+  it("fences the current batch as soon as a falsely tagged key requires recovery", async () => {
+    const upstreams = makeUpstreams();
+    const fanout = new raw.SharedAvccFanout({ openUpstream: () => upstreams.open() });
+    const viewer = new ViewerResponse();
+    fanout.attach("device-a", viewer);
+    await flush();
+
+    upstreams.opened[0]!.write(concat(
+      v1Frame(1, AVCC_1),
+      v1Frame(2, [0, 0, 0, 2, 0x65, 0x01]),
+      v1Frame(3, [0, 0, 0, 2, 0x41, 0x02]),
+    ));
+    expect(kinds(viewer)).toEqual([1, 2, 3]);
+
+    upstreams.opened[0]!.write(concat(
+      // Both records arrive from one parser push. Once the first proves the
+      // epoch invalid, the following delta must never cross the missing IDR.
+      v1Frame(2, [0, 0, 0, 2, 0x41, 0x03]),
+      v1Frame(3, [0, 0, 0, 2, 0x41, 0x04]),
+    ));
+    expect(kinds(viewer)).toEqual([1, 2, 3]);
+
+    await flush();
+    expect(kinds(viewer).at(-1)).toBe(5);
+    expect(upstreams.opened).toHaveLength(2);
+  });
+
+  it("cancels an upstream still waiting for headers when the last viewer leaves", async () => {
+    let openingSignal: AbortSignal | undefined;
+    const fanout = new raw.SharedAvccFanout({
+      openUpstream: (_udid, signal) => {
+        openingSignal = signal;
+        return new Promise(() => {});
+      },
+    });
+    const viewer = new ViewerResponse();
+    fanout.attach("device-a", viewer);
+    await flush();
+
+    viewer.destroy();
+    await flush();
+
+    expect(openingSignal).toBeInstanceOf(AbortSignal);
+    expect(openingSignal?.aborted).toBe(true);
+    expect(fanout.status("device-a")).toMatchObject({ viewers: 0, upstreamEncoders: 0 });
   });
 
   it("restarts before admitting a new viewer or a changed decoder description", async () => {

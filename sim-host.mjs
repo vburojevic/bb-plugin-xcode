@@ -46,6 +46,7 @@ export const INTERNAL_AVCC_HEADER = "x-xcode-simulators-internal-avcc";
 export const MAX_CONTROL_BODY_BYTES = 4096;
 export const MAX_SCRUBBED_JSON_BYTES = 8 * 1024 * 1024;
 export const MAX_PIXEL_RESPONSES = 4;
+export const AVCC_UPSTREAM_HEADERS_TIMEOUT_MS = 5_000;
 
 /**
  * Routes that are 404 **unconditionally**, secret or not.
@@ -347,7 +348,7 @@ export function createFilteredServer(
   };
 
   const fanout = new SharedAvccFanout({
-    openUpstream(udid) {
+    openUpstream(udid, signal) {
       return new Promise((resolve, reject) => {
         const address = server.address();
         if (typeof address !== "object" || address === null) {
@@ -360,8 +361,24 @@ export function createFilteredServer(
           method: "GET",
           path: `/helper/${udid}/stream.avcc`,
           headers: { [INTERNAL_AVCC_HEADER]: internalKey },
-        }, resolve);
-        request.once("error", reject);
+        }, (response) => {
+          clearTimeout(timeout);
+          signal.removeEventListener("abort", cancel);
+          resolve(response);
+        });
+        const cancel = () => request.destroy(new Error("AVCC upstream cancelled"));
+        const timeout = setTimeout(
+          () => request.destroy(new Error("AVCC upstream response headers timed out")),
+          options.upstreamHeadersTimeoutMs ?? AVCC_UPSTREAM_HEADERS_TIMEOUT_MS,
+        );
+        timeout.unref?.();
+        request.once("error", (error) => {
+          clearTimeout(timeout);
+          signal.removeEventListener("abort", cancel);
+          reject(error);
+        });
+        signal.addEventListener("abort", cancel, { once: true });
+        if (signal.aborted) cancel();
         request.end();
       });
     },
