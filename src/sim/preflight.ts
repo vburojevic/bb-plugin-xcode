@@ -18,7 +18,7 @@ import { dirname, join } from "node:path";
 import { run } from "./exec.js";
 
 /** The serve-sim release every quirk in this plugin was verified against. */
-export const PINNED_SERVE_SIM = "0.1.45";
+export const PINNED_SERVE_SIM = "0.1.46";
 
 export type ProbeState = "ok" | "warn" | "blocked" | "unknown";
 
@@ -325,7 +325,7 @@ async function probeXcodeVersion(deps: PreflightDeps): Promise<string | null> {
  * Note the specifier: `require.resolve("serve-sim")` throws
  * `ERR_PACKAGE_PATH_NOT_EXPORTED` on a perfectly healthy install, because the
  * exports map declares only `./middleware` and `./state` with no `.` entry.
- * Verified against serve-sim 0.1.45.
+ * Verified against serve-sim 0.1.45; the exports map is unchanged in 0.1.46.
  */
 export function resolveServeSimMiddleware(pluginDir: string): string | null {
   try {

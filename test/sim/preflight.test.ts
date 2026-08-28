@@ -115,12 +115,12 @@ describe("the serve-sim version probe", () => {
     const probe = serveSimVersionProbe("0.1.52");
     expect(probe.state).toBe("warn");
     expect(probe.detail).toBe(
-      "Xcode Simulators was tested against serve-sim 0.1.45; this install has 0.1.52. Live may behave differently.",
+      "Xcode Simulators was tested against serve-sim 0.1.46; this install has 0.1.52. Live may behave differently.",
     );
   });
 
   it("is quiet at the pinned version", () => {
-    expect(serveSimVersionProbe("0.1.45").state).toBe("ok");
+    expect(serveSimVersionProbe("0.1.46").state).toBe("ok");
   });
 
   it("points at the install shape when serve-sim is absent entirely", () => {
