@@ -344,11 +344,26 @@ describe("the allow list", () => {
         signal: controllers[3]!.signal,
       }),
     ];
-    expect((await Promise.all(requests)).map((response) => response.status)).toEqual([200, 200, 200, 200]);
+    const responses = await Promise.all(requests);
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200]);
     expect((await fetch(`${harness.base}/helper/${UDID}/stream.mjpeg?k=${capability}`)).status).toBe(503);
 
-    controllers[1]!.abort();
-    await new Promise((resolve) => setImmediate(resolve));
+    // Cancel the body rather than abort the signal: how quickly an aborted
+    // fetch destroys its socket is a property of the client's undici (25 does
+    // it a tick sooner than 24), and the slot only frees when the host sees
+    // the close. Cancelling is deterministic on every supported Node; the
+    // wait below is on the host's own counter, not a guessed number of ticks.
+    await responses[1]!.body!.cancel();
+    const deadline = Date.now() + 2000;
+    for (;;) {
+      const status = await fetch(`${harness.base}/helper/${UDID}/stream-status`, {
+        headers: { [SECRET_HEADER]: SECRET },
+      });
+      const { viewers } = (await status.json()) as { viewers: number };
+      if (viewers === 3) break;
+      if (Date.now() > deadline) throw new Error(`viewer slot never freed (viewers=${viewers})`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     const replacement = new AbortController();
     expect((await fetch(`${harness.base}/helper/${UDID}/stream.mjpeg?k=${capability}`, {
       signal: replacement.signal,
