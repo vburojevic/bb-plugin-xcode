@@ -5,6 +5,8 @@
  * These tests import only our raw helper, never serve-sim, so Linux CI exercises
  * the same bytes the Mac child will eventually put on the wire.
  */
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 
 interface V1Frame {
@@ -42,6 +44,21 @@ interface RawStreamModule {
     }): Uint8Array;
     upstreamRestart(): Uint8Array;
   };
+  SharedAvccFanout: new (options: {
+    openUpstream(udid: string): Promise<PassThrough & { statusCode: number; headers: Record<string, string> }>;
+    nowMicros?: () => bigint;
+    nowMs?: () => number;
+  }) => {
+    attach(udid: string, response: ViewerResponse): void;
+    status(udid: string): {
+      viewers: number;
+      upstreamEncoders: number;
+      generation: number;
+      restarts: number;
+      slowViewerDrops: number;
+      lastPacketAgeMs: number | null;
+    };
+  };
 }
 
 const raw = (await import(
@@ -68,6 +85,78 @@ function concat(...parts: Uint8Array[]): Uint8Array {
 
 function header(record: Uint8Array): DataView {
   return new DataView(record.buffer, record.byteOffset, record.byteLength);
+}
+
+const AVCC_1 = [1, 100, 0, 51, 0xff, 0xe1, 0, 1, 0x67, 1, 0, 1, 0x68];
+const AVCC_2 = [1, 66, 0, 30, 0xff, 0xe1, 0, 1, 0x67, 1, 0, 1, 0x68];
+
+class ViewerResponse extends EventEmitter {
+  readonly headers = new Map<string, string>();
+  readonly writes: Buffer[] = [];
+  statusCode = 0;
+  writableEnded = false;
+  destroyed = false;
+  blockNext = false;
+
+  writeHead(status: number, headers: Record<string, string>): this {
+    this.statusCode = status;
+    for (const [name, value] of Object.entries(headers)) this.headers.set(name.toLowerCase(), value);
+    return this;
+  }
+
+  write(chunk: Uint8Array): boolean {
+    const packet = Buffer.isBuffer(chunk)
+      ? chunk
+      : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    this.writes.push(packet);
+    if (!this.blockNext) return true;
+    this.blockNext = false;
+    return false;
+  }
+
+  end(): this {
+    if (this.writableEnded) return this;
+    this.writableEnded = true;
+    this.emit("close");
+    return this;
+  }
+
+  destroy(): this {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    this.emit("close");
+    return this;
+  }
+}
+
+function kinds(viewer: ViewerResponse): number[] {
+  return viewer.writes.map((packet) => packet[5]!);
+}
+
+function makeUpstreams() {
+  const opened: Array<PassThrough & { statusCode: number; headers: Record<string, string> }> = [];
+  let active = 0;
+  let peak = 0;
+  return {
+    opened,
+    active: () => active,
+    peak: () => peak,
+    async open() {
+      const stream = Object.assign(new PassThrough(), {
+        statusCode: 200,
+        headers: { "content-type": "application/octet-stream" },
+      });
+      active += 1;
+      peak = Math.max(peak, active);
+      stream.once("close", () => { active -= 1; });
+      opened.push(stream);
+      return stream;
+    },
+  };
+}
+
+function flush(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 describe("the child-side v1 parser", () => {
@@ -184,5 +273,151 @@ describe("the child-side v2 encoder", () => {
 
     const tooLarge = new Uint8Array(raw.MAX_FRAME_BYTES - raw.V2_HEADER_BYTES + 1);
     expect(() => raw.encodeV2Record({ kind: 2, payload: tooLarge })).toThrow(/not plausible/);
+  });
+});
+
+describe("the child-side shared AVCC fanout", () => {
+  it("opens one upstream for four viewers and reuses each evidenced packet byte-for-byte", async () => {
+    const upstreams = makeUpstreams();
+    const times = [100n, 200n, 300n];
+    const fanout = new raw.SharedAvccFanout({
+      openUpstream: () => upstreams.open(),
+      nowMicros: () => times.shift()!,
+      nowMs: () => 1_000,
+    });
+    const viewers = Array.from({ length: 4 }, () => new ViewerResponse());
+    for (const viewer of viewers) fanout.attach("device-a", viewer);
+    await flush();
+
+    expect(upstreams.opened).toHaveLength(1);
+    expect(upstreams.peak()).toBe(1);
+    expect(fanout.status("device-a")).toMatchObject({ viewers: 4, upstreamEncoders: 1 });
+
+    upstreams.opened[0]!.write(concat(
+      v1Frame(1, AVCC_1),
+      v1Frame(2, [0, 0, 0, 2, 0x65, 0x88]),
+      v1Frame(3, [0, 0, 0, 2, 0x41, 0x99]),
+    ));
+    await flush();
+
+    expect(viewers.map(kinds)).toEqual(Array.from({ length: 4 }, () => [1, 2, 3]));
+    for (const index of [0, 1, 2]) {
+      expect(viewers[0]!.writes[index]).toBe(viewers[1]!.writes[index]);
+      expect(viewers[1]!.writes[index]).toBe(viewers[2]!.writes[index]);
+      expect(viewers[2]!.writes[index]).toBe(viewers[3]!.writes[index]);
+    }
+    expect(viewers.map((viewer) => [
+      header(viewer.writes[1]!).getUint32(8, false),
+      header(viewer.writes[1]!).getBigUint64(16, false),
+      header(viewer.writes[2]!).getUint32(8, false),
+      header(viewer.writes[2]!).getBigUint64(16, false),
+    ])).toEqual(Array.from({ length: 4 }, () => [1, 100n, 2, 200n]));
+    expect(viewers[0]!.headers.get("content-type")).toBe("application/vnd.bb.sim-avcc;version=2");
+
+    for (const viewer of viewers) viewer.destroy();
+    await flush();
+    expect(upstreams.active()).toBe(0);
+    expect(fanout.status("device-a")).toMatchObject({ viewers: 0, upstreamEncoders: 0 });
+  });
+
+  it("does not let stalled viewers block healthy ones and coalesces their drains into one restart", async () => {
+    const upstreams = makeUpstreams();
+    let now = 10_000;
+    const fanout = new raw.SharedAvccFanout({
+      openUpstream: () => upstreams.open(),
+      nowMicros: () => BigInt(now++),
+      nowMs: () => now,
+    });
+    const healthy = new ViewerResponse();
+    const slowA = new ViewerResponse();
+    const slowB = new ViewerResponse();
+    fanout.attach("device-a", healthy);
+    fanout.attach("device-a", slowA);
+    fanout.attach("device-a", slowB);
+    await flush();
+    upstreams.opened[0]!.write(concat(
+      v1Frame(1, AVCC_1),
+      v1Frame(2, [0, 0, 0, 2, 0x65, 0x88]),
+    ));
+    await flush();
+
+    slowA.blockNext = true;
+    slowB.blockNext = true;
+    upstreams.opened[0]!.write(v1Frame(3, [0, 0, 0, 2, 0x41, 0x01]));
+    upstreams.opened[0]!.write(v1Frame(3, [0, 0, 0, 2, 0x41, 0x02]));
+    await flush();
+    expect(kinds(healthy)).toEqual([1, 2, 3, 3]);
+    expect(kinds(slowA)).toEqual([1, 2, 3]);
+    expect(kinds(slowB)).toEqual([1, 2, 3]);
+
+    slowA.emit("drain");
+    await flush();
+    expect(upstreams.opened).toHaveLength(2);
+    slowB.emit("drain");
+    await flush();
+    expect(upstreams.opened).toHaveLength(2);
+    expect(upstreams.peak()).toBe(1);
+    expect(fanout.status("device-a")).toMatchObject({
+      upstreamEncoders: 1,
+      restarts: 1,
+      slowViewerDrops: 5,
+    });
+    expect(kinds(healthy).at(-1)).toBe(5);
+
+    upstreams.opened[1]!.write(concat(
+      v1Frame(1, AVCC_1),
+      // The key tag lies: this is a non-IDR slice and must not release deltas.
+      v1Frame(2, [0, 0, 0, 2, 0x41, 0x44]),
+      v1Frame(3, [0, 0, 0, 2, 0x41, 0x55]),
+    ));
+    await flush();
+    expect(upstreams.opened).toHaveLength(3);
+    expect(upstreams.peak()).toBe(1);
+
+    upstreams.opened[2]!.write(concat(
+      v1Frame(1, AVCC_1),
+      v1Frame(2, [0, 0, 0, 2, 0x65, 0x66]),
+      v1Frame(3, [0, 0, 0, 2, 0x41, 0x77]),
+    ));
+    await flush();
+    for (const viewer of [healthy, slowA, slowB]) {
+      const lastDiscontinuity = kinds(viewer).lastIndexOf(5);
+      expect(kinds(viewer).slice(lastDiscontinuity)).toEqual([5, 1, 2, 3]);
+    }
+    expect(fanout.status("device-a")).toMatchObject({ generation: 3, restarts: 2 });
+  });
+
+  it("restarts before admitting a new viewer or a changed decoder description", async () => {
+    const upstreams = makeUpstreams();
+    const fanout = new raw.SharedAvccFanout({ openUpstream: () => upstreams.open() });
+    const first = new ViewerResponse();
+    fanout.attach("device-a", first);
+    await flush();
+    upstreams.opened[0]!.write(concat(
+      v1Frame(1, AVCC_1),
+      v1Frame(2, [0, 0, 0, 2, 0x65, 0x01]),
+    ));
+    await flush();
+
+    const joiner = new ViewerResponse();
+    fanout.attach("device-a", joiner);
+    await flush();
+    expect(upstreams.opened).toHaveLength(2);
+    expect(upstreams.opened[0]!.destroyed).toBe(true);
+    expect(kinds(first).at(-1)).toBe(5);
+    expect(kinds(joiner)).toEqual([5]);
+
+    upstreams.opened[1]!.write(concat(
+      v1Frame(1, AVCC_1),
+      v1Frame(2, [0, 0, 0, 2, 0x65, 0x02]),
+      v1Frame(1, AVCC_2),
+    ));
+    await flush();
+    expect(upstreams.opened).toHaveLength(3);
+    expect(upstreams.opened[1]!.destroyed).toBe(true);
+    expect(upstreams.peak()).toBe(1);
+    expect(kinds(joiner)).toEqual([5, 1, 2, 5]);
+    expect(joiner.writes.map((packet) => header(packet).getUint32(12, false))).toEqual([2, 2, 2, 3]);
+    expect(fanout.status("device-a")).toMatchObject({ generation: 3, restarts: 2 });
   });
 });

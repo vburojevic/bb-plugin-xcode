@@ -34,15 +34,18 @@
  * serve-sim, no simulator and no Mac.
  */
 import { createRequire } from "node:module";
-import { createServer } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { createServer, request as httpRequest } from "node:http";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { dirname, join } from "node:path";
 import { existsSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { SharedAvccFanout } from "./sim-host-stream.mjs";
 
 export const SECRET_HEADER = "x-xcode-simulators-key";
+export const INTERNAL_AVCC_HEADER = "x-xcode-simulators-internal-avcc";
 export const MAX_CONTROL_BODY_BYTES = 4096;
 export const MAX_SCRUBBED_JSON_BYTES = 8 * 1024 * 1024;
+export const MAX_PIXEL_RESPONSES = 4;
 
 /**
  * Routes that are 404 **unconditionally**, secret or not.
@@ -61,6 +64,7 @@ const ALLOW = [
   { method: "POST", pattern: /^\/grid\/api\/shutdown$/ },
   { method: "GET", pattern: new RegExp(`^/helper/${UDID}/stream\\.mjpeg$`) },
   { method: "GET", pattern: new RegExp(`^/helper/${UDID}/stream\\.avcc$`) },
+  { method: "GET", pattern: new RegExp(`^/helper/${UDID}/stream-status$`) },
   { method: "GET", pattern: new RegExp(`^/helper/${UDID}/config$`) },
   { method: "GET", pattern: new RegExp(`^/helper/${UDID}/health$`) },
   { method: "GET", pattern: new RegExp(`^/helper/${UDID}/ax$`) },
@@ -70,7 +74,7 @@ const ALLOW = [
 const WS_ALLOW = new RegExp(`^/helper/${UDID}/ws$`);
 
 /**
- * The one route a **stream token** may open.
+ * The routes a device-derived stream capability may open.
  *
  * The panel streams straight from this process rather than through the bb
  * server — measured, the proxy hop cost 79% as much CPU as capturing and
@@ -78,15 +82,26 @@ const WS_ALLOW = new RegExp(`^/helper/${UDID}/ws$`);
  * But an `<img>` cannot set a header, so a direct URL has to carry its
  * credential in the query string, where it lands in the DOM.
  *
- * So it carries a different one. The stream token authorises exactly this
- * regex and nothing else: a URL that leaks lets someone *watch* the simulator,
- * where the master secret would also let them drive it over the HID socket,
- * read the accessibility tree, and shut the device down.
+ * So it carries HMAC(stream key, UDID). The derivative authorises exactly this
+ * device's two pixel routes and nothing else: a URL that leaks cannot watch a
+ * second simulator, while the master secret would also allow HID input,
+ * accessibility reads, status, and shutdown.
  */
 const STREAM_ONLY = new RegExp(`^/helper/${UDID}/stream\\.(mjpeg|avcc)$`);
+const PIXEL_ROUTE = new RegExp(`^/helper/(${UDID})/stream\\.(mjpeg|avcc)$`);
+const AVCC_ROUTE = new RegExp(`^/helper/(${UDID})/stream\\.avcc$`);
+const STREAM_STATUS_ROUTE = new RegExp(`^/helper/(${UDID})/stream-status$`);
 
 export function isStreamRoute(path) {
   return STREAM_ONLY.test(path);
+}
+
+function streamDevice(path) {
+  return PIXEL_ROUTE.exec(path)?.[1] ?? null;
+}
+
+function streamCapability(streamKey, udid) {
+  return createHmac("sha256", streamKey).update(udid, "utf8").digest("base64url");
 }
 
 export function isDenied(path) {
@@ -119,14 +134,15 @@ export function headerSecret(req) {
  * May this request proceed?
  *
  * The master secret opens every allowed route, but only from its private
- * header. The stream token opens a pixel stream only and only from `?k=`.
+ * header. A device-bound stream capability opens pixel routes only from `?k=`.
  * Keeping the two channels distinct prevents a master credential copied into
  * a URL from reaching access logs, browser history, or referrers.
  */
 export function authorize({ path, header, query, secret, streamToken }) {
   if (secretMatches(header, secret)) return true;
   if (typeof streamToken !== "string" || streamToken === "") return false;
-  return isStreamRoute(path) && secretMatches(query, streamToken);
+  const udid = streamDevice(path);
+  return udid !== null && secretMatches(query, streamCapability(streamToken, udid));
 }
 
 /**
@@ -292,44 +308,22 @@ function validControlBody(req) {
  * Taking the middleware as a parameter is what lets the security suite mount a
  * stub and assert every route on a machine that has never seen a simulator.
  */
-export function createFilteredServer(middleware, secret, onError = () => {}, streamToken = null) {
-  const server = createServer((req, res) => {
-    let url;
-    try {
-      url = new URL(req.url ?? "/", "http://127.0.0.1");
-    } catch {
-      refuse(res, 400, "Bad request");
-      return;
-    }
-    const path = url.pathname;
-    const method = (req.method ?? "GET").toUpperCase();
+export function createFilteredServer(
+  middleware,
+  secret,
+  onError = () => {},
+  streamToken = null,
+  options = {},
+) {
+  // This credential exists only inside this function and its loopback request
+  // closure. In particular it is not an environment variable and cannot enter
+  // the startup handshake, where the parent or a log collector might retain it.
+  const internalKey = options.internalKey ?? randomBytes(32).toString("base64url");
+  let activePixels = 0;
+  const viewersByDevice = new Map();
+  let server;
 
-    // Order matters and is asserted: denied before allowed before authenticated,
-    // so `/exec` is 404 whether or not the caller holds the secret.
-    if (isDenied(path) || !isAllowed(method, path)) {
-      refuse(res, 404, "Not found");
-      return;
-    }
-    if (!authorize({
-      path,
-      header: headerSecret(req),
-      query: url.searchParams.get("k"),
-      secret,
-      streamToken,
-    })) {
-      refuse(res, 401, "Unauthorized");
-      return;
-    }
-    const invalidBody = validControlBody(req);
-    if (invalidBody !== null) {
-      refuse(res, invalidBody.status, invalidBody.message);
-      return;
-    }
-
-    wrapForScrubbing(res);
-    // The middleware returns a promise it also settles internally; a rejection
-    // here is ours to contain, because an unhandled one kills this process and
-    // the supervisor would report a restart with no reason.
+  const invokeMiddleware = (req, res) => {
     Promise.resolve()
       .then(() => middleware(req, res))
       .catch((error) => {
@@ -350,6 +344,138 @@ export function createFilteredServer(middleware, secret, onError = () => {}, str
           res.destroy();
         }
       });
+  };
+
+  const fanout = new SharedAvccFanout({
+    openUpstream(udid) {
+      return new Promise((resolve, reject) => {
+        const address = server.address();
+        if (typeof address !== "object" || address === null) {
+          reject(new Error("capture host is not listening"));
+          return;
+        }
+        const request = httpRequest({
+          host: "127.0.0.1",
+          port: address.port,
+          method: "GET",
+          path: `/helper/${udid}/stream.avcc`,
+          headers: { [INTERNAL_AVCC_HEADER]: internalKey },
+        }, resolve);
+        request.once("error", reject);
+        request.end();
+      });
+    },
+    onError(error) {
+      try {
+        onError(`AVCC fanout failed: ${error instanceof Error ? error.stack : error}`);
+      } catch {
+        // Diagnostics never own capture lifetime.
+      }
+    },
+  });
+
+  server = createServer((req, res) => {
+    let url;
+    try {
+      url = new URL(req.url ?? "/", "http://127.0.0.1");
+    } catch {
+      refuse(res, 400, "Bad request");
+      return;
+    }
+    const path = url.pathname;
+    const method = (req.method ?? "GET").toUpperCase();
+
+    // Order matters and is asserted: denied before allowed before authenticated,
+    // so `/exec` is 404 whether or not the caller holds the secret.
+    if (isDenied(path) || !isAllowed(method, path)) {
+      refuse(res, 404, "Not found");
+      return;
+    }
+    const avcc = AVCC_ROUTE.exec(path);
+    const internal = req.headers[INTERNAL_AVCC_HEADER];
+    if (
+      avcc !== null &&
+      typeof internal === "string" &&
+      secretMatches(internal, internalKey)
+    ) {
+      invokeMiddleware(req, res);
+      return;
+    }
+    const status = STREAM_STATUS_ROUTE.exec(path);
+    const authorized = status !== null
+      ? secretMatches(headerSecret(req), secret)
+      : authorize({
+          path,
+          header: headerSecret(req),
+          query: url.searchParams.get("k"),
+          secret,
+          streamToken,
+        });
+    if (!authorized) {
+      refuse(res, 401, "Unauthorized");
+      return;
+    }
+    const invalidBody = validControlBody(req);
+    if (invalidBody !== null) {
+      refuse(res, invalidBody.status, invalidBody.message);
+      return;
+    }
+
+    if (status !== null) {
+      const udid = status[1];
+      const body = JSON.stringify({
+        ...fanout.status(udid),
+        viewers: viewersByDevice.get(udid) ?? 0,
+      });
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(body)),
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      });
+      res.end(body);
+      return;
+    }
+
+    const pixel = PIXEL_ROUTE.exec(path);
+    if (pixel !== null) {
+      if (activePixels >= MAX_PIXEL_RESPONSES) {
+        refuse(res, 503, "Too many simulator streams");
+        return;
+      }
+      const udid = pixel[1];
+      activePixels += 1;
+      viewersByDevice.set(udid, (viewersByDevice.get(udid) ?? 0) + 1);
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        activePixels -= 1;
+        const remaining = (viewersByDevice.get(udid) ?? 1) - 1;
+        if (remaining === 0) viewersByDevice.delete(udid);
+        else viewersByDevice.set(udid, remaining);
+      };
+      res.once("close", release);
+      res.once("finish", release);
+      res.once("error", release);
+
+      if (pixel[2] === "avcc") {
+        try {
+          fanout.attach(udid, res);
+        } catch (error) {
+          release();
+          if (res.headersSent) res.destroy();
+          else refuse(res, 502, "Capture host error");
+        }
+        return;
+      }
+    }
+
+    wrapForScrubbing(res);
+    // The middleware returns a promise it also settles internally; a rejection
+    // here is ours to contain, because an unhandled one kills this process and
+    // the supervisor would report a restart with no reason.
+    invokeMiddleware(req, res);
   });
 
   server.on("upgrade", (req, socket, head) => {

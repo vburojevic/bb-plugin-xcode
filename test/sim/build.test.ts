@@ -48,10 +48,32 @@ describe.skipIf(!built)("dist/server.js", () => {
     expect(bundle).not.toContain("@odiff/darwin");
   });
 
-  it("ships sim-host.mjs raw beside the bundle", () => {
+  it("ships both capture-host modules raw beside the bundle", () => {
     // V1: a path install loads `server.ts` at the plugin root and a git install
     // prefers `dist/server.js`; both resolve the same file.
     expect(existsSync(fileURLToPath(new URL("../../sim-host.mjs", import.meta.url)))).toBe(true);
+    expect(existsSync(fileURLToPath(new URL("../../sim-host-stream.mjs", import.meta.url)))).toBe(true);
+  });
+});
+
+describe("the raw capture boundary", () => {
+  it("has no bundled runtime import path to serve-sim middleware", () => {
+    const roots = ["server.ts", "src"];
+    const offenders: string[] = [];
+    const walk = (relative: string): void => {
+      const path = fileURLToPath(new URL(`../../${relative}`, import.meta.url));
+      if (!existsSync(path)) return;
+      const stats = statSync(path);
+      if (stats.isFile()) {
+        if (!/\.(?:ts|tsx)$/.test(path)) return;
+        const source = readFileSync(path, "utf8");
+        if (/import\s+(?!type\b)[^;]*["']serve-sim\/middleware["']/.test(source)) offenders.push(relative);
+        return;
+      }
+      for (const entry of readdirSync(path)) walk(`${relative}/${entry}`);
+    };
+    for (const root of roots) walk(root);
+    expect(offenders).toEqual([]);
   });
 });
 

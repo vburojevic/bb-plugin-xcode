@@ -17,11 +17,17 @@ This removes the separate viewer origin and its public Connect hostname. It does
 
 ## Architecture
 
-`serve-sim` remains isolated in the disposable `sim-host.mjs` child. The child continues to bind an ephemeral loopback TCP port because the server process needs streaming HTTP and WebSocket access to the native middleware. Its filtered route allowlist, split stream/control credentials, response limits, curated environment, parent-liveness pipe, and forced teardown remain unchanged.
+`serve-sim` remains isolated in the disposable `sim-host.mjs` child. Both `sim-host.mjs` and its `sim-host-stream.mjs` sibling ship raw and unbundled; bundled server code has no runtime import path to `serve-sim/middleware`. The child continues to bind an ephemeral loopback TCP port because the server process needs streaming HTTP and WebSocket access to the native middleware. Its filtered route allowlist, split stream/control credentials, response limits, curated environment, parent-liveness pipe, and forced teardown remain unchanged.
 
 The bb frontend already receives a same-origin `streamUrl` from `liveState`. A local HTTP panel may prefer the stream-scoped loopback URL for performance; a remote HTTPS panel rejects that candidate before opening it and uses `/api/v1/plugins/<id>/http/stream`. Touch, keyboard, device, and capture actions continue through typed plugin RPC. No simulator port is declared to bb Connect.
 
-The `/stream` and `/presence` routes each receive an independent four-connection gate. Acquisition happens only after request and device validation. Every exit path releases exactly once: request abort, response cancellation, upstream error/close, rejected upstream response, and failed upstream open. A fifth concurrent connection receives HTTP 503 without starting or retaining native work.
+The child has one four-response gate for every external pixel request, whether direct or proxied and whether MJPEG or AVCC. The plugin proxy retains its independent four-connection gate. Acquisition happens only after request and device validation. Every exit path releases exactly once: request abort, response cancellation, upstream error/close, rejected upstream response, and failed upstream open. A fifth concurrent pixel response receives HTTP 503 without starting or retaining native work.
+
+The DOM sees `HMAC-SHA256(perBootStreamKey, activeUdid)`, never the host-wide key. That capability is valid for both stream extensions of exactly one device and cannot reach configuration, accessibility, HID, control, or stream-status routes. The master secret remains header-only.
+
+Authenticated external AVCC requests terminate in a child-owned fanout. Its first viewer opens one same-process loopback request through a random internal header accepted only on the exact allowlisted AVCC path; the key is absent from the environment, handshake, logs, and DOM. Every healthy viewer receives the same immutable v2 record Buffer, sequence, and PTS. A blocked response is skipped without blocking capture and waits for decoder sync.
+
+Published `serve-sim` has no force-keyframe API, so a new viewer, drained slow viewer, invalid key tag, or configuration change coalesces an encoder restart. The old upstream closes before its replacement opens; the replacement creates a new native encoder and forced IDR. The fanout emits discontinuity, description, and a NAL-verified IDR under the new configuration generation before deltas resume. The last viewer destroys the upstream immediately. A master-header-only `/helper/<UDID>/stream-status` route reports viewer and encoder counts, generation, restart/drop counters, and last-packet age; only explicit capture and stream-status tool calls query it.
 
 ## Removed surface
 
@@ -45,5 +51,11 @@ Plugin HTTP `auth: "local"` is bb's frontend Origin/CSRF boundary, not a caller-
 - Unit tests prove the connection gate refuses N+1 and releases idempotently.
 - Plugin registration tests prove exposure RPC and CLI methods no longer exist and all HTTP routes remain `auth: "local"`.
 - Stream-source tests prove remote HTTPS viewers receive only proxied candidates.
+- Linux fake-upstream tests prove four AVCC viewers share one producer, isolate
+  backpressure, coalesce recovery, verify IDR ordering, and tear down on the
+  last close without importing the native dependency.
+- Security tests prove deny-before-allow-before-auth ordering, device-bound
+  capabilities, the exact internal AVCC branch, the global pixel cap, and the
+  master-only status route.
 - Source scans prove no production use of shared-port APIs and no wildcard/LAN listener.
 - The full test suite, TypeScript build, plugin build, package audit, package-content audit, and security scans run before completion.

@@ -66,6 +66,7 @@ import { coordinatesOnly, executeStep, type Step } from "./steps.js";
 import type { LiveStreamEvent } from "./hid.js";
 import { isUiOptionKey, uiOptions } from "./options.js";
 import { LiveStreamStatsStore } from "./live-stream-stats.js";
+import { deriveStreamCapability } from "./stream-token.js";
 import type { LiveStreamSample } from "./contract.js";
 
 export type LiveStateDto = LiveState & {
@@ -105,9 +106,10 @@ export function streamUrlFor(pluginId: string, state: LiveState): string | null 
  * plugin and the whole UI share. The bytes are identical; the hop was pure
  * copying.
  *
- * It carries `streamToken`, not the master secret, because an `<img>` cannot
- * set a header and this URL therefore lives in the DOM. The token opens the
- * MJPEG route and nothing else — no HID socket, no accessibility tree, no
+ * It carries a device-bound derivative of `streamToken`, not the master secret
+ * or the host-wide stream key, because an `<img>` cannot set a header and this
+ * URL therefore lives in the DOM. The capability opens both pixel codecs for
+ * this UDID and nothing else — no HID socket, accessibility tree, status, or
  * shutdown. See `authorize` in `sim-host.mjs`.
  *
  * `null` whenever the capture host is not up. The panel treats a non-null value
@@ -122,7 +124,10 @@ export function directStreamUrlFor(
   if (state.kind !== "streaming" && state.kind !== "waiting-frame" && state.kind !== "stalled") {
     return null;
   }
-  const params = new URLSearchParams({ k: address.streamToken, g: String(state.generation) });
+  const params = new URLSearchParams({
+    k: deriveStreamCapability(address.streamToken, state.device.udid),
+    g: String(state.generation),
+  });
   return `http://127.0.0.1:${address.port}/helper/${state.device.udid}/stream.mjpeg?${params.toString()}`;
 }
 

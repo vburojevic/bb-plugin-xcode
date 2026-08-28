@@ -51,7 +51,13 @@ The child wrapper:
 - 404s everything except the exact device routes the plugin uses and always
   denies `/exec`, `/exec-ws`, and DevTools routes;
 - accepts the master capability only in a private request header;
-- gives image URLs a separate query token that opens only MJPEG/AVCC streams;
+- derives a device-bound HMAC query capability for image URLs that opens only
+  that UDID's MJPEG/AVCC streams;
+- keeps AVCC sharing and its random loopback key inside the raw child, with the
+  private header accepted only by the exact allowlisted AVCC route;
+- caps all external pixel responses, across direct/proxied callers and both
+  codecs, at four;
+- exposes encoder counters only through a master-header-only status route;
 - bounds control bodies, JSON responses, headers, connections, frame sizes,
   and client-side reads;
 - scrubs any `execToken` from forwarded JSON as a second line of defence;
@@ -60,7 +66,7 @@ The child wrapper:
 - exits on parent stdin EOF, SIGTERM, or SIGINT, with a supervisor SIGKILL
   fallback.
 
-`serve-sim` is pinned exactly to `0.1.45`. Updating it requires re-running the
+`serve-sim` is pinned exactly to `0.1.46`. Updating it requires re-running the
 route-policy and response-scrubbing tests against the new middleware.
 
 ## Private simulator transport
@@ -74,12 +80,21 @@ reuse bb's server and do not open another listener or publish the capture host's
 loopback port.
 
 On the server host, a local HTTP bb panel may use the capture host directly via
-its stream-only per-boot token. An HTTPS or remote bb panel cannot reach that
-machine's loopback and automatically uses the same-origin `/stream` proxy. The
-proxy validates the active UDID and carries backpressure
-to the child. At most four proxy streams and four zero-byte presence responses
-may be open at once; excess requests receive `503`. Disconnect, cancellation,
-upstream error, device change, and failed-open paths all release their slot.
+a per-boot, per-device stream capability. An HTTPS or remote bb panel cannot
+reach that machine's loopback and automatically uses the same-origin `/stream`
+proxy. The proxy validates the active UDID and remains a byte-forwarder. The
+child admits at most four external pixel responses across direct and proxied
+callers and both codecs; the proxy also retains its independent four-stream
+gate. Excess requests receive `503`. Disconnect, cancellation, upstream error,
+device change, and failed-open paths all release their slot.
+
+AVCC viewers of one simulator share one same-process upstream encoder. A new or
+recovered viewer restarts that encoder because published `serve-sim` exposes no
+force-keyframe operation; the raw child emits an explicit discontinuity and
+does not resume deltas until it has verified the fresh description and IDR.
+Slow responses are skipped independently and cannot apply producer
+backpressure. Fanout counters are read only when a capture or stream-status
+tool is called, never by a background health timer.
 
 No plugin code calls `declareSharedPorts` or `ensureSharedPortTunnel`. Operators
 must not manually tunnel the capture port: loopback limits network reachability

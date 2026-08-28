@@ -8,6 +8,7 @@
 import { describe, expect, it } from "vitest";
 import { directStreamUrlFor, streamUrlFor } from "../../src/sim/rpc.js";
 import type { LiveState } from "../../src/sim/live.js";
+import { deriveStreamCapability } from "../../src/sim/stream-token.js";
 
 const UDID = "11111111-2222-3333-4444-555555555555";
 const MASTER = "master-secret-value-that-is-long-enough";
@@ -31,14 +32,27 @@ function state(over: Partial<LiveState> = {}): LiveState {
 const address = { port: 59505, streamToken: STREAM };
 
 describe("the direct stream URL", () => {
-  it("points at the capture host and carries only the stream token", () => {
+  it("points at the capture host and carries only the device-derived capability", () => {
     const url = directStreamUrlFor(state(), address);
     expect(url).toBe(
-      `http://127.0.0.1:59505/helper/${UDID}/stream.mjpeg?k=${STREAM}&g=3`,
+      `http://127.0.0.1:59505/helper/${UDID}/stream.mjpeg?k=e5wpLwpIEx4mQ3mbKr684ycqhYZVNpUnKkk5gox0Zfg&g=3`,
     );
     // The master secret also opens the HID socket. It must never be the thing
     // sitting in an <img src> in the DOM.
     expect(url).not.toContain(MASTER);
+    expect(url).not.toContain(STREAM);
+  });
+
+  it("binds one capability to one UDID while leaving both pixel codecs usable", () => {
+    const other = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+    const capability = deriveStreamCapability(STREAM, UDID);
+    expect(capability).toBe("e5wpLwpIEx4mQ3mbKr684ycqhYZVNpUnKkk5gox0Zfg");
+    expect(deriveStreamCapability(STREAM, other)).not.toBe(capability);
+
+    const mjpeg = directStreamUrlFor(state(), address)!;
+    const avcc = mjpeg.replace("stream.mjpeg", "stream.avcc");
+    expect(new URL(mjpeg).searchParams.get("k")).toBe(capability);
+    expect(new URL(avcc).searchParams.get("k")).toBe(capability);
   });
 
   it("does not exist when the capture host is down", () => {

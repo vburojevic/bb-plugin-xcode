@@ -26,7 +26,7 @@ function context(signal: AbortSignal = new AbortController().signal): PrivateRou
 function upstream(statusCode = 200): IncomingMessage {
   return Object.assign(new PassThrough(), {
     statusCode,
-    headers: { "content-type": "video/test" },
+    headers: { "content-type": "application/vnd.bb.sim-avcc;version=2" },
   }) as unknown as IncomingMessage;
 }
 
@@ -108,6 +108,9 @@ describe("the private stream route", () => {
     const responses = await Promise.all(Array.from({ length: 4 }, () => handler(context())));
 
     expect(responses.every((response) => response.status === 200)).toBe(true);
+    expect(responses.every(
+      (response) => response.headers.get("content-type") === "application/vnd.bb.sim-avcc;version=2",
+    )).toBe(true);
     expect((await handler(context())).status).toBe(503);
     expect(opened).toHaveLength(4);
 

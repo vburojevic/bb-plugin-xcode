@@ -7,6 +7,7 @@
  * to discover that nobody is watching a simulator.
  */
 import type { LiveStreamHealth, LiveStreamSample } from "./contract.js";
+import type { HostStreamStatus } from "./sim-host-client.js";
 
 export const LIVE_STREAM_STATS_TTL_MS = 15_000;
 export const LIVE_STREAM_STATS_FRESH_MS = 5_000;
@@ -142,4 +143,17 @@ export function formatStreamHealth(health: LiveStreamHealth): string {
     ? "excess viewer backlog unmeasured"
     : `${Math.round(health.excessLatencyMs)} ms excess viewer backlog`;
   return `Stream health (${health.status}): ${codec}/${health.route}/${health.qualityProfile}; ${pace}; ${excess}; ${health.sequenceGaps} gaps; ${health.resyncs} resyncs.`;
+}
+
+/**
+ * The child owns encoder truth; renderer telemetry cannot infer whether a
+ * reconnect created a second VideoToolbox session or merely a new consumer.
+ * Keep that evidence adjacent without blending their clocks or lifetimes.
+ */
+export function formatHostStreamStatus(status: HostStreamStatus | null): string {
+  if (status === null) return "Host fanout: unavailable.";
+  const viewers = `${status.viewers} ${status.viewers === 1 ? "viewer" : "viewers"}`;
+  const encoders = `${status.upstreamEncoders} upstream ${status.upstreamEncoders === 1 ? "encoder" : "encoders"}`;
+  const age = status.lastPacketAgeMs === null ? "last packet unavailable" : `last packet ${status.lastPacketAgeMs} ms ago`;
+  return `Host fanout: ${viewers}; ${encoders}; generation ${status.generation}; ${status.restarts} restarts; ${status.slowViewerDrops} slow-viewer drops; ${age}.`;
 }

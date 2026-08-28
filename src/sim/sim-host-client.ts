@@ -187,6 +187,52 @@ export function deviceConfig(address: SimHostAddress, udid: string): Promise<Dev
   });
 }
 
+export interface HostStreamStatus {
+  viewers: number;
+  upstreamEncoders: 0 | 1;
+  generation: number;
+  restarts: number;
+  slowViewerDrops: number;
+  lastPacketAgeMs: number | null;
+}
+
+function counter(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Read fanout counters on demand through the master-header-only route.
+ *
+ * This is deliberately a question, not a health poll. The raw child has no
+ * reason to wake merely so a dashboard can rediscover that nobody is watching;
+ * capture and status tools ask at the moment their evidence is requested.
+ */
+export async function streamStatus(address: SimHostAddress, udid: string): Promise<HostStreamStatus> {
+  const raw = await json<Record<string, unknown>>(address, {
+    method: "GET",
+    path: `/helper/${udid}/stream-status`,
+    timeoutMs: 5000,
+  });
+  if (
+    !counter(raw.viewers) ||
+    (raw.upstreamEncoders !== 0 && raw.upstreamEncoders !== 1) ||
+    !counter(raw.generation) ||
+    !counter(raw.restarts) ||
+    !counter(raw.slowViewerDrops) ||
+    (raw.lastPacketAgeMs !== null && !counter(raw.lastPacketAgeMs))
+  ) {
+    throw new SimHostError("The capture host returned malformed stream counters.", 200);
+  }
+  return {
+    viewers: raw.viewers,
+    upstreamEncoders: raw.upstreamEncoders,
+    generation: raw.generation,
+    restarts: raw.restarts,
+    slowViewerDrops: raw.slowViewerDrops,
+    lastPacketAgeMs: raw.lastPacketAgeMs,
+  };
+}
+
 export interface ForegroundApp {
   bundleId: string | null;
   pid: number | null;

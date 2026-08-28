@@ -25,9 +25,20 @@ import {
   SECRET_HEADER,
   secretMatches,
 } from "../../sim-host.mjs";
+import { deriveStreamCapability } from "../../src/sim/stream-token.js";
 
 const SECRET = "s".repeat(43);
 const UDID = "11111111-2222-3333-4444-555555555555";
+const INTERNAL_AVCC_HEADER = "x-xcode-simulators-internal-avcc";
+const AVCC_DESCRIPTION = Buffer.from([1, 100, 0, 51, 0xff, 0xe1, 0, 1, 0x67, 1, 0, 1, 0x68]);
+
+function v1Frame(kind: number, payload: Buffer): Buffer {
+  const frame = Buffer.allocUnsafe(5 + payload.byteLength);
+  frame.writeUInt32BE(1 + payload.byteLength, 0);
+  frame[4] = kind;
+  payload.copy(frame, 5);
+  return frame;
+}
 
 interface Harness {
   base: string;
@@ -53,7 +64,8 @@ async function start(
     setHeader: (name: string, value: string | number) => void;
     write: (b: unknown) => boolean;
     end: (b?: unknown) => void;
-  }) => void,
+  }, req: { url?: string; headers: Record<string, string | string[] | undefined> }) => void,
+  options: { internalKey?: string } = {},
 ): Promise<Harness> {
   const reached: string[] = [];
   const middleware = ((
@@ -67,7 +79,7 @@ async function start(
   ) => {
     reached.push(req.url ?? "");
     if (respond) {
-      respond(res);
+      respond(res, req as { url?: string; headers: Record<string, string | string[] | undefined> });
       return;
     }
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -81,7 +93,14 @@ async function start(
     socket.end("HTTP/1.1 101 Switching Protocols\r\n\r\n");
   };
 
-  const server = createFilteredServer(middleware, secret, () => {}, streamToken);
+  const create = createFilteredServer as unknown as (
+    injected: unknown,
+    master: string,
+    onError: (error: unknown) => void,
+    key: string | null,
+    rawOptions: { internalKey?: string },
+  ) => import("node:http").Server;
+  const server = create(middleware, secret, () => {}, streamToken, options);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   const harness: Harness = {
@@ -144,7 +163,7 @@ describe("the allow list", () => {
     expect(response.status).toBe(401);
   });
 
-  it("lets the seven routes through with the secret", async () => {
+  it("lets the seven middleware routes through with the secret", async () => {
     const harness = await start();
     const paths = [
       `/helper/${UDID}/stream.mjpeg`,
@@ -170,6 +189,31 @@ describe("the allow list", () => {
     expect(harness.reached).toHaveLength(7);
   });
 
+  it("keeps stream status master-header-only and outside serve-sim", async () => {
+    const streamKey = "v".repeat(43);
+    const harness = await start(SECRET, streamKey);
+    const capability = deriveStreamCapability(streamKey, UDID);
+
+    const anonymous = await fetch(`${harness.base}/helper/${UDID}/stream-status`);
+    const streamOnly = await fetch(`${harness.base}/helper/${UDID}/stream-status?k=${capability}`);
+    const master = await fetch(`${harness.base}/helper/${UDID}/stream-status`, {
+      headers: { [SECRET_HEADER]: SECRET },
+    });
+
+    expect(anonymous.status).toBe(401);
+    expect(streamOnly.status).toBe(401);
+    expect(master.status).toBe(200);
+    expect(await master.json()).toEqual({
+      viewers: 0,
+      upstreamEncoders: 0,
+      generation: 0,
+      restarts: 0,
+      slowViewerDrops: 0,
+      lastPacketAgeMs: null,
+    });
+    expect(harness.reached).toEqual([]);
+  });
+
   it("refuses a helper path whose UDID is not a UDID", () => {
     expect(isAllowed("GET", `/helper/${UDID}/config`)).toBe(true);
     expect(isAllowed("GET", "/helper/../../etc/passwd/config")).toBe(false);
@@ -185,12 +229,102 @@ describe("the allow list", () => {
     expect(response.status).toBe(401);
   });
 
-  it("accepts the separate stream token only on pixel routes", async () => {
-    const streamToken = "v".repeat(43);
-    const harness = await start(SECRET, streamToken);
-    expect((await fetch(`${harness.base}/helper/${UDID}/stream.mjpeg?k=${streamToken}`)).status).toBe(200);
-    expect((await fetch(`${harness.base}/helper/${UDID}/config?k=${streamToken}`)).status).toBe(401);
-    expect(harness.reached).toEqual([`/helper/${UDID}/stream.mjpeg?k=${streamToken}`]);
+  it("accepts a device-derived capability on both pixel codecs and nowhere else", async () => {
+    const streamKey = "v".repeat(43);
+    const capability = deriveStreamCapability(streamKey, UDID);
+    const other = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+    const harness = await start(SECRET, streamKey, (res, req) => {
+      if (req.url?.startsWith(`/helper/${UDID}/stream.avcc`)) {
+        res.writeHead(200, { "Content-Type": "application/octet-stream" });
+        const description = v1Frame(1, AVCC_DESCRIPTION);
+        const idr = v1Frame(2, Buffer.from([0, 0, 0, 2, 0x65, 0x88]));
+        res.write(Buffer.concat([description, idr]));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/octet-stream" });
+      res.end("pixel");
+    });
+    const mjpeg = await fetch(`${harness.base}/helper/${UDID}/stream.mjpeg?k=${capability}`);
+    const avccController = new AbortController();
+    const avcc = await fetch(`${harness.base}/helper/${UDID}/stream.avcc?k=${capability}`, {
+      signal: avccController.signal,
+    });
+
+    expect(mjpeg.status).toBe(200);
+    expect(avcc.status).toBe(200);
+    expect(avcc.headers.get("content-type")).toBe("application/vnd.bb.sim-avcc;version=2");
+    expect((await fetch(`${harness.base}/helper/${other}/stream.mjpeg?k=${capability}`)).status).toBe(401);
+    for (const path of [
+      `/helper/${UDID}/config`,
+      `/helper/${UDID}/health`,
+      `/helper/${UDID}/ax`,
+      `/helper/${UDID}/foreground`,
+      `/helper/${UDID}/stream-status`,
+    ]) {
+      expect((await fetch(`${harness.base}${path}?k=${capability}`)).status, path).toBe(401);
+    }
+    for (const path of ["/grid/api/start", "/grid/api/shutdown"]) {
+      expect((await fetch(`${harness.base}${path}?k=${capability}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ udid: UDID }),
+      })).status, path).toBe(401);
+    }
+    avccController.abort();
+  });
+
+  it("lets the private internal header reach only the exact AVCC middleware branch", async () => {
+    const internalKey = "internal-key-known-only-to-this-test";
+    const harness = await start(SECRET, null, (res) => {
+      res.writeHead(200, { "Content-Type": "application/octet-stream" });
+      res.end("internal");
+    }, { internalKey });
+    const headers = { [INTERNAL_AVCC_HEADER]: internalKey };
+
+    expect((await fetch(`${harness.base}/helper/${UDID}/stream.avcc`, { headers })).status).toBe(200);
+    expect((await fetch(`${harness.base}/helper/${UDID}/stream.mjpeg`, { headers })).status).toBe(401);
+    expect((await fetch(`${harness.base}/helper/${UDID}/config`, { headers })).status).toBe(401);
+    expect((await fetch(`${harness.base}/exec`, { headers })).status).toBe(404);
+    expect((await fetch(`${harness.base}/exec-ws`, { headers })).status).toBe(404);
+    expect((await fetch(`${harness.base}/devtools`, { headers })).status).toBe(404);
+    expect(harness.reached).toEqual([`/helper/${UDID}/stream.avcc`]);
+  });
+
+  it("caps direct and proxied pixel responses across both codecs at four", async () => {
+    const streamKey = "v".repeat(43);
+    const capability = deriveStreamCapability(streamKey, UDID);
+    const harness = await start(SECRET, streamKey, (res, req) => {
+      res.writeHead(200, { "Content-Type": "application/octet-stream" });
+      if (req.url?.startsWith(`/helper/${UDID}/stream.avcc`)) {
+        res.write(v1Frame(1, AVCC_DESCRIPTION));
+      } else {
+        res.write("pixel");
+      }
+    });
+    const controllers = Array.from({ length: 4 }, () => new AbortController());
+    const requests = [
+      fetch(`${harness.base}/helper/${UDID}/stream.avcc?k=${capability}`, { signal: controllers[0]!.signal }),
+      fetch(`${harness.base}/helper/${UDID}/stream.mjpeg?k=${capability}`, { signal: controllers[1]!.signal }),
+      fetch(`${harness.base}/helper/${UDID}/stream.mjpeg`, {
+        headers: { [SECRET_HEADER]: SECRET },
+        signal: controllers[2]!.signal,
+      }),
+      fetch(`${harness.base}/helper/${UDID}/stream.mjpeg`, {
+        headers: { [SECRET_HEADER]: SECRET },
+        signal: controllers[3]!.signal,
+      }),
+    ];
+    expect((await Promise.all(requests)).map((response) => response.status)).toEqual([200, 200, 200, 200]);
+    expect((await fetch(`${harness.base}/helper/${UDID}/stream.mjpeg?k=${capability}`)).status).toBe(503);
+
+    controllers[1]!.abort();
+    await new Promise((resolve) => setImmediate(resolve));
+    const replacement = new AbortController();
+    expect((await fetch(`${harness.base}/helper/${UDID}/stream.mjpeg?k=${capability}`, {
+      signal: replacement.signal,
+    })).status).toBe(200);
+    replacement.abort();
+    for (const controller of controllers) controller.abort();
   });
 
   it("bounds and types control request bodies before middleware", async () => {
@@ -338,14 +472,18 @@ describe("the websocket upgrade", () => {
     expect(harness.reached).toEqual([]);
   });
 
-  it("never accepts the master or stream token from a websocket query", async () => {
+  it("never accepts the master, root stream key, or derived capability from a websocket query", async () => {
     const streamToken = "v".repeat(43);
+    const capability = deriveStreamCapability(streamToken, UDID);
     const harness = await start(SECRET, streamToken);
     expect(
       await upgradeStatus(`${harness.base.replace("http", "ws")}/helper/${UDID}/ws?k=${SECRET}`),
     ).toBe(401);
     expect(
       await upgradeStatus(`${harness.base.replace("http", "ws")}/helper/${UDID}/ws?k=${streamToken}`),
+    ).toBe(401);
+    expect(
+      await upgradeStatus(`${harness.base.replace("http", "ws")}/helper/${UDID}/ws?k=${capability}`),
     ).toBe(401);
     expect(harness.reached).toEqual([]);
   });
@@ -382,16 +520,17 @@ describe("secret comparison", () => {
 });
 
 
-describe("the stream token", () => {
+describe("the stream capability", () => {
   const MASTER = "m".repeat(43);
   const STREAM = "s".repeat(43);
   const STREAM_PATH = `/helper/${UDID}/stream.mjpeg`;
+  const CAPABILITY = deriveStreamCapability(STREAM, UDID);
 
   it("opens the MJPEG route and refuses every other one", () => {
     // The whole reason it exists: this token travels in a query string, where
     // it lands in the DOM, so a URL that leaks must buy "watch" and not "drive".
     expect(
-      authorize({ path: STREAM_PATH, header: null, query: STREAM, secret: MASTER, streamToken: STREAM }),
+      authorize({ path: STREAM_PATH, header: null, query: CAPABILITY, secret: MASTER, streamToken: STREAM }),
     ).toBe(true);
 
     for (const path of [
@@ -402,7 +541,7 @@ describe("the stream token", () => {
       "/grid/api/shutdown",
     ]) {
       expect(
-        authorize({ path, header: null, query: STREAM, secret: MASTER, streamToken: STREAM }),
+        authorize({ path, header: null, query: CAPABILITY, secret: MASTER, streamToken: STREAM }),
         path,
       ).toBe(false);
     }

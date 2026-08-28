@@ -226,3 +226,353 @@ export function createMediaEnvelopeEncoder(options = {}) {
     },
   };
 }
+
+export const MEDIA_ENVELOPE_V2_CONTENT_TYPE = "application/vnd.bb.sim-avcc;version=2";
+const MAX_AVCC_NAL_UNITS = 256;
+
+function avccNalLengthSize(description) {
+  if (description.length < 7 || description[0] !== 1) return null;
+  const lengthSize = (description[4] & 0x03) + 1;
+  if (lengthSize === 3) return null;
+  const spsCount = description[5] & 0x1f;
+  if (spsCount === 0) return null;
+  let offset = 6;
+  const skip = (count, expectedType) => {
+    for (let index = 0; index < count; index += 1) {
+      if (offset + 2 > description.length) return false;
+      const length = description[offset] * 256 + description[offset + 1];
+      offset += 2;
+      if (length === 0 || length > description.length - offset) return false;
+      if ((description[offset] & 0x1f) !== expectedType) return false;
+      offset += length;
+    }
+    return true;
+  };
+  if (!skip(spsCount, 7) || offset >= description.length) return null;
+  const ppsCount = description[offset];
+  offset += 1;
+  if (ppsCount === 0 || !skip(ppsCount, 8)) return null;
+  return lengthSize;
+}
+
+function avccAccessUnitHasIdr(data, nalLengthSize) {
+  if (!Number.isInteger(nalLengthSize) || nalLengthSize < 1 || nalLengthSize > 4) return false;
+  let offset = 0;
+  let units = 0;
+  let found = false;
+  while (offset < data.length) {
+    if (units >= MAX_AVCC_NAL_UNITS || offset + nalLengthSize > data.length) return false;
+    units += 1;
+    let length = 0;
+    for (let index = 0; index < nalLengthSize; index += 1) {
+      length = length * 256 + data[offset + index];
+    }
+    offset += nalLengthSize;
+    if (length === 0 || length > data.length - offset) return false;
+    if ((data[offset] & 0x1f) === 5) found = true;
+    offset += length;
+  }
+  return found;
+}
+
+function immutableBuffer(bytes) {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
+function generationOf(packet) {
+  return packet.readUInt32BE(12);
+}
+
+function sameBuffer(left, right) {
+  return left.length === right.length && Buffer.compare(left, right) === 0;
+}
+
+/**
+ * One native encoder feeds every AVCC viewer of a simulator.
+ *
+ * The middleware's encoder callback awaits one response's drain, so sharing its
+ * subscription directly would let the slowest browser throttle capture for
+ * everybody. This fanout instead consumes one loopback upstream at full pace,
+ * hands the same immutable record Buffer to every writable response, and turns
+ * a slow response into an explicit decoder resync. Restarting is deliberately
+ * the only keyframe request: published serve-sim exposes no force-IDR API.
+ */
+export class SharedAvccFanout {
+  constructor(options) {
+    this.options = options;
+    this.sessions = new Map();
+  }
+
+  attach(udid, response) {
+    const state = this.stateFor(udid);
+    const viewer = {
+      response,
+      blocked: false,
+      waitingForSync: true,
+      closed: false,
+      onClose: null,
+      onDrain: null,
+    };
+    viewer.onClose = () => this.detach(state, viewer);
+    response.once("close", viewer.onClose);
+    response.once("error", viewer.onClose);
+    response.writeHead(200, {
+      "Content-Type": MEDIA_ENVELOPE_V2_CONTENT_TYPE,
+      "Cache-Control": "no-cache, no-store",
+      Connection: "keep-alive",
+      "X-Content-Type-Options": "nosniff",
+    });
+    state.viewers.add(viewer);
+
+    // Viewers mounted in one turn are one opening cohort. A genuinely later
+    // join restarts the encoder so it cannot begin on a delta frame.
+    if (state.upstream !== null || state.opening || state.generation > 0) {
+      this.request(state, "restart");
+    } else {
+      this.request(state, "start");
+    }
+  }
+
+  status(udid) {
+    const state = this.sessions.get(udid);
+    if (state === undefined) {
+      return {
+        viewers: 0,
+        upstreamEncoders: 0,
+        generation: 0,
+        restarts: 0,
+        slowViewerDrops: 0,
+        lastPacketAgeMs: null,
+      };
+    }
+    return {
+      viewers: state.viewers.size,
+      upstreamEncoders: state.upstream !== null || state.opening ? 1 : 0,
+      generation: state.generation,
+      restarts: state.restarts,
+      slowViewerDrops: state.slowViewerDrops,
+      lastPacketAgeMs:
+        state.lastPacketAt === null
+          ? null
+          : Math.max(0, (this.options.nowMs ?? Date.now)() - state.lastPacketAt),
+    };
+  }
+
+  stateFor(udid) {
+    const existing = this.sessions.get(udid);
+    if (existing !== undefined) return existing;
+    const state = {
+      udid,
+      viewers: new Set(),
+      upstream: null,
+      opening: false,
+      transition: Promise.resolve(),
+      scheduled: false,
+      requested: null,
+      restartPending: false,
+      drainRestartPending: false,
+      parser: createV1FrameParser(),
+      envelope: createMediaEnvelopeEncoder({ nowMicros: this.options.nowMicros }),
+      description: null,
+      nalLengthSize: null,
+      synced: false,
+      generation: 0,
+      restarts: 0,
+      slowViewerDrops: 0,
+      lastPacketAt: null,
+    };
+    this.sessions.set(udid, state);
+    return state;
+  }
+
+  request(state, action) {
+    if (action === "restart") {
+      if (state.restartPending) return;
+      state.restartPending = true;
+    }
+    if (action === "restart" || state.requested === null) state.requested = action;
+    if (state.scheduled) return;
+    state.scheduled = true;
+    queueMicrotask(() => {
+      state.scheduled = false;
+      const requested = state.requested;
+      state.requested = null;
+      if (requested === null) return;
+      state.transition = state.transition
+        .then(() => this.transition(state, requested === "restart"))
+        .catch((error) => this.fail(state, error));
+    });
+  }
+
+  async transition(state, restarting) {
+    if (state.viewers.size === 0) {
+      state.restartPending = false;
+      await this.closeUpstream(state);
+      return;
+    }
+    if (restarting) {
+      state.restarts += 1;
+      state.synced = false;
+      state.description = null;
+      state.nalLengthSize = null;
+      state.parser = createV1FrameParser();
+      const discontinuity = immutableBuffer(state.envelope.upstreamRestart());
+      state.generation = generationOf(discontinuity);
+      this.broadcast(state, discontinuity, MEDIA_KIND_DISCONTINUITY);
+      await this.closeUpstream(state);
+    } else if (state.upstream !== null || state.opening) {
+      return;
+    }
+    if (state.viewers.size === 0) return;
+
+    state.opening = true;
+    let upstream;
+    try {
+      upstream = await this.options.openUpstream(state.udid);
+    } finally {
+      state.opening = false;
+    }
+    if (state.viewers.size === 0) {
+      upstream.destroy();
+      return;
+    }
+    if (upstream.statusCode !== 200) {
+      upstream.destroy();
+      throw new SimHostStreamError(`AVCC upstream answered ${upstream.statusCode ?? 0}`);
+    }
+    state.upstream = upstream;
+    // Requests against this fresh encoder are a new recovery epoch. Repeated
+    // evidence from the old byte stream cannot queue a second transition.
+    state.restartPending = false;
+    upstream.on("data", (chunk) => this.consume(state, upstream, chunk));
+    const ended = () => {
+      if (state.upstream !== upstream) return;
+      state.upstream = null;
+      for (const viewer of [...state.viewers]) viewer.response.destroy();
+    };
+    upstream.once("end", ended);
+    upstream.once("error", ended);
+    upstream.once("close", ended);
+  }
+
+  consume(state, upstream, chunk) {
+    if (state.upstream !== upstream) return;
+    let frames;
+    try {
+      frames = state.parser.push(chunk);
+    } catch (error) {
+      this.request(state, "restart");
+      return;
+    }
+    for (const frame of frames) {
+      state.lastPacketAt = (this.options.nowMs ?? Date.now)();
+      if (frame.type === MEDIA_KIND_DESCRIPTION) {
+        const lengthSize = avccNalLengthSize(frame.data);
+        if (lengthSize === null) {
+          this.request(state, "restart");
+          continue;
+        }
+        if (state.description !== null && !sameBuffer(state.description, frame.data)) {
+          this.request(state, "restart");
+          continue;
+        }
+        state.description = Buffer.from(frame.data);
+        state.nalLengthSize = lengthSize;
+      } else if (frame.type === MEDIA_KIND_KEY) {
+        if (
+          state.nalLengthSize === null ||
+          !avccAccessUnitHasIdr(frame.data, state.nalLengthSize)
+        ) {
+          this.request(state, "restart");
+          continue;
+        }
+        state.synced = true;
+        state.drainRestartPending = false;
+      } else if (frame.type === MEDIA_KIND_DELTA && !state.synced) {
+        this.request(state, "restart");
+        continue;
+      }
+
+      const packet = immutableBuffer(state.envelope.encode({
+        kind: frame.type,
+        payload: frame.data,
+      }));
+      state.generation = generationOf(packet);
+      this.broadcast(state, packet, frame.type);
+    }
+  }
+
+  broadcast(state, packet, kind) {
+    for (const viewer of state.viewers) {
+      if (viewer.closed) continue;
+      if (viewer.blocked) {
+        state.slowViewerDrops += 1;
+        continue;
+      }
+      if (viewer.waitingForSync && kind === MEDIA_KIND_DELTA) continue;
+      let writable = false;
+      try {
+        writable = viewer.response.write(packet);
+      } catch {
+        this.detach(state, viewer);
+        continue;
+      }
+      if (writable && kind === MEDIA_KIND_KEY) viewer.waitingForSync = false;
+      if (writable) continue;
+      state.slowViewerDrops += 1;
+      viewer.blocked = true;
+      viewer.waitingForSync = true;
+      viewer.onDrain = () => {
+        viewer.onDrain = null;
+        if (viewer.closed) return;
+        viewer.blocked = false;
+        // Several slow viewers usually drain in different turns. They all
+        // missed the same sync point, so one replacement encoder repairs the
+        // cohort; another restart before its verified IDR is only churn.
+        if (!state.drainRestartPending) {
+          state.drainRestartPending = true;
+          this.request(state, "restart");
+        }
+      };
+      viewer.response.once("drain", viewer.onDrain);
+    }
+  }
+
+  detach(state, viewer) {
+    if (viewer.closed) return;
+    viewer.closed = true;
+    viewer.response.off("close", viewer.onClose);
+    viewer.response.off("error", viewer.onClose);
+    if (viewer.onDrain !== null) viewer.response.off("drain", viewer.onDrain);
+    state.viewers.delete(viewer);
+    if (state.viewers.size !== 0) return;
+    state.restartPending = false;
+    state.drainRestartPending = false;
+    // Last-viewer teardown is deliberately synchronous at the socket boundary;
+    // waiting for another transition would retain VideoToolbox work nobody can
+    // observe.
+    const upstream = state.upstream;
+    state.upstream = null;
+    upstream?.destroy();
+  }
+
+  async closeUpstream(state) {
+    const upstream = state.upstream;
+    state.upstream = null;
+    if (upstream === null || upstream.destroyed) return;
+    await new Promise((resolve) => {
+      upstream.once("close", resolve);
+      upstream.destroy();
+    });
+  }
+
+  fail(state, error) {
+    try {
+      this.options.onError?.(error);
+    } catch {
+      // Diagnostics cannot retain an upstream or a viewer.
+    }
+    void this.closeUpstream(state);
+    for (const viewer of [...state.viewers]) viewer.response.destroy();
+  }
+}

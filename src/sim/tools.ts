@@ -35,7 +35,7 @@ import { fitToBudget } from "./image.js";
 import { executeStep, MAX_STEPS, stepSchema, type ResolvePoint } from "./steps.js";
 import { describeMiss, findByLabel, flatten } from "./ax.js";
 import * as host from "./sim-host-client.js";
-import { formatStreamHealth, LiveStreamStatsStore } from "./live-stream-stats.js";
+import { formatHostStreamStatus, formatStreamHealth, LiveStreamStatsStore } from "./live-stream-stats.js";
 
 /**
  * MCP-style content parts, matching the host's own union exactly.
@@ -76,6 +76,7 @@ export const CAPTURE_INSTRUCTIONS = [
 export interface CaptureToolDeps {
   capture: typeof captureNow;
   encode: typeof encodeForModel;
+  status?: typeof host.streamStatus;
 }
 
 /**
@@ -126,10 +127,20 @@ function currentStreamHealth(ctx: Ctx, streamStats: LiveStreamStatsStore) {
   });
 }
 
+async function currentHostStreamStatus(ctx: Ctx, status: typeof host.streamStatus) {
+  const state = ctx.live.state();
+  // Tool dependencies are also used by recorder/import tests whose deliberately
+  // narrow live facade predates host addressing. No address means no child
+  // evidence, not a failed capture.
+  const address = typeof ctx.live.address === "function" ? ctx.live.address() : null;
+  if (state.device === null || address === null) return null;
+  return status(address, state.device.udid).catch(() => null);
+}
+
 export function makeCaptureTool(
   ctx: Ctx,
   streamStats = new LiveStreamStatsStore(),
-  deps: CaptureToolDeps = { capture: captureNow, encode: encodeForModel },
+  deps: CaptureToolDeps = { capture: captureNow, encode: encodeForModel, status: host.streamStatus },
 ) {
   return {
     name: "simulator_capture",
@@ -156,6 +167,7 @@ export function makeCaptureTool(
       try {
         const result = await deps.capture(ctx, args.label ?? null, args.settleMs);
         const image = await deps.encode(ctx, result.frameId);
+        const hostStatus = await currentHostStreamStatus(ctx, deps.status ?? host.streamStatus);
         // The text stands alone. If the image had to be dropped, the caller
         // still learns what happened and where to look.
         const captureText =
@@ -165,7 +177,8 @@ export function makeCaptureTool(
         // The durable JPEG came from the capture host independently of the
         // viewer canvas. Correlation belongs in text only: changing capture
         // bytes here would quietly turn pixel evidence into a stream grab.
-        const text = `${captureText} ${formatStreamHealth(currentStreamHealth(ctx, streamStats))}`;
+        const hostText = hostStatus === null ? "" : ` ${formatHostStreamStatus(hostStatus)}`;
+        const text = `${captureText} ${formatStreamHealth(currentStreamHealth(ctx, streamStats))}${hostText}`;
         const content: ToolContent[] = [{ type: "text", text }];
         if (image !== null) {
           content.push({ type: "image", data: image.data, mimeType: image.mimeType });
@@ -180,7 +193,15 @@ export function makeCaptureTool(
   };
 }
 
-export function makeStreamStatusTool(ctx: Ctx, streamStats = new LiveStreamStatsStore()) {
+export interface StreamStatusToolDeps {
+  status: typeof host.streamStatus;
+}
+
+export function makeStreamStatusTool(
+  ctx: Ctx,
+  streamStats = new LiveStreamStatsStore(),
+  deps: StreamStatusToolDeps = { status: host.streamStatus },
+) {
   return {
     name: "simulator_stream_status",
     description:
@@ -199,11 +220,12 @@ export function makeStreamStatusTool(ctx: Ctx, streamStats = new LiveStreamStats
         return textError("Simulator agent access is disabled in Xcode plugin settings.");
       }
       const health = currentStreamHealth(ctx, streamStats);
+      const hostStatus = await currentHostStreamStatus(ctx, deps.status);
       return {
         content: [
           {
             type: "text",
-            text: `${formatStreamHealth(health)}\n${JSON.stringify(health, null, 2)}`,
+            text: `${formatStreamHealth(health)} ${formatHostStreamStatus(hostStatus)}\n${JSON.stringify({ viewerHealth: health, host: hostStatus }, null, 2)}`,
           },
         ],
       };
