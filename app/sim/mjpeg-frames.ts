@@ -20,10 +20,11 @@
  * boundaries fall wherever the network puts them, and a parser that mishandles
  * a part split across two reads fails in a way that looks like a dead device.
  */
+import { BoundedByteQueue } from "./byte-queue";
 
 export interface MjpegPart {
   /** One whole JPEG, headers stripped. */
-  jpeg: Uint8Array;
+  jpeg: Uint8Array<ArrayBuffer>;
 }
 
 export interface MjpegParser {
@@ -46,70 +47,54 @@ export const MAX_PART_BYTES = 32 * 1024 * 1024;
 export class MjpegParseError extends Error {}
 
 const HEADER_END = [13, 10, 13, 10]; // \r\n\r\n
+const HEADER_END_BYTES = new Uint8Array(HEADER_END);
+const MAX_HEADER_BYTES = 64 * 1024;
 const CONTENT_LENGTH = /content-length:\s*(\d+)/i;
 const ASCII = new TextDecoder("ascii");
 
 export function createMjpegParser(): MjpegParser {
-  // One growing buffer rather than a list of chunks: parts are small and
-  // contiguous, and a subarray of a single buffer costs nothing to hand out.
-  let buffer: Uint8Array = new Uint8Array(0);
-
-  const append = (chunk: Uint8Array): void => {
-    if (buffer.length === 0) {
-      buffer = chunk;
-      return;
-    }
-    const next = new Uint8Array(buffer.length + chunk.length);
-    next.set(buffer, 0);
-    next.set(chunk, buffer.length);
-    buffer = next;
-  };
-
-  const indexOfHeaderEnd = (from: number): number => {
-    outer: for (let i = from; i + 3 < buffer.length; i += 1) {
-      for (let j = 0; j < 4; j += 1) {
-        if (buffer[i + j] !== HEADER_END[j]) continue outer;
-      }
-      return i;
-    }
-    return -1;
-  };
+  // The header allowance lets one network read contain the largest legal
+  // body plus its prefix while still making a delimiter-free stream finite.
+  const queue = new BoundedByteQueue(MAX_PART_BYTES + MAX_HEADER_BYTES);
+  let pendingBodyBytes: number | null = null;
 
   return {
     push(chunk: Uint8Array) {
-      append(chunk);
+      queue.push(chunk);
       const out: MjpegPart[] = [];
-      let offset = 0;
 
       for (;;) {
-        const headerEnd = indexOfHeaderEnd(offset);
-        if (headerEnd === -1) break;
-        const header = ASCII.decode(buffer.subarray(offset, headerEnd));
-        const length = CONTENT_LENGTH.exec(header);
-        if (length === null) {
-          // A header block with no length is not a part — it is the preamble,
-          // a boundary line, or garbage after one. Resync past it.
-          offset = headerEnd + 4;
-          continue;
+        if (pendingBodyBytes === null) {
+          const headerEnd = queue.indexOf(HEADER_END_BYTES);
+          if (headerEnd === -1) {
+            if (queue.bufferedBytes > MAX_HEADER_BYTES) {
+              throw new MjpegParseError("multipart header exceeds 64 KiB");
+            }
+            break;
+          }
+          const header = ASCII.decode(queue.take(headerEnd));
+          queue.discard(HEADER_END.length);
+          const length = CONTENT_LENGTH.exec(header);
+          if (length === null) {
+            // A header block with no length is not a part — it is the preamble,
+            // a boundary line, or garbage after one. Resync past it.
+            continue;
+          }
+          const bytes = Number.parseInt(length[1]!, 10);
+          if (!Number.isFinite(bytes) || bytes < 1 || bytes > MAX_PART_BYTES) {
+            throw new MjpegParseError(`part length ${length[1]} is not plausible`);
+          }
+          pendingBodyBytes = bytes;
         }
-        const bytes = Number.parseInt(length[1]!, 10);
-        if (!Number.isFinite(bytes) || bytes < 1 || bytes > MAX_PART_BYTES) {
-          throw new MjpegParseError(`part length ${length[1]} is not plausible`);
-        }
-        const bodyStart = headerEnd + 4;
-        if (buffer.length - bodyStart < bytes) break;
-        out.push({ jpeg: buffer.subarray(bodyStart, bodyStart + bytes) });
-        offset = bodyStart + bytes;
+        if (queue.bufferedBytes < pendingBodyBytes) break;
+        out.push({ jpeg: queue.take(pendingBodyBytes) });
+        pendingBodyBytes = null;
       }
 
-      // Copy rather than subarray: the tail is retained across pushes, and a
-      // subarray would pin the whole previous buffer — including every part
-      // just handed out — alive with it.
-      buffer = offset === 0 ? buffer : buffer.slice(offset);
       return out;
     },
     pending() {
-      return buffer.length;
+      return queue.bufferedBytes;
     },
   };
 }

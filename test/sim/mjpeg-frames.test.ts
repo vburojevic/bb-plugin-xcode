@@ -56,6 +56,39 @@ describe("the MJPEG parser", () => {
     expect([...parts[0]!.jpeg]).toEqual([...JPEG_A]);
   });
 
+  it("returns byte-identical parts under deterministic randomized chunking", () => {
+    const whole = concat(part(JPEG_A), part(JPEG_B), part(JPEG_A));
+    const parser = createMjpegParser();
+    const parts = [];
+    let state = 23;
+    for (let offset = 0; offset < whole.length; ) {
+      state = (state * 16807) % 0x7fffffff;
+      const size = 1 + (state % 17);
+      parts.push(...parser.push(whole.subarray(offset, Math.min(whole.length, offset + size))));
+      offset += size;
+    }
+
+    expect(parts.map(({ jpeg }) => [...jpeg])).toEqual([[...JPEG_A], [...JPEG_B], [...JPEG_A]]);
+    expect(parser.pending()).toBe(2);
+  });
+
+  it("transfers a contiguous JPEG and owns one split across chunks", () => {
+    const contiguousWire = part(JPEG_A);
+    const [contiguous] = createMjpegParser().push(contiguousWire);
+    expect(contiguous!.jpeg.buffer).toBe(contiguousWire.buffer);
+
+    const splitWire = part(JPEG_B);
+    const bodyStart = splitWire.length - JPEG_B.length - 2;
+    const left = splitWire.slice(0, bodyStart + 4);
+    const right = splitWire.slice(bodyStart + 4);
+    const parser = createMjpegParser();
+    parser.push(left);
+    const [split] = parser.push(right);
+    expect([...split!.jpeg]).toEqual([...JPEG_B]);
+    expect(split!.jpeg.buffer).not.toBe(left.buffer);
+    expect(split!.jpeg.buffer).not.toBe(right.buffer);
+  });
+
   it("reads several parts from one chunk", () => {
     const parser = createMjpegParser();
     const parts = parser.push(concat(part(JPEG_A), part(JPEG_B), part(JPEG_A)));

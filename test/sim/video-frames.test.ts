@@ -76,6 +76,48 @@ describe("the frame parser", () => {
     }
   });
 
+  it("returns byte-identical frames under deterministic randomized chunking", () => {
+    const whole = concat(
+      frame(FRAME_JPEG, [0xff, 0xd8, 0xff, 0xe0]),
+      frame(FRAME_DESCRIPTION, [1, 100, 0, 51]),
+      frame(FRAME_KEY, Array.from({ length: 257 }, (_, index) => index & 0xff)),
+      frame(FRAME_DELTA, [7, 8, 9]),
+    );
+    let state = 0x6d2b79f5;
+    const parser = createFrameParser();
+    const parsed = [];
+    for (let offset = 0; offset < whole.length; ) {
+      state = Math.imul(state ^ (state >>> 15), 1 | state);
+      const size = 1 + ((state >>> 0) % 23);
+      parsed.push(...parser.push(whole.subarray(offset, Math.min(whole.length, offset + size))));
+      offset += size;
+    }
+
+    expect(parsed.map(({ type, data }) => [type, [...data]])).toEqual([
+      [FRAME_JPEG, [0xff, 0xd8, 0xff, 0xe0]],
+      [FRAME_DESCRIPTION, [1, 100, 0, 51]],
+      [FRAME_KEY, Array.from({ length: 257 }, (_, index) => index & 0xff)],
+      [FRAME_DELTA, [7, 8, 9]],
+    ]);
+    expect(parser.pending()).toBe(0);
+  });
+
+  it("transfers contiguous payload ownership and copies only split payloads", () => {
+    const contiguousWire = frame(FRAME_KEY, [1, 2, 3]);
+    const [contiguous] = createFrameParser().push(contiguousWire);
+    expect(contiguous!.data.buffer).toBe(contiguousWire.buffer);
+
+    const splitWire = frame(FRAME_KEY, [4, 5, 6, 7]);
+    const left = splitWire.slice(0, 7);
+    const right = splitWire.slice(7);
+    const parser = createFrameParser();
+    parser.push(left);
+    const [split] = parser.push(right);
+    expect([...split!.data]).toEqual([4, 5, 6, 7]);
+    expect(split!.data.buffer).not.toBe(left.buffer);
+    expect(split!.data.buffer).not.toBe(right.buffer);
+  });
+
   it("holds a partial header without inventing a frame", () => {
     const parser = createFrameParser();
     // Four bytes is a complete length and still not a complete header.

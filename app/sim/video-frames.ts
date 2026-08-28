@@ -25,6 +25,7 @@
  * that mishandles a frame split across two reads fails in a way that looks like
  * a codec problem.
  */
+import { BoundedByteQueue } from "./byte-queue";
 
 export const FRAME_DESCRIPTION = 0x01;
 export const FRAME_KEY = 0x02;
@@ -43,7 +44,7 @@ export function isFrameType(type: number): type is FrameType {
 
 export interface StreamFrame {
   type: FrameType;
-  data: Uint8Array;
+  data: Uint8Array<ArrayBuffer>;
 }
 
 /**
@@ -66,55 +67,37 @@ export interface FrameParser {
 }
 
 export function createFrameParser(): FrameParser {
-  // One growing buffer rather than a list of chunks: frames are small and
-  // contiguous, and a subarray of a single buffer costs nothing to hand out.
-  let buffer: Uint8Array = new Uint8Array(0);
-
-  const append = (chunk: Uint8Array): void => {
-    if (buffer.length === 0) {
-      buffer = chunk;
-      return;
-    }
-    const next = new Uint8Array(buffer.length + chunk.length);
-    next.set(buffer, 0);
-    next.set(chunk, buffer.length);
-    buffer = next;
-  };
+  // Four prefix bytes may sit beside the largest legal record. The queue
+  // takes ownership of stream chunks; a returned view is therefore stable
+  // even when a later push advances the deque into the same allocation.
+  const queue = new BoundedByteQueue(MAX_FRAME_BYTES + 4);
 
   return {
     push(chunk: Uint8Array) {
-      append(chunk);
+      queue.push(chunk);
       const out: StreamFrame[] = [];
-      let offset = 0;
 
       for (;;) {
-        if (buffer.length - offset < 5) break;
-        const view = new DataView(buffer.buffer, buffer.byteOffset + offset, 5);
-        const length = view.getUint32(0, false);
+        if (queue.bufferedBytes < 4) break;
+        const length = queue.readUint32BE(0);
         if (length < 1 || length > MAX_FRAME_BYTES) {
           throw new FrameParseError(`frame length ${length} is not plausible`);
         }
-        const type = buffer[offset + 4]!;
+        if (queue.bufferedBytes < 5) break;
+        const type = queue.byteAt(4);
         if (!isFrameType(type)) {
           throw new FrameParseError(`frame kind ${type} is not supported`);
         }
         // `length` counts the type byte, so the payload is one shorter.
-        if (buffer.length - offset < 4 + length) break;
-        out.push({
-          type,
-          data: buffer.subarray(offset + 5, offset + 4 + length),
-        });
-        offset += 4 + length;
+        if (queue.bufferedBytes < 4 + length) break;
+        queue.discard(5);
+        out.push({ type, data: queue.take(length - 1) });
       }
 
-      // Copy rather than subarray: the tail is retained across pushes, and a
-      // subarray would pin the whole previous buffer — including every frame
-      // just handed out — alive with it.
-      buffer = offset === 0 ? buffer : buffer.slice(offset);
       return out;
     },
     pending() {
-      return buffer.length;
+      return queue.bufferedBytes;
     },
   };
 }

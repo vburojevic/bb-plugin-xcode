@@ -17,6 +17,7 @@ import {
   MAX_FRAME_BYTES,
   type FrameType,
 } from "./video-frames";
+import { BoundedByteQueue } from "./byte-queue";
 
 export const MEDIA_ENVELOPE_V2_CONTENT_TYPE = "application/vnd.bb.sim-avcc;version=2";
 export const MEDIA_ENVELOPE_V2_VERSION = 2;
@@ -35,7 +36,7 @@ export interface VideoEnvelopeRecord {
   codedWidth: number | null;
   codedHeight: number | null;
   orientation: number | null;
-  data: Uint8Array;
+  data: Uint8Array<ArrayBuffer>;
 }
 
 export interface VideoEnvelopeParser {
@@ -94,14 +95,6 @@ function isV2Kind(kind: number): kind is VideoEnvelopeKind {
   return kind >= FRAME_DESCRIPTION && kind <= FRAME_DISCONTINUITY;
 }
 
-function appendBytes(buffer: Uint8Array, chunk: Uint8Array): Uint8Array {
-  if (buffer.length === 0) return chunk;
-  const next = new Uint8Array(buffer.length + chunk.length);
-  next.set(buffer, 0);
-  next.set(chunk, buffer.length);
-  return next;
-}
-
 function createV1EnvelopeParser(): VideoEnvelopeParser {
   const parser = createFrameParser();
   return {
@@ -124,64 +117,58 @@ function createV1EnvelopeParser(): VideoEnvelopeParser {
 }
 
 function createV2EnvelopeParser(): VideoEnvelopeParser {
-  let buffer: Uint8Array = new Uint8Array(0);
+  const queue = new BoundedByteQueue(MAX_FRAME_BYTES + 4);
   return {
     push(chunk) {
-      buffer = appendBytes(buffer, chunk);
+      queue.push(chunk);
       const records: VideoEnvelopeRecord[] = [];
-      let offset = 0;
 
       for (;;) {
-        if (buffer.length - offset < 4) break;
-        const prefix = new DataView(buffer.buffer, buffer.byteOffset + offset, 4);
-        const length = prefix.getUint32(0, false);
+        if (queue.bufferedBytes < 4) break;
+        const length = queue.readUint32BE(0);
         if (length < MEDIA_ENVELOPE_V2_HEADER_BYTES || length > MAX_FRAME_BYTES) {
           throw new VideoEnvelopeParseError(`frame length ${length} is not plausible`);
         }
-        if (buffer.length - offset < 6) break;
-        const version = buffer[offset + 4]!;
-        const kind = buffer[offset + 5]!;
+        if (queue.bufferedBytes < 6) break;
+        const version = queue.byteAt(4);
+        const kind = queue.byteAt(5);
         if (version !== MEDIA_ENVELOPE_V2_VERSION) {
           throw new VideoEnvelopeParseError(`frame version ${version} is not supported`);
         }
         if (!isV2Kind(kind)) {
           throw new VideoEnvelopeParseError(`frame kind ${kind} is not supported`);
         }
-        if (buffer.length - offset < 4 + length) break;
+        if (queue.bufferedBytes < 4 + length) break;
 
-        const view = new DataView(
-          buffer.buffer,
-          buffer.byteOffset + offset,
-          4 + MEDIA_ENVELOPE_V2_HEADER_BYTES,
-        );
-        if (view.getUint8(29) !== 0 || view.getUint8(30) !== 0 || view.getUint8(31) !== 0) {
+        if (queue.byteAt(29) !== 0 || queue.byteAt(30) !== 0 || queue.byteAt(31) !== 0) {
           throw new VideoEnvelopeParseError("frame reserved bytes are not zero");
         }
+        const flags = queue.readUint16BE(6);
+        const sequence = queue.readUint32BE(8);
+        const configGeneration = queue.readUint32BE(12);
+        const ptsMicros = queue.readBigUint64BE(16);
+        const codedWidth = queue.readUint16BE(24);
+        const codedHeight = queue.readUint16BE(26);
+        const orientation = queue.byteAt(28);
+        queue.discard(4 + MEDIA_ENVELOPE_V2_HEADER_BYTES);
         records.push({
           version: 2,
           kind,
-          flags: view.getUint16(6, false),
-          sequence: view.getUint32(8, false),
-          configGeneration: view.getUint32(12, false),
-          ptsMicros: view.getBigUint64(16, false),
-          codedWidth: view.getUint16(24, false),
-          codedHeight: view.getUint16(26, false),
-          orientation: view.getUint8(28),
-          data: buffer.subarray(
-            offset + 4 + MEDIA_ENVELOPE_V2_HEADER_BYTES,
-            offset + 4 + length,
-          ),
+          flags,
+          sequence,
+          configGeneration,
+          ptsMicros,
+          codedWidth,
+          codedHeight,
+          orientation,
+          data: queue.take(length - MEDIA_ENVELOPE_V2_HEADER_BYTES),
         });
-        offset += 4 + length;
       }
 
-      // A copy keeps a partial next header without retaining the completed
-      // payloads it followed. Returned payload views keep the old allocation.
-      buffer = offset === 0 ? buffer : buffer.slice(offset);
       return records;
     },
     pending() {
-      return buffer.length;
+      return queue.bufferedBytes;
     },
   };
 }

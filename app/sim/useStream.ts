@@ -30,6 +30,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { createMjpegParser } from "./mjpeg-frames";
+import { MjpegAdmission, pullMjpegFrames } from "./mjpeg-admission";
 import {
   DecoderGeneration,
   shouldDropToKeyframe,
@@ -194,33 +195,41 @@ export function useStream(
 
     /** A JPEG, through the ordered bitmap path. Shared by MJPEG parts and the
      * H.264 stream's bootstrap frame. */
-    let pendingBitmaps = 0;
-    const paintJpeg = (data: Uint8Array, packet: PacketEvent): void => {
-      // Whole frames, dropped when the bitmap decoder can't keep up. Every
-      // JPEG on either path is independently decodable, so losing one under
-      // load costs a frame, not the stream — and an unbounded queue of pending
-      // decodes is the same leak the H.264 backpressure exists to prevent.
-      if (pendingBitmaps >= 4) return;
-      pendingBitmaps += 1;
+    const decodeJpeg = async (
+      data: Uint8Array<ArrayBuffer>,
+      packet: PacketEvent,
+    ): Promise<void> => {
       const seq = ++paintSeq;
       const surfaceId = frameFingerprint(data);
-      // Copied: `createImageBitmap` is async and the parser's buffer is
-      // reused the moment this loop continues.
-      const blob = new Blob([data.slice()], { type: "image/jpeg" });
-      void createImageBitmap(blob)
-        .then((bitmap) => {
-          pendingBitmaps -= 1;
-          if (disposed || seq !== paintSeq) {
-            // Stale before it resolved: a newer frame already owns the canvas.
-            bitmap.close();
-            return;
-          }
-          paint(bitmap, bitmap.width, bitmap.height, packet, surfaceId);
-          bitmap.close();
-        })
-        .catch(() => {
-          pendingBitmaps -= 1;
-          // One undecodable frame is not fatal; the ones behind it are the point.
+      // The parser transfers an immutable payload view: Blob/WebCodecs may
+      // still copy internally, but another plugin-owned `slice()` here only
+      // duplicates the exact allocation the chunk deque already made when a
+      // frame crossed network chunks.
+      const bitmap = await createImageBitmap(new Blob([data], { type: "image/jpeg" }));
+      try {
+        if (disposed || seq !== paintSeq) return;
+        paint(bitmap, bitmap.width, bitmap.height, packet, surfaceId);
+      } finally {
+        // A stale sequence and an unmounted canvas own exactly the same GPU
+        // cleanup obligation as a painted bitmap.
+        bitmap.close();
+      }
+    };
+
+    // The H.264 bootstrap is not part of MJPEG pressure accounting. Keeping
+    // its small independent guard means fallback saturation cannot weaken the
+    // instant first paint or delay decoder configuration.
+    let pendingBootstrapBitmaps = 0;
+    const paintBootstrapJpeg = (
+      data: Uint8Array<ArrayBuffer>,
+      packet: PacketEvent,
+    ): void => {
+      if (pendingBootstrapBitmaps >= 4) return;
+      pendingBootstrapBitmaps += 1;
+      void decodeJpeg(data, packet)
+        .catch(() => {})
+        .finally(() => {
+          pendingBootstrapBitmaps -= 1;
         });
     };
 
@@ -377,9 +386,9 @@ export function useStream(
             case FRAME_JPEG:
               // The instant first paint, before the decoder is configured.
               {
-                const packet = evidenceFor(frame, arrivedAtMs, pendingBitmaps + 1);
+                const packet = evidenceFor(frame, arrivedAtMs, pendingBootstrapBitmaps + 1);
                 publishH264Packet(packet);
-                paintJpeg(frame.data, packet);
+                paintBootstrapJpeg(frame.data, packet);
               }
               break;
             case FRAME_DESCRIPTION: {
@@ -417,7 +426,7 @@ export function useStream(
                   new EncodedVideoChunk({
                     type: "key",
                     timestamp: packet.timestampMicros,
-                    data: frame.data.slice(),
+                    data: frame.data,
                   }),
                 );
               } catch {
@@ -453,7 +462,7 @@ export function useStream(
                   new EncodedVideoChunk({
                     type: "delta",
                     timestamp: packet.timestampMicros,
-                    data: frame.data.slice(),
+                    data: frame.data,
                   }),
                 );
               } catch {
@@ -473,27 +482,31 @@ export function useStream(
 
     const runMjpeg = async (reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> => {
       const parser = createMjpegParser();
+      const admission = new MjpegAdmission(abort.signal);
       let firstArrival: number | null = null;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done || disposed) return;
-        if (value === undefined) continue;
-        const arrivedAtMs = performance.now();
-        firstArrival ??= arrivedAtMs;
-        for (const part of parser.push(value)) {
+      await pullMjpegFrames({
+        reader,
+        admission,
+        parse: (chunk) => {
+          const arrivedAtMs = performance.now();
+          firstArrival ??= arrivedAtMs;
+          return parser.push(chunk).map((part) => ({ part, arrivedAtMs }));
+        },
+        decode: async ({ part, arrivedAtMs }, decoderQueue) => {
           if (disposed) return;
           frameIndex += 1;
           const packet = {
             sequence: frameIndex,
-            sourcePtsMs: arrivedAtMs - firstArrival,
+            sourcePtsMs: arrivedAtMs - firstArrival!,
             arrivedAtMs,
             bytes: part.jpeg.byteLength,
-            decoderQueue: pendingBitmaps + 1,
+            decoderQueue,
           };
           publish(tracker.packet(packet), false);
-          paintJpeg(part.jpeg, packet);
-        }
-      }
+          await decodeJpeg(part.jpeg, packet);
+        },
+        dropped: (count) => publish(tracker.statelessDrops(count), false),
+      });
     };
 
     const run = async (): Promise<void> => {

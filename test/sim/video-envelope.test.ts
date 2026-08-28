@@ -65,8 +65,45 @@ describe("the v2 media envelope", () => {
       const parser = createVideoEnvelopeParser(MEDIA_ENVELOPE_V2_CONTENT_TYPE);
       const parsed = [...parser.push(wire.subarray(0, cut)), ...parser.push(wire.subarray(cut))];
       expect(parsed.map((record) => record.kind), `cut at ${cut}`).toEqual([4, 1, 2, 3, 5]);
+      expect(parsed.map((record) => [...record.data]), `payloads at ${cut}`).toEqual(
+        records.map((record) => [...record.subarray(32)]),
+      );
       expect(parser.pending(), `cut at ${cut}`).toBe(0);
     }
+  });
+
+  it("returns byte-identical v2 records under deterministic randomized chunking", () => {
+    let state = 0x9e3779b9;
+    const parser = createVideoEnvelopeParser(MEDIA_ENVELOPE_V2_CONTENT_TYPE);
+    const parsed = [];
+    for (let offset = 0; offset < wire.length; ) {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      const size = 1 + ((state >>> 0) % 19);
+      parsed.push(...parser.push(wire.subarray(offset, Math.min(wire.length, offset + size))));
+      offset += size;
+    }
+
+    expect(parsed.map((record) => [...record.data])).toEqual(
+      records.map((record) => [...record.subarray(32)]),
+    );
+    expect(parser.pending()).toBe(0);
+  });
+
+  it("transfers a contiguous v2 payload and owns a payload split across chunks", () => {
+    const record = raw.encodeV2Record({ kind: 2, payload: new Uint8Array([1, 2, 3, 4]) });
+    const [contiguous] = createVideoEnvelopeParser(MEDIA_ENVELOPE_V2_CONTENT_TYPE).push(record);
+    expect(contiguous!.data.buffer).toBe(record.buffer);
+
+    const left = record.slice(0, 34);
+    const right = record.slice(34);
+    const parser = createVideoEnvelopeParser(MEDIA_ENVELOPE_V2_CONTENT_TYPE);
+    parser.push(left);
+    const [split] = parser.push(right);
+    expect([...split!.data]).toEqual([1, 2, 3, 4]);
+    expect(split!.data.buffer).not.toBe(left.buffer);
+    expect(split!.data.buffer).not.toBe(right.buffer);
   });
 
   it("returns multiple records per chunk without losing u64 PTS, generation, or geometry", () => {
@@ -204,6 +241,30 @@ describe("media type compatibility", () => {
       timestampMicros: 233_331,
       sourcePtsMs: 233.331,
     });
+  });
+
+  it("keeps v1 byte-identical under deterministic randomized chunking", () => {
+    const wire = concat(
+      v1Frame(4, [0xff, 0xd8]),
+      v1Frame(1, [1, 100, 0, 51]),
+      v1Frame(2, Array.from({ length: 131 }, (_, index) => index & 0xff)),
+    );
+    const parser = createVideoEnvelopeParser("application/octet-stream");
+    const parsed = [];
+    let state = 17;
+    for (let offset = 0; offset < wire.length; ) {
+      state = (state * 48271) % 0x7fffffff;
+      const size = 1 + (state % 11);
+      parsed.push(...parser.push(wire.subarray(offset, Math.min(wire.length, offset + size))));
+      offset += size;
+    }
+
+    expect(parsed.map((record) => [...record.data])).toEqual([
+      [0xff, 0xd8],
+      [1, 100, 0, 51],
+      Array.from({ length: 131 }, (_, index) => index & 0xff),
+    ]);
+    expect(parser.pending()).toBe(0);
   });
 
   it("refuses to guess a framing protocol from an unknown media type", () => {

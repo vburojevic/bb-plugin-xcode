@@ -193,6 +193,19 @@ export class StreamTelemetry {
     };
   }
 
+  /** Independent JPEGs need no decoder reset, but skipped burst members are
+   * still source frames the renderer chose not to present. Reuse the existing
+   * gap field so `simulator_stream_status` reports pressure loss without
+   * pretending the stateless fallback performed an H.264 resync. */
+  statelessDrops(count: number, sampledAt = Date.now()): TelemetryUpdate {
+    const dropped = Math.max(0, Math.trunc(count));
+    this.sequenceGaps += dropped;
+    return {
+      sample: this.snapshot(sampledAt),
+      reason: dropped > 0 ? "gap" : null,
+    };
+  }
+
   paint(event: PaintEvent, sampledAt = event.paintedAtUnixMs): TelemetryUpdate {
     this.paints += 1;
     this.state = "live";
