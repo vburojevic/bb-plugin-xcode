@@ -35,6 +35,7 @@ import { fitToBudget } from "./image.js";
 import { executeStep, MAX_STEPS, stepSchema, type ResolvePoint } from "./steps.js";
 import { describeMiss, findByLabel, flatten } from "./ax.js";
 import * as host from "./sim-host-client.js";
+import { formatStreamHealth, LiveStreamStatsStore } from "./live-stream-stats.js";
 
 /**
  * MCP-style content parts, matching the host's own union exactly.
@@ -71,6 +72,11 @@ export const CAPTURE_INSTRUCTIONS = [
   "Call this instead of describing the screen in prose. Never claim a screen 'looks correct' without a frame.",
   "The simulator is shared: if a call reports another thread is driving it, wait rather than retrying.",
 ].join(" ");
+
+export interface CaptureToolDeps {
+  capture: typeof captureNow;
+  encode: typeof encodeForModel;
+}
 
 /**
  * Downscale a stored frame for a model, into a temporary file.
@@ -112,7 +118,19 @@ export async function encodeForModel(
   }
 }
 
-export function makeCaptureTool(ctx: Ctx) {
+function currentStreamHealth(ctx: Ctx, streamStats: LiveStreamStatsStore) {
+  const state = ctx.live.state();
+  return streamStats.read({
+    ...(state.device === null ? {} : { deviceUdid: state.device.udid }),
+    hostGeneration: state.generation,
+  });
+}
+
+export function makeCaptureTool(
+  ctx: Ctx,
+  streamStats = new LiveStreamStatsStore(),
+  deps: CaptureToolDeps = { capture: captureNow, encode: encodeForModel },
+) {
   return {
     name: "simulator_capture",
     description:
@@ -136,14 +154,18 @@ export function makeCaptureTool(ctx: Ctx) {
       if (!lease.ok) return textError(lease.reason);
 
       try {
-        const result = await captureNow(ctx, args.label ?? null, args.settleMs);
-        const image = await encodeForModel(ctx, result.frameId);
+        const result = await deps.capture(ctx, args.label ?? null, args.settleMs);
+        const image = await deps.encode(ctx, result.frameId);
         // The text stands alone. If the image had to be dropped, the caller
         // still learns what happened and where to look.
-        const text =
+        const captureText =
           image === null
             ? `${result.summary} The frame was saved but could not be downscaled for this reply — open the Xcode panel to see it.`
             : result.summary;
+        // The durable JPEG came from the capture host independently of the
+        // viewer canvas. Correlation belongs in text only: changing capture
+        // bytes here would quietly turn pixel evidence into a stream grab.
+        const text = `${captureText} ${formatStreamHealth(currentStreamHealth(ctx, streamStats))}`;
         const content: ToolContent[] = [{ type: "text", text }];
         if (image !== null) {
           content.push({ type: "image", data: image.data, mimeType: image.mimeType });
@@ -154,6 +176,37 @@ export function makeCaptureTool(ctx: Ctx) {
       } finally {
         lease.release();
       }
+    },
+  };
+}
+
+export function makeStreamStatusTool(ctx: Ctx, streamStats = new LiveStreamStatsStore()) {
+  return {
+    name: "simulator_stream_status",
+    description:
+      "Inspect current iOS simulator stream transport and decode health, including every active viewer.",
+    instructions:
+      "Treat sourceFps as approximate because v1 AVCC supplies synthetic cadence. Use excessLatencyMs only as approximate queue/decode/presentation backlog above this viewer's best observed clock offset; it is never absolute end-to-end latency.",
+    presentation: {
+      label: {
+        pending: "Inspecting simulator stream health",
+        completed: "Inspected simulator stream health",
+      },
+    },
+    parameters: z.object({}),
+    async execute(): Promise<ToolResult> {
+      if (!ctx.settings().allowAgentCapture) {
+        return textError("Simulator agent access is disabled in Xcode plugin settings.");
+      }
+      const health = currentStreamHealth(ctx, streamStats);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${formatStreamHealth(health)}\n${JSON.stringify(health, null, 2)}`,
+          },
+        ],
+      };
     },
   };
 }

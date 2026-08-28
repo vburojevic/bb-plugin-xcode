@@ -44,7 +44,14 @@ import { detectProject, findCandidates, shapeOf } from "./onboard.js";
 import { DetectCache } from "./detect-cache.js";
 import { deviceKey } from "./model.js";
 import { findDeviceByNameOrUdid, pickDefaultDevice } from "./devices.js";
-import { GLOBAL_INSTRUCTIONS, makeCaptureTool, makeDriveTool, makeStillsTool } from "./tools.js";
+import {
+  GLOBAL_INSTRUCTIONS,
+  makeCaptureTool,
+  makeDriveTool,
+  makeStillsTool,
+  makeStreamStatusTool,
+} from "./tools.js";
+import { LiveStreamStatsStore } from "./live-stream-stats.js";
 import { applyPrune, planPrune, sweepLegacyStillsResults, sweepServeSimLogs } from "./prune.js";
 import { DEMO_TTL_MS, type DemoState } from "./demos.js";
 import { coalesce, detach, safely } from "./safe.js";
@@ -215,6 +222,9 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
     log,
     publish: () => publish("live"),
   });
+  // Viewer samples are generation-scoped and opportunistically pruned. This
+  // store owns no timer and dies with this plugin generation.
+  const liveStreamStats = new LiveStreamStatsStore();
 
   // The lease is keyed on the device, because the device is the contended
   // resource: `stillsDevice` is one shared UDID by design, and two callers with
@@ -763,7 +773,7 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // RPC
   // ---------------------------------------------------------------------------
 
-  bb.rpc.register(rpcContract, makeRpcHandlers(ctx));
+  bb.rpc.register(rpcContract, makeRpcHandlers(ctx, liveStreamStats));
 
   // ---------------------------------------------------------------------------
   // The stream proxy
@@ -974,9 +984,10 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // model provider, and a setting that turns that off has to actually remove
   // the tools rather than make them refuse.
   if (settings.allowAgentCapture) {
-    bb.agents.registerTool(makeCaptureTool(ctx));
+    bb.agents.registerTool(makeCaptureTool(ctx, liveStreamStats));
     bb.agents.registerTool(makeDriveTool(ctx));
     bb.agents.registerTool(makeStillsTool(ctx));
+    bb.agents.registerTool(makeStreamStatusTool(ctx, liveStreamStats));
     // The instructions themselves are contributed by `server.ts`:
     // `contributeInstructions` is one call per plugin, and both halves have
     // something to say. They are still contributed *globally* rather than only

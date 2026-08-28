@@ -130,6 +130,95 @@ export const liveStateSchema = z
   .strict();
 
 /**
+ * One renderer's bounded account of the pixels it actually painted.
+ *
+ * Times used for freshness are assigned by the server on receipt. `sampledAt`
+ * and `lastPaintAt` remain useful evidence for the renderer itself, but are
+ * never compared with a server clock to manufacture end-to-end latency.
+ */
+export const liveStreamSampleSchema = z
+  .object({
+    viewerId: z.string().min(1).max(120),
+    deviceUdid: z.string().min(1).max(120),
+    hostGeneration: z.number().int().nonnegative(),
+    sampledAt: z.number(),
+    state: z.enum(["configuring", "live", "failed", "closed"]),
+    codec: z.enum(["h264", "mjpeg"]),
+    route: z.enum(["direct", "proxied"]),
+    qualityProfile: z.string().min(1).max(40),
+    codedWidth: z.number().int().positive().nullable(),
+    codedHeight: z.number().int().positive().nullable(),
+    logicalWidth: z.number().positive().nullable(),
+    logicalHeight: z.number().positive().nullable(),
+    sourceFps: z
+      .number()
+      .nonnegative()
+      .nullable()
+      .describe("Approximate source cadence; v1 AVCC has synthetic presentation timestamps."),
+    paintFps: z.number().nonnegative().nullable(),
+    bytesPerSecond: z.number().nonnegative().nullable(),
+    decoderQueuePeak: z.number().int().nonnegative(),
+    sequenceGaps: z.number().int().nonnegative(),
+    discontinuities: z.number().int().nonnegative(),
+    resyncs: z.number().int().nonnegative(),
+    reconnects: z.number().int().nonnegative(),
+    repeatedSurfaces: z.number().int().nonnegative(),
+    lastPaintAt: z.number().nullable(),
+    excessLatencyMs: z
+      .number()
+      .nonnegative()
+      .nullable()
+      .describe("Approximate viewer backlog above this viewer's best observed clock offset."),
+    packets: z.number().int().nonnegative(),
+    paintedFrames: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export type LiveStreamSample = z.infer<typeof liveStreamSampleSchema>;
+
+export const liveStreamViewerHealthSchema = liveStreamSampleSchema.extend({
+  receivedAt: z.number(),
+  ageMs: z.number().nonnegative(),
+  freshness: z.enum(["fresh", "stale"]),
+});
+
+export const liveStreamHealthSchema = z
+  .object({
+    status: z.enum(["unavailable", "stale", "live"]),
+    deviceUdid: z.string().nullable(),
+    hostGeneration: z.number().int().nonnegative().nullable(),
+    viewerCount: z.number().int().nonnegative(),
+    freshViewerCount: z.number().int().nonnegative(),
+    staleViewerCount: z.number().int().nonnegative(),
+    codec: z.enum(["h264", "mjpeg"]).nullable(),
+    route: z.enum(["direct", "proxied"]).nullable(),
+    qualityProfile: z.string().nullable(),
+    sourceFps: z
+      .number()
+      .nonnegative()
+      .nullable()
+      .describe("Approximate source cadence; v1 AVCC has synthetic presentation timestamps."),
+    paintFps: z.number().nonnegative().nullable(),
+    bytesPerSecond: z.number().nonnegative().nullable(),
+    decoderQueuePeak: z.number().int().nonnegative(),
+    sequenceGaps: z.number().int().nonnegative(),
+    discontinuities: z.number().int().nonnegative(),
+    resyncs: z.number().int().nonnegative(),
+    reconnects: z.number().int().nonnegative(),
+    repeatedSurfaces: z.number().int().nonnegative(),
+    lastPaintAt: z.number().nullable(),
+    excessLatencyMs: z
+      .number()
+      .nonnegative()
+      .nullable()
+      .describe("Approximate viewer backlog above each viewer's best observed clock offset."),
+    viewers: z.array(liveStreamViewerHealthSchema),
+  })
+  .strict();
+
+export type LiveStreamHealth = z.infer<typeof liveStreamHealthSchema>;
+
+/**
  * A frame, as the panel needs it.
  *
  * `url` and `thumbUrl` are the plugin's own image route rather than paths: RPC
@@ -275,6 +364,17 @@ export const rpcContract = defineRpcContract({
       .object({ reportStall: z.boolean().optional(), stallCleared: z.boolean().optional() })
       .strict(),
     output: liveStateSchema,
+  },
+  /** Renderer evidence: write a sample or read the current generation. */
+  liveStreamStats: {
+    input: z
+      .object({
+        sample: liveStreamSampleSchema.optional(),
+        deviceUdid: z.string().optional(),
+        hostGeneration: z.number().int().nonnegative().optional(),
+      })
+      .strict(),
+    output: liveStreamHealthSchema,
   },
   liveStart: {
     input: z.object({ device: z.string().optional() }).strict(),

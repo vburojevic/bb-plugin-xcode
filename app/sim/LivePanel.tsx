@@ -33,10 +33,12 @@ import {
 } from "./frame-input";
 import { canDecodeH264, currentViewerCanReachLoopback } from "./stream-core";
 import { describeSource, streamSources, type StreamSource } from "./stream-sources";
+import { streamHudText, streamViewerId } from "./stream-telemetry";
 import type { StreamEvent } from "./touch-channel";
 import { useStream } from "./useStream";
-import type { DeviceList, LiveState } from "./useLive";
+import { submitLiveStreamSample, type DeviceList, type LiveState } from "./useLive";
 import type { Step } from "../../src/sim/steps.js";
+import type { LiveStreamSample } from "../../src/sim/contract.js";
 
 /**
  * How long a stream may go without delivering a frame before the panel reports
@@ -90,7 +92,7 @@ export function LivePanel({
    * they are on MJPEG.
    */
   const [source, setSource] = useState<StreamSource | null>(null);
-  const [fps, setFps] = useState<number | null>(null);
+  const [telemetry, setTelemetry] = useState<LiveStreamSample | null>(null);
   // A new device, or a new stream, is a fresh chance for it to work.
   useEffect(() => setStreamFailed(false), [state?.streamUrl]);
 
@@ -116,9 +118,9 @@ export function LivePanel({
     [onStart, onRefresh, onOpenDoctor],
   );
 
-  const onStreamStats = useCallback((next: StreamSource | null, nextFps: number | null) => {
+  const onStreamStats = useCallback((next: StreamSource | null, nextTelemetry: LiveStreamSample | null) => {
     setSource(next);
-    setFps(nextFps);
+    setTelemetry(nextTelemetry);
   }, []);
 
   return (
@@ -147,7 +149,7 @@ export function LivePanel({
                 {describeSource(source) === null ? null : (
                   <span className="ml-2 text-xs opacity-60">
                     {describeSource(source)}
-                    {fps === null ? "" : ` · ${fps} fps`}
+                    {streamHudText(telemetry) === null ? "" : ` · ${streamHudText(telemetry)}`}
                   </span>
                 )}
               </p>
@@ -179,8 +181,8 @@ interface LiveFrameProps {
   onStep: (step: Step) => void;
   onInput: (event: StreamEvent) => void;
   onStreamFailed: () => void;
-  /** Reports the rung in use and its pace, for the meta line. */
-  onStats: (source: StreamSource | null, fps: number | null) => void;
+  /** Reports the rung and event-derived health for the meta line. */
+  onStats: (source: StreamSource | null, telemetry: LiveStreamSample | null) => void;
 }
 
 function LiveFrame({
@@ -207,6 +209,8 @@ function LiveFrame({
   const visible = useDocumentVisible();
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
+  const viewerId = useRef<string | null>(null);
+  viewerId.current ??= streamViewerId();
   const [crosshair, setCrosshair] = useState<{ x: number; y: number } | null>(null);
 
   /**
@@ -244,7 +248,16 @@ function LiveFrame({
     setRung(0);
   }, [proxiedUrl, directUrl]);
 
-  const video = useStream(source, canvasRef, active);
+  const video = useStream(source, canvasRef, active, {
+    viewerId: viewerId.current,
+    deviceUdid: state?.device?.udid ?? "unknown",
+    hostGeneration: state?.generation ?? 0,
+    // serve-sim exposes its native-size streams and no lower quality preset.
+    qualityProfile: "full",
+    logicalWidth: screen?.width ?? null,
+    logicalHeight: screen?.height ?? null,
+    onSample: submitLiveStreamSample,
+  });
 
   /**
    * One rung down, or out of rungs and the veil has to say so.
@@ -262,7 +275,10 @@ function LiveFrame({
     if (video.failed && rung + 1 >= sources.length) onStreamFailed();
   }, [video.failed, rung, sources.length, onStreamFailed]);
 
-  useEffect(() => onStats(active ? source : null, video.fps), [active, source, video.fps, onStats]);
+  useEffect(
+    () => onStats(active ? source : null, video.telemetry),
+    [active, source, video.telemetry, onStats],
+  );
 
   /**
    * Presence, only while streaming directly.

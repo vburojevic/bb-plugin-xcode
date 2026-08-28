@@ -65,6 +65,8 @@ import { detach } from "./safe.js";
 import { coordinatesOnly, executeStep, type Step } from "./steps.js";
 import type { LiveStreamEvent } from "./hid.js";
 import { isUiOptionKey, uiOptions } from "./options.js";
+import { LiveStreamStatsStore } from "./live-stream-stats.js";
+import type { LiveStreamSample } from "./contract.js";
 
 export type LiveStateDto = LiveState & {
   streamUrl: string | null;
@@ -168,7 +170,7 @@ export function toLiveStateDto(ctx: Ctx, state: LiveState): LiveStateDto {
   };
 }
 
-export function makeRpcHandlers(ctx: Ctx) {
+export function makeRpcHandlers(ctx: Ctx, liveStreamStats = new LiveStreamStatsStore()) {
   return {
     ...makeStillsHandlers(ctx),
     async doctor({ refresh }: { refresh?: boolean }) {
@@ -327,6 +329,22 @@ export function makeRpcHandlers(ctx: Ctx) {
       // signal brings the panel back for it.
       ctx.live.noteStateRead();
       return toLiveStateDto(ctx, state);
+    },
+
+    liveStreamStats({
+      sample,
+      deviceUdid,
+      hostGeneration,
+    }: {
+      sample?: LiveStreamSample;
+      deviceUdid?: string;
+      hostGeneration?: number;
+    }) {
+      if (sample !== undefined) return liveStreamStats.write(sample);
+      return liveStreamStats.read({
+        ...(deviceUdid === undefined ? {} : { deviceUdid }),
+        ...(hostGeneration === undefined ? {} : { hostGeneration }),
+      });
     },
 
     async liveStart({ device }: { device?: string }) {

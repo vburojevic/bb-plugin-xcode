@@ -28,6 +28,7 @@ import {
   makeCaptureTool,
   makeDriveTool,
   makeStillsTool,
+  makeStreamStatusTool,
 } from "../src/sim/tools";
 import type { Ctx } from "../src/sim/context";
 
@@ -48,11 +49,12 @@ const tools = (() => {
     makeCaptureTool(simCtx),
     makeDriveTool(simCtx),
     makeStillsTool(simCtx),
+    makeStreamStatusTool(simCtx),
   ];
 })();
 
 describe("agent tool registrations against the host validator", () => {
-  it("registers the six tools the server wires up", () => {
+  it("registers the seven tools the server wires up", () => {
     expect(tools.map((tool) => tool.name)).toEqual([
       "xcode_status",
       "xcode_last_failure",
@@ -60,6 +62,7 @@ describe("agent tool registrations against the host validator", () => {
       "simulator_capture",
       "simulator_drive",
       "simulator_stills",
+      "simulator_stream_status",
     ]);
   });
 

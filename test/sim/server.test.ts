@@ -143,6 +143,7 @@ describe("registrations", () => {
       "simulator_capture",
       "simulator_drive",
       "simulator_stills",
+      "simulator_stream_status",
     ]);
     // No agent tool can create or return a network share. Remote viewing stays
     // inside the main bb panel.
@@ -184,6 +185,14 @@ describe("the agent tools", () => {
     )) as { content: Array<{ type: string; text?: string }>; isError?: boolean };
     expect(result.isError).toBe(true);
     expect(result.content[0]?.text).toContain("Simulator agent access is disabled");
+
+    const streamResult = (await harness.callAgentTool(
+      "simulator_stream_status",
+      {},
+      { threadId: "th_1" },
+    )) as { content: Array<{ type: string; text?: string }>; isError?: boolean };
+    expect(streamResult.isError).toBe(true);
+    expect(streamResult.content[0]?.text).toContain("Simulator agent access is disabled");
   });
 
   it("refuse a capture with a sentence rather than an empty result", async () => {

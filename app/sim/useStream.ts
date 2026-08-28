@@ -45,12 +45,20 @@ import {
   FRAME_JPEG,
   FRAME_KEY,
 } from "./video-frames";
+import {
+  frameFingerprint,
+  StreamTelemetry,
+  type PacketEvent,
+  type StreamTelemetryConfig,
+  type TelemetryUpdate,
+} from "./stream-telemetry";
+import type { LiveStreamSample } from "../../src/sim/contract.js";
 
 export interface StreamStats {
   /** Frames decoded and painted. The stall watchdog counts these. */
   frames: number;
-  /** Smoothed frames per second, for the meta line. `null` until measurable. */
-  fps: number | null;
+  /** The newest local sample; RPC publication is deliberately less frequent. */
+  telemetry: LiveStreamSample | null;
   /** Set once the stream fails terminally; the caller advances the ladder. */
   failed: boolean;
 }
@@ -66,32 +74,52 @@ export function useStream(
   source: StreamSource | null,
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
   active: boolean,
+  telemetryConfig: Omit<StreamTelemetryConfig, "codec" | "route" | "reconnects"> & {
+    onSample: (sample: LiveStreamSample) => void;
+  },
 ): StreamStats {
   const [frames, setFrames] = useState(0);
-  const [fps, setFps] = useState<number | null>(null);
+  const [telemetry, setTelemetry] = useState<LiveStreamSample | null>(null);
   const [failed, setFailed] = useState(false);
   // Counted outside React so a burst of frames is one render, not thirty.
   const counter = useRef(0);
   const url = source?.url ?? null;
   const codec = source?.codec ?? null;
+  const route = source?.route ?? null;
+  const reconnects = useRef(0);
+  const started = useRef(false);
 
   useEffect(() => {
     setFailed(false);
     setFrames(0);
-    setFps(null);
+    setTelemetry(null);
     counter.current = 0;
   }, [url]);
 
   useEffect(() => {
-    if (url === null || codec === null || !active) return;
+    if (url === null || codec === null || route === null || !active) return;
     const canvas = canvasRef.current;
     if (canvas === null) return;
 
-    // A (re)start is a new stream in every way: the frame count and the fps
-    // window must not average across a reconnect or a visibility toggle.
+    // A (re)start is a new stream in every way: rate windows must not average
+    // across a reconnect or a visibility toggle.
     counter.current = 0;
     setFrames(0);
-    setFps(null);
+    setTelemetry(null);
+
+    if (started.current) reconnects.current += 1;
+    started.current = true;
+    const tracker = new StreamTelemetry({
+      viewerId: telemetryConfig.viewerId,
+      deviceUdid: telemetryConfig.deviceUdid,
+      hostGeneration: telemetryConfig.hostGeneration,
+      codec,
+      route,
+      qualityProfile: telemetryConfig.qualityProfile,
+      logicalWidth: telemetryConfig.logicalWidth,
+      logicalHeight: telemetryConfig.logicalHeight,
+      reconnects: reconnects.current,
+    });
 
     const abort = new AbortController();
     let decoder: VideoDecoder | null = null;
@@ -105,44 +133,57 @@ export function useStream(
      * pipeline's opening glitch, every time.
      */
     let paintSeq = 0;
-    /** Painted-frame timestamps, for the fps readout. Bounded at 30. */
-    const paintedAt: number[] = [];
+    let latestTelemetry: LiveStreamSample | null = null;
 
     const context = canvas.getContext("2d", { alpha: false });
 
-    const publish = (): void => {
-      counter.current += 1;
-      // Coalesce: the watchdog needs to know frames are arriving, not how many.
+    const publish = (update: TelemetryUpdate, painted: boolean): void => {
+      if (painted) counter.current += 1;
+      latestTelemetry = update.sample;
+      if (update.reason !== null) telemetryConfig.onSample(update.sample);
+      // Coalesce: the watchdog and HUD need current truth, not one React render
+      // per packet. Exceptional samples still cross RPC immediately above.
       if (!painting) {
         painting = true;
         requestAnimationFrame(() => {
           painting = false;
+          if (disposed) return;
           setFrames(counter.current);
-          const now = performance.now();
-          paintedAt.push(now);
-          if (paintedAt.length > 30) paintedAt.shift();
-          if (paintedAt.length >= 2) {
-            const span = now - paintedAt[0]!;
-            if (span > 0) setFps(Math.round(((paintedAt.length - 1) * 1000) / span));
-          }
+          setTelemetry(latestTelemetry);
         });
       }
     };
 
-    const paint = (source: CanvasImageSource, width: number, height: number): void => {
+    const paint = (
+      source: CanvasImageSource,
+      width: number,
+      height: number,
+      packet: PacketEvent,
+      surfaceId?: string,
+    ): void => {
       if (context === null) return;
       if (canvas.width !== width || canvas.height !== height) {
         canvas.width = width;
         canvas.height = height;
       }
       context.drawImage(source, 0, 0, width, height);
-      publish();
+      publish(
+        tracker.paint({
+          ...packet,
+          paintedAtMs: performance.now(),
+          paintedAtUnixMs: Date.now(),
+          codedWidth: width,
+          codedHeight: height,
+          ...(surfaceId === undefined ? {} : { surfaceId }),
+        }),
+        true,
+      );
     };
 
     /** A JPEG, through the ordered bitmap path. Shared by MJPEG parts and the
      * H.264 stream's bootstrap frame. */
     let pendingBitmaps = 0;
-    const paintJpeg = (data: Uint8Array): void => {
+    const paintJpeg = (data: Uint8Array, packet: PacketEvent): void => {
       // Whole frames, dropped when the bitmap decoder can't keep up. Every
       // JPEG on either path is independently decodable, so losing one under
       // load costs a frame, not the stream — and an unbounded queue of pending
@@ -150,6 +191,7 @@ export function useStream(
       if (pendingBitmaps >= 4) return;
       pendingBitmaps += 1;
       const seq = ++paintSeq;
+      const surfaceId = frameFingerprint(data);
       // Copied: `createImageBitmap` is async and the parser's buffer is
       // reused the moment this loop continues.
       const blob = new Blob([data.slice()], { type: "image/jpeg" });
@@ -161,7 +203,7 @@ export function useStream(
             bitmap.close();
             return;
           }
-          paint(bitmap, bitmap.width, bitmap.height);
+          paint(bitmap, bitmap.width, bitmap.height, packet, surfaceId);
           bitmap.close();
         })
         .catch(() => {
@@ -172,8 +214,11 @@ export function useStream(
 
     const fail = (): void => {
       if (disposed) return;
+      publish(tracker.failure(), false);
       setFailed(true);
     };
+
+    publish(tracker.configure(), false);
 
     /**
      * Wait until the decoder queue has drained.
@@ -206,6 +251,7 @@ export function useStream(
       const parser = createFrameParser();
       // When the queue is this deep, decode keyframes only until it drains.
       let dropping = false;
+      const packetsByTimestamp = new Map<number, PacketEvent>();
 
       for (;;) {
         // Backpressure before more bytes: the body is pull-based, so not
@@ -222,13 +268,26 @@ export function useStream(
         const { done, value } = await reader.read();
         if (done || disposed) return;
         if (value === undefined) continue;
+        const arrivedAtMs = performance.now();
 
         for (const frame of parser.push(value)) {
           if (disposed) return;
           switch (frame.type) {
             case FRAME_JPEG:
               // The instant first paint, before the decoder is configured.
-              paintJpeg(frame.data);
+              frameIndex += 1;
+              {
+                const sourcePtsMs = timestampFor(frameIndex) / 1000;
+                const packet = {
+                  sequence: frameIndex,
+                  sourcePtsMs,
+                  arrivedAtMs,
+                  bytes: frame.data.byteLength,
+                  decoderQueue: pendingBitmaps + 1,
+                };
+                publish(tracker.packet(packet), false);
+                paintJpeg(frame.data, packet);
+              }
               break;
             case FRAME_DESCRIPTION: {
               const codec = codecStringFrom(frame.data);
@@ -244,7 +303,11 @@ export function useStream(
                       // sequence guard against bitmaps is needed, and bitmaps
                       // always lose once the decoder owns the canvas.
                       paintSeq += 1;
-                      paint(videoFrame, videoFrame.displayWidth, videoFrame.displayHeight);
+                      const packet = packetsByTimestamp.get(videoFrame.timestamp);
+                      if (packet !== undefined) {
+                        packetsByTimestamp.delete(videoFrame.timestamp);
+                        paint(videoFrame, videoFrame.displayWidth, videoFrame.displayHeight, packet);
+                      }
                     }
                   } finally {
                     // Unconditional: a leaked VideoFrame holds a GPU surface
@@ -263,11 +326,28 @@ export function useStream(
             }
             case FRAME_KEY: {
               if (decoder === null || decoder.state !== "configured") break;
-              dropping = shouldDropToKeyframe(decoder.decodeQueueSize);
+              const nextDropping = shouldDropToKeyframe(decoder.decodeQueueSize);
+              if (!dropping && nextDropping) publish(tracker.resync(), false);
+              dropping = nextDropping;
+              frameIndex += 1;
+              const timestamp = timestampFor(frameIndex);
+              const packet = {
+                sequence: frameIndex,
+                sourcePtsMs: timestamp / 1000,
+                arrivedAtMs,
+                bytes: frame.data.byteLength,
+                decoderQueue: decoder.decodeQueueSize + 1,
+              };
+              packetsByTimestamp.set(timestamp, packet);
+              if (packetsByTimestamp.size > 64) {
+                const oldest = packetsByTimestamp.keys().next().value as number | undefined;
+                if (oldest !== undefined) packetsByTimestamp.delete(oldest);
+              }
+              publish(tracker.packet(packet), false);
               decoder.decode(
                 new EncodedVideoChunk({
                   type: "key",
-                  timestamp: timestampFor((frameIndex += 1)),
+                  timestamp,
                   data: frame.data.slice(),
                 }),
               );
@@ -275,12 +355,27 @@ export function useStream(
             }
             case FRAME_DELTA: {
               if (decoder === null || decoder.state !== "configured") break;
+              frameIndex += 1;
+              const timestamp = timestampFor(frameIndex);
+              const packet = {
+                sequence: frameIndex,
+                sourcePtsMs: timestamp / 1000,
+                arrivedAtMs,
+                bytes: frame.data.byteLength,
+                decoderQueue: decoder.decodeQueueSize + 1,
+              };
+              publish(tracker.packet(packet), false);
               if (dropping && shouldDropToKeyframe(decoder.decodeQueueSize)) break;
               dropping = false;
+              packetsByTimestamp.set(timestamp, packet);
+              if (packetsByTimestamp.size > 64) {
+                const oldest = packetsByTimestamp.keys().next().value as number | undefined;
+                if (oldest !== undefined) packetsByTimestamp.delete(oldest);
+              }
               decoder.decode(
                 new EncodedVideoChunk({
                   type: "delta",
-                  timestamp: timestampFor((frameIndex += 1)),
+                  timestamp,
                   data: frame.data.slice(),
                 }),
               );
@@ -295,13 +390,25 @@ export function useStream(
 
     const runMjpeg = async (reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> => {
       const parser = createMjpegParser();
+      let firstArrival: number | null = null;
       for (;;) {
         const { done, value } = await reader.read();
         if (done || disposed) return;
         if (value === undefined) continue;
+        const arrivedAtMs = performance.now();
+        firstArrival ??= arrivedAtMs;
         for (const part of parser.push(value)) {
           if (disposed) return;
-          paintJpeg(part.jpeg);
+          frameIndex += 1;
+          const packet = {
+            sequence: frameIndex,
+            sourcePtsMs: arrivedAtMs - firstArrival,
+            arrivedAtMs,
+            bytes: part.jpeg.byteLength,
+            decoderQueue: pendingBitmaps + 1,
+          };
+          publish(tracker.packet(packet), false);
+          paintJpeg(part.jpeg, packet);
         }
       }
     };
@@ -342,6 +449,7 @@ export function useStream(
 
     return () => {
       disposed = true;
+      telemetryConfig.onSample(tracker.close().sample);
       abort.abort();
       if (decoder !== null && decoder.state !== "closed") {
         try {
@@ -351,7 +459,20 @@ export function useStream(
         }
       }
     };
-  }, [url, codec, active, canvasRef]);
+  }, [
+    url,
+    codec,
+    route,
+    active,
+    canvasRef,
+    telemetryConfig.viewerId,
+    telemetryConfig.deviceUdid,
+    telemetryConfig.hostGeneration,
+    telemetryConfig.qualityProfile,
+    telemetryConfig.logicalWidth,
+    telemetryConfig.logicalHeight,
+    telemetryConfig.onSample,
+  ]);
 
-  return { frames, fps, failed };
+  return { frames, telemetry, failed };
 }

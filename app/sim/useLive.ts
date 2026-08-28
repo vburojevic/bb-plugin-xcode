@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { useBbContext, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../../src/sim/wire";
+import type { LiveStreamSample } from "../../src/sim/contract.js";
 import type { Step } from "../../src/sim/steps.js";
 import { TouchChannel, type StreamEvent } from "./touch-channel";
 
@@ -142,6 +143,20 @@ function touchChannel(): TouchChannel {
  * step starts clean.
  */
 let stepChain: Promise<unknown> = Promise.resolve();
+
+/**
+ * Telemetry is diagnostic and lossy. The stream must never wait for its own
+ * status report, and a plugin reload must not turn one missed sample into a
+ * detached rejection in the renderer.
+ */
+export function submitLiveStreamSample(sample: LiveStreamSample): void {
+  const client = rpc;
+  if (client === null) return;
+  void client.call("liveStreamStats", { sample }).catch(() => {
+    // Thirty paints later — or on the next exceptional event — the current
+    // renderer sends a complete replacement sample.
+  });
+}
 
 function emit(patch: Partial<Snapshot>): void {
   snapshot = { ...snapshot, ...patch };
