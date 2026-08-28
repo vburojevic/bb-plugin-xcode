@@ -6,9 +6,9 @@
  * The device session is created in response to a button. Device death is
  * detected by the surface that already has an open stream: the stream stalls,
  * something reports it, and the server runs *one* `simctl list devices booted
- * -j` — a single command in response to an event. When no panel is mounted the
- * device session is torn down after 60 seconds and the child after five
- * minutes.
+ * -j` — a single command in response to an event. When no panel is mounted,
+ * capture is parked after a short grace period while the already-booted
+ * simulator remains selected.
  */
 import type { SimDevice } from "./devices.js";
 import { DeviceDriver, SimctlError, DRIVABLE_PLATFORMS, findDeviceByNameOrUdid, pickDefaultDevice } from "./devices.js";
@@ -17,10 +17,8 @@ import { startSimHost, type SimHostHandle, type SpawnDeps } from "./sim-host-sup
 import * as host from "./sim-host-client.js";
 import { detach } from "./safe.js";
 
-/** How long after the last viewer disconnects before the device session goes. */
-export const IDLE_DEVICE_MS = 60_000;
-/** And how long before the capture host itself is stopped. */
-export const IDLE_HOST_MS = 5 * 60_000;
+/** Enough grace for panel moves and visibility transitions, not background capture. */
+export const VIEWER_IDLE_MS = 15_000;
 /** Two crashes inside this window is a pattern rather than a blip. */
 export const CRASH_WINDOW_MS = 60_000;
 /** After this long, "about twenty seconds" has stopped being true. */
@@ -107,8 +105,7 @@ export class LiveService {
   private starting: Promise<SimHostHandle> | null = null;
   private session: Session | null = null;
   private viewers = 0;
-  private idleDeviceTimer: ReturnType<typeof setTimeout> | null = null;
-  private idleHostTimer: ReturnType<typeof setTimeout> | null = null;
+  private viewerIdleTimer: ReturnType<typeof setTimeout> | null = null;
   private crashTimestamps: number[] = [];
   private lastSimctlError: string | null = null;
   private generation = 0;
@@ -177,9 +174,9 @@ export class LiveService {
    * down and re-boot it.
    */
   private handleHostExit(code: number | null, signal: NodeJS.Signals | null, expected: boolean): void {
+    if (expected || this.disposed) return;
     this.child = null;
     this.generation += 1;
-    if (expected || this.disposed) return;
 
     this.crashTimestamps = [...this.recentCrashes(), this.now()];
     this.deps.log(
@@ -216,34 +213,51 @@ export class LiveService {
    */
   noteViewerOpened(): void {
     this.viewers += 1;
-    this.clearIdleTimers();
+    this.clearViewerIdleTimer();
   }
 
   noteViewerClosed(): void {
     this.viewers = Math.max(0, this.viewers - 1);
     if (this.viewers > 0) return;
-    this.clearIdleTimers();
-    this.idleDeviceTimer = setTimeout(() => {
+    this.clearViewerIdleTimer();
+    this.viewerIdleTimer = setTimeout(() => {
+      this.viewerIdleTimer = null;
       detach(
-        () => this.detachDevice(),
-        (error) => this.deps.log("warn", `idle teardown failed: ${describe(error)}`),
+        () => this.parkCapture(),
+        (error) => this.deps.log("warn", `idle capture parking failed: ${describe(error)}`),
       );
-    }, IDLE_DEVICE_MS);
-    this.idleDeviceTimer.unref?.();
-    this.idleHostTimer = setTimeout(() => this.stopHost(), IDLE_HOST_MS);
-    this.idleHostTimer.unref?.();
+    }, VIEWER_IDLE_MS);
+    this.viewerIdleTimer.unref?.();
   }
 
-  private clearIdleTimers(): void {
-    if (this.idleDeviceTimer !== null) clearTimeout(this.idleDeviceTimer);
-    if (this.idleHostTimer !== null) clearTimeout(this.idleHostTimer);
-    this.idleDeviceTimer = null;
-    this.idleHostTimer = null;
+  private clearViewerIdleTimer(): void {
+    if (this.viewerIdleTimer !== null) clearTimeout(this.viewerIdleTimer);
+    this.viewerIdleTimer = null;
   }
 
   private stopHost(): void {
-    this.child?.stop();
+    const child = this.child;
     this.child = null;
+    child?.stop();
+  }
+
+  /**
+   * Stop permanent IOSurface/JPEG work without turning "not watched" into
+   * "not selected". A later visible panel replays `liveStart` for this UDID;
+   * the simulator is already booted, so only the capture plane comes back.
+   */
+  private async parkCapture(): Promise<void> {
+    if (this.viewers > 0 || this.disposed) return;
+    const session = this.session;
+    if (session !== null) {
+      session.abort.abort();
+      session.hid?.close();
+      session.hid = null;
+      session.kind = "waiting-frame";
+      session.reason = null;
+    }
+    this.stopHost();
+    if (session !== null) this.deps.publish();
   }
 
   // -------------------------------------------------------------------------
@@ -305,15 +319,20 @@ export class LiveService {
    * socket that pushes dimensions.
    */
   private async attach(udid: string): Promise<void> {
+    const session = this.session;
+    if (session?.device.udid !== udid) return;
     const handle = await this.ensureHost();
-    if (this.session?.device.udid !== udid) return;
+    if (this.session !== session || session.abort.signal.aborted) {
+      if (this.viewers === 0) this.stopHost();
+      return;
+    }
 
     await host.startDevice(
       { port: handle.port, secret: handle.secret, streamToken: handle.streamToken },
       udid,
-      this.session.abort.signal,
+      session.abort.signal,
     );
-    if (this.session?.device.udid !== udid) return;
+    if (this.session !== session || session.abort.signal.aborted) return;
 
     this.deps.driver.invalidateBooted();
 
@@ -764,7 +783,7 @@ export class LiveService {
   async dispose(): Promise<void> {
     this.disposed = true;
     const starting = this.starting;
-    this.clearIdleTimers();
+    this.clearViewerIdleTimer();
     await this.detachDevice();
     this.stopHost();
     await starting?.catch(() => undefined);

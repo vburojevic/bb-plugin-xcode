@@ -10,7 +10,7 @@
  * The capture host, the HID socket and simctl are all faked at the module
  * seam, so this runs anywhere with no simulator and no Mac.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => {
   interface FakeScreen {
@@ -61,9 +61,10 @@ const mocks = vi.hoisted(() => {
       streamToken: "t".repeat(32),
       addonLoaded: true,
       addonError: null,
-      stop: () => {},
+      stop: vi.fn(),
       isAlive: () => true,
     },
+    startDevice: vi.fn(() => Promise.resolve()),
   };
 
   return { FakeHidSocket, state };
@@ -85,7 +86,7 @@ vi.mock("../../src/sim/sim-host-sup.js", () => ({
 }));
 
 vi.mock("../../src/sim/sim-host-client.js", () => ({
-  startDevice: () => Promise.resolve(),
+  startDevice: mocks.state.startDevice,
   shutdownDevice: () => Promise.resolve(),
   foregroundApp: () => Promise.resolve({ bundleId: null, pid: null }),
 }));
@@ -140,6 +141,84 @@ async function streamingService(booted = new Set([DEVICE.udid])): Promise<LiveSe
 beforeEach(() => {
   mocks.FakeHidSocket.instances.length = 0;
   mocks.state.exitHandler = null;
+  mocks.state.handle.stop.mockClear();
+  mocks.state.startDevice.mockClear();
+});
+
+afterEach(() => vi.useRealTimers());
+
+describe("viewer-idle capture parking", () => {
+  it("parks once after 15 seconds, retaining the booted simulator selection", async () => {
+    const booted = new Set([DEVICE.udid]);
+    const service = await streamingService(booted);
+    const generation = service.state().generation;
+    vi.useFakeTimers();
+
+    service.noteViewerClosed();
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(service.state().kind).toBe("streaming");
+    expect(mocks.state.handle.stop).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(service.state()).toMatchObject({
+      kind: "waiting-frame",
+      device: { udid: DEVICE.udid },
+      generation,
+    });
+    expect(service.currentDevice()?.udid).toBe(DEVICE.udid);
+    expect(booted.has(DEVICE.udid)).toBe(true);
+    expect(mocks.FakeHidSocket.instances.at(-1)?.closed).toBe(true);
+    expect(mocks.state.handle.stop).toHaveBeenCalledTimes(1);
+    expect(service.address()).toBeNull();
+
+    mocks.state.exitHandler!({ code: 0, signal: "SIGTERM", expected: true });
+    expect(service.state().kind).toBe("waiting-frame");
+  });
+
+  it("cancels parking when a viewer returns inside 15 seconds", async () => {
+    const service = await streamingService();
+    vi.useFakeTimers();
+
+    service.noteViewerClosed();
+    await vi.advanceTimersByTimeAsync(14_999);
+    service.noteViewerOpened();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(service.state().kind).toBe("streaming");
+    expect(mocks.state.handle.stop).not.toHaveBeenCalled();
+  });
+
+  it("reattaches one parked selection with a fresh generation", async () => {
+    const service = await streamingService();
+    vi.useFakeTimers();
+    service.noteViewerClosed();
+    await vi.advanceTimersByTimeAsync(15_000);
+    const parkedGeneration = service.state().generation;
+    vi.useRealTimers();
+
+    await service.start(DEVICE.udid);
+    await vi.waitFor(() => expect(service.state().kind).toBe("streaming"));
+
+    expect(service.state().generation).toBe(parkedGeneration + 1);
+    expect(mocks.state.startDevice).toHaveBeenCalledTimes(2);
+  });
+
+  it("dispose clears the pending park and all live resources", async () => {
+    const service = await streamingService();
+    vi.useFakeTimers();
+    service.noteViewerClosed();
+    expect(vi.getTimerCount()).toBe(1);
+
+    await service.dispose();
+
+    expect(vi.getTimerCount()).toBe(0);
+    expect(service.currentDevice()).toBeNull();
+    expect(service.address()).toBeNull();
+    expect(mocks.state.handle.stop).toHaveBeenCalledTimes(1);
+    expect(mocks.FakeHidSocket.instances.at(-1)?.closed).toBe(true);
+  });
 });
 
 describe("the crash count", () => {

@@ -266,7 +266,7 @@ describe("the stream the browser could not load", () => {
    * streaming — supplies no sentence at all. Measured on a real machine: the
    * device was shut down by other tooling between the poll and the request.
    */
-  it("says what happened instead of leaving a broken image with no text", () => {
+  it("keeps the last frame unobscured through retries, then shows the terminal action", () => {
     const streaming = state({
       kind: "streaming",
       device: IPHONE,
@@ -274,7 +274,7 @@ describe("the stream the browser could not load", () => {
     });
 
     // What the server thinks: everything is fine, so there is nothing to say.
-    expect(liveVeil(streaming, devices()).sentence).toBeNull();
+    expect(liveVeil(streaming, devices())).toMatchObject({ sentence: null, skeleton: false });
 
     // What the browser knows, which is strictly newer.
     const veil = liveVeil(streaming, devices(), true);

@@ -12,12 +12,13 @@
  * blanking. A panel that flashes "No simulator is running" during a reconnect
  * has told the user something false.
  */
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { useBbContext, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../../src/sim/wire";
 import type { LiveStreamSample } from "../../src/sim/contract.js";
 import type { Step } from "../../src/sim/steps.js";
 import { TouchChannel, type StreamEvent } from "./touch-channel";
+import { VisibleReattachGate } from "./reconnect-policy";
 
 export interface LiveState {
   kind:
@@ -143,6 +144,7 @@ function touchChannel(): TouchChannel {
  * step starts clean.
  */
 let stepChain: Promise<unknown> = Promise.resolve();
+const visibleReattach = new VisibleReattachGate();
 
 /**
  * Telemetry is diagnostic and lossy. The stream must never wait for its own
@@ -227,6 +229,7 @@ export function resetLiveStore(): void {
   queued = false;
   touches = null;
   stepChain = Promise.resolve();
+  visibleReattach.reset();
   listeners.clear();
 }
 
@@ -277,6 +280,11 @@ export function useLive(): LiveApi {
     },
     [client],
   );
+
+  const visible = useDocumentVisible();
+  useEffect(() => {
+    visibleReattach.update(value.state, visible, start);
+  }, [value.state, visible, start]);
 
   const stop = useCallback(async () => {
     const next = await client.call("liveStop", {});
@@ -373,4 +381,18 @@ export function useLive(): LiveApi {
     () => ({ ...value, refresh, start, stop, shutdown, erase, input, stream, capture, reportStall, reportAlive }),
     [value, start, stop, shutdown, erase, input, stream, capture, reportStall, reportAlive],
   );
+}
+
+/** Visibility is the presence boundary: a hidden panel must neither stream nor reattach. */
+function useDocumentVisible(): boolean {
+  const [visible, setVisible] = useState(
+    () => typeof document === "undefined" || document.visibilityState === "visible",
+  );
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onChange = (): void => setVisible(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onChange);
+    return () => document.removeEventListener("visibilitychange", onChange);
+  }, []);
+  return visible;
 }

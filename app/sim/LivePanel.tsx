@@ -36,6 +36,7 @@ import { describeSource, streamSources, type StreamSource } from "./stream-sourc
 import { streamHudText, streamViewerId } from "./stream-telemetry";
 import type { StreamEvent } from "./touch-channel";
 import { useStream } from "./useStream";
+import { RetryBudget } from "./reconnect-policy";
 import { submitLiveStreamSample, type DeviceList, type LiveState } from "./useLive";
 import type { Step } from "../../src/sim/steps.js";
 import type { LiveStreamSample } from "../../src/sim/contract.js";
@@ -83,6 +84,7 @@ export function LivePanel({
   controls,
 }: LivePanelProps) {
   const [streamFailed, setStreamFailed] = useState(false);
+  const [manualRetry, setManualRetry] = useState(0);
   /**
    * Which stream is actually feeding the frame.
    *
@@ -93,8 +95,13 @@ export function LivePanel({
    */
   const [source, setSource] = useState<StreamSource | null>(null);
   const [telemetry, setTelemetry] = useState<LiveStreamSample | null>(null);
+  const markStreamFailed = useCallback(() => setStreamFailed(true), []);
+  const markStreamRecovered = useCallback(() => setStreamFailed(false), []);
   // A new device, or a new stream, is a fresh chance for it to work.
-  useEffect(() => setStreamFailed(false), [state?.streamUrl]);
+  useEffect(
+    () => setStreamFailed(false),
+    [state?.streamUrl, state?.directStreamUrl, state?.generation, state?.device?.udid],
+  );
 
   const veil = liveVeil(state, devices, streamFailed);
   const meta = state === null ? null : metaLine(state);
@@ -105,6 +112,8 @@ export function LivePanel({
         case "boot":
         case "watch":
         case "retry":
+          setStreamFailed(false);
+          setManualRetry((current) => current + 1);
           onStart(action.udid);
           return;
         case "refresh":
@@ -133,7 +142,9 @@ export function LivePanel({
         onAlive={onAlive}
         onStep={onStep}
         onInput={onInput}
-        onStreamFailed={() => setStreamFailed(true)}
+        onStreamFailed={markStreamFailed}
+        onStreamRecovered={markStreamRecovered}
+        manualRetry={manualRetry}
         onStats={onStreamStats}
       />
 
@@ -181,6 +192,8 @@ interface LiveFrameProps {
   onStep: (step: Step) => void;
   onInput: (event: StreamEvent) => void;
   onStreamFailed: () => void;
+  onStreamRecovered: () => void;
+  manualRetry: number;
   /** Reports the rung and event-derived health for the meta line. */
   onStats: (source: StreamSource | null, telemetry: LiveStreamSample | null) => void;
 }
@@ -194,6 +207,8 @@ function LiveFrame({
   onStep,
   onInput,
   onStreamFailed,
+  onStreamRecovered,
+  manualRetry,
   onStats,
 }: LiveFrameProps) {
   const proxiedUrl = state?.streamUrl ?? null;
@@ -231,7 +246,18 @@ function LiveFrame({
     [directUrl, proxiedUrl],
   );
   const [rung, setRung] = useState(0);
-  const source = sources[rung] ?? null;
+  const [replay, setReplay] = useState(0);
+  const retryBudget = useRef<RetryBudget | null>(null);
+  retryBudget.current ??= new RetryBudget();
+  const previousVisible = useRef(visible);
+  const baseSource = sources[rung] ?? null;
+  const source = useMemo(
+    () =>
+      baseSource === null || replay === 0
+        ? baseSource
+        : { ...baseSource, url: `${baseSource.url}&retry=${replay}` },
+    [baseSource, replay],
+  );
   /** Every rung failed; the veil has to say so. */
   const exhausted = rung >= sources.length;
 
@@ -245,8 +271,38 @@ function LiveFrame({
   // restart rotates the token and the port, and whatever made a rung fail last
   // time may have gone with it.
   useEffect(() => {
+    retryBudget.current?.reset();
     setRung(0);
-  }, [proxiedUrl, directUrl]);
+    setReplay(0);
+  }, [proxiedUrl, directUrl, state?.generation, state?.device?.udid]);
+
+  useEffect(() => {
+    if (manualRetry === 0) return;
+    retryBudget.current?.reset();
+    setRung(0);
+    setReplay((current) => current + 1);
+  }, [manualRetry]);
+
+  // A hidden page cancels old work; returning is a new visibility session with
+  // the complete budget. The canvas is deliberately untouched on both edges.
+  useEffect(() => {
+    const returning = visible && !previousVisible.current;
+    previousVisible.current = visible;
+    retryBudget.current?.reset();
+    setRung(0);
+    if (returning) setReplay((current) => current + 1);
+  }, [visible]);
+
+  useEffect(() => {
+    retryBudget.current?.cancel();
+  }, [source?.url, source?.codec, source?.route]);
+
+  useEffect(
+    () => () => {
+      retryBudget.current?.cancel();
+    },
+    [],
+  );
 
   const video = useStream(source, canvasRef, active, {
     viewerId: viewerId.current,
@@ -272,8 +328,22 @@ function LiveFrame({
   }, [video.failed, rung, sources.length]);
 
   useEffect(() => {
-    if (video.failed && rung + 1 >= sources.length) onStreamFailed();
+    if (!video.failed || rung + 1 < sources.length) return;
+    const scheduled =
+      retryBudget.current?.schedule(() => {
+        setRung(0);
+        // A one-rung ladder still needs a new URL identity; zero-to-zero is no
+        // state change, and useStream correctly leaves its failed fetch dead.
+        setReplay((current) => current + 1);
+      }) ?? false;
+    if (!scheduled) onStreamFailed();
   }, [video.failed, rung, sources.length, onStreamFailed]);
+
+  useEffect(() => {
+    if (video.frames === 0) return;
+    retryBudget.current?.reset();
+    onStreamRecovered();
+  }, [video.frames, onStreamRecovered]);
 
   useEffect(
     () => onStats(active ? source : null, video.telemetry),
@@ -285,7 +355,7 @@ function LiveFrame({
    *
    * Bytes now bypass the bb server, and the viewer-presence signal used to be a
    * side effect of them passing through it. Without this the device session is
-   * torn down 60 seconds into being watched. Zero bytes; the open connection is
+   * parked 15 seconds into being watched. Zero bytes; the open connection is
    * the entire message.
    */
   const streamingDirectly = source?.route === "direct";
