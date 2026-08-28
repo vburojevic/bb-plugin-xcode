@@ -31,8 +31,18 @@ export const FRAME_KEY = 0x02;
 export const FRAME_DELTA = 0x03;
 export const FRAME_JPEG = 0x04;
 
+export type FrameType =
+  | typeof FRAME_DESCRIPTION
+  | typeof FRAME_KEY
+  | typeof FRAME_DELTA
+  | typeof FRAME_JPEG;
+
+export function isFrameType(type: number): type is FrameType {
+  return type >= FRAME_DESCRIPTION && type <= FRAME_JPEG;
+}
+
 export interface StreamFrame {
-  type: number;
+  type: FrameType;
   data: Uint8Array;
 }
 
@@ -84,10 +94,14 @@ export function createFrameParser(): FrameParser {
         if (length < 1 || length > MAX_FRAME_BYTES) {
           throw new FrameParseError(`frame length ${length} is not plausible`);
         }
+        const type = buffer[offset + 4]!;
+        if (!isFrameType(type)) {
+          throw new FrameParseError(`frame kind ${type} is not supported`);
+        }
         // `length` counts the type byte, so the payload is one shorter.
         if (buffer.length - offset < 4 + length) break;
         out.push({
-          type: buffer[offset + 4]!,
+          type,
           data: buffer.subarray(offset + 5, offset + 4 + length),
         });
         offset += 4 + length;

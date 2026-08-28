@@ -109,6 +109,11 @@ describe("the frame parser", () => {
     expect(() => createFrameParser().push(zero)).toThrow(FrameParseError);
   });
 
+  it("refuses an unknown v1 kind instead of silently desynchronising the decoder", () => {
+    expect(() => createFrameParser().push(frame(0, []))).toThrow(/kind 0/);
+    expect(() => createFrameParser().push(frame(5, []))).toThrow(/kind 5/);
+  });
+
   it("accepts an empty payload, which is a frame with only a type", () => {
     const parser = createFrameParser();
     const frames = parser.push(frame(FRAME_DELTA, []));

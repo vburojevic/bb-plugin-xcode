@@ -11,9 +11,11 @@
  * browser clock do not share an epoch, so their absolute difference is
  * meaningless. The best arrival-minus-PTS offset observed by this viewer is
  * the baseline; paint-minus-PTS above that floor is measurable queue/decode/
- * presentation delay, even when the two clocks started years apart. AVCC v1
- * carries no source timestamps, so its `sourceFps` is synthetic cadence until
- * the transport can supply them; neither field is end-to-end latency evidence.
+ * presentation delay, even when the two clocks started years apart. V2 PTS is
+ * capture-host arrival time: useful for jitter and queue growth from egress,
+ * never glass-to-glass latency. AVCC v1 carries no source timestamps, so its
+ * `sourceFps` remains synthetic cadence during rollback; neither field is
+ * end-to-end latency evidence.
  */
 import type { LiveStreamSample } from "../../src/sim/contract.js";
 import type { StreamCodec, StreamRoute } from "./stream-sources";
@@ -60,6 +62,11 @@ export interface PacketEvent {
   arrivedAtMs: number;
   bytes: number;
   decoderQueue: number;
+  /** V2 only. A change is a decoder lifetime boundary, not a packet gap. */
+  configGeneration?: number;
+  /** V2 header geometry is available before WebCodecs produces a surface. */
+  codedWidth?: number;
+  codedHeight?: number;
 }
 
 export interface PaintEvent extends PacketEvent {
@@ -107,6 +114,7 @@ export class StreamTelemetry {
   private repeatedSurfaces = 0;
   private previousSequence: number | null = null;
   private previousPts: number | null = null;
+  private previousConfigGeneration: number | null = null;
   private previousSurface: string | null = null;
   private bestArrivalOffset: number | null = null;
   private codedWidth: number | null = null;
@@ -127,8 +135,22 @@ export class StreamTelemetry {
     pushBounded(this.sourcePts, event.sourcePtsMs);
     pushBounded(this.bytePoints, { at: event.arrivedAtMs, total: this.totalBytes });
     this.decoderQueuePeak = Math.max(this.decoderQueuePeak, Math.max(0, event.decoderQueue));
+    if (event.codedWidth !== undefined && event.codedWidth > 0) {
+      this.codedWidth = event.codedWidth;
+    }
+    if (event.codedHeight !== undefined && event.codedHeight > 0) {
+      this.codedHeight = event.codedHeight;
+    }
 
     let continuity: StreamContinuity | null = null;
+    if (
+      event.configGeneration !== undefined &&
+      this.previousConfigGeneration !== null &&
+      event.configGeneration !== this.previousConfigGeneration
+    ) {
+      this.discontinuities += 1;
+      continuity = "discontinuity";
+    }
     if (this.previousSequence !== null) {
       if (event.sequence > this.previousSequence + 1) {
         this.sequenceGaps += event.sequence - this.previousSequence - 1;
@@ -144,6 +166,9 @@ export class StreamTelemetry {
     }
     this.previousSequence = event.sequence;
     this.previousPts = event.sourcePtsMs;
+    if (event.configGeneration !== undefined) {
+      this.previousConfigGeneration = event.configGeneration;
+    }
 
     const offset = event.arrivedAtMs - event.sourcePtsMs;
     this.bestArrivalOffset =
@@ -152,6 +177,19 @@ export class StreamTelemetry {
       sample: this.snapshot(sampledAt),
       reason: continuity === null ? null : "gap",
       ...(continuity === null ? {} : { continuity }),
+    };
+  }
+
+  /** A v2 control record proves a break without inventing a media packet. */
+  discontinuity(sampledAt = Date.now()): TelemetryUpdate {
+    this.discontinuities += 1;
+    this.previousSequence = null;
+    this.previousPts = null;
+    this.previousConfigGeneration = null;
+    return {
+      sample: this.snapshot(sampledAt),
+      reason: "gap",
+      continuity: "discontinuity",
     };
   }
 

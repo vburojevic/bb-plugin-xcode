@@ -15,7 +15,7 @@
  *
  * Here both codecs go through one path: `fetch` → incremental parse → decode
  * → paint, into a single canvas, behind one frame counter. The differences
- * that remain are the honest ones — the parser (`video-frames` vs
+ * that remain are the honest ones — the parser (`video-envelope` vs
  * `mjpeg-frames`) and the decoder (`VideoDecoder` vs `createImageBitmap`).
  *
  * What this file has to get right:
@@ -44,12 +44,15 @@ import {
 } from "./h264-sync";
 import type { StreamSource } from "./stream-sources";
 import {
-  createFrameParser,
+  createVideoEnvelopeParser,
   FRAME_DELTA,
   FRAME_DESCRIPTION,
+  FRAME_DISCONTINUITY,
   FRAME_JPEG,
   FRAME_KEY,
-} from "./video-frames";
+  videoPacketEvidence,
+  type VideoEnvelopeRecord,
+} from "./video-envelope";
 import {
   frameFingerprint,
   StreamTelemetry,
@@ -169,18 +172,20 @@ export function useStream(
       surfaceId?: string,
     ): void => {
       if (context === null) return;
-      if (canvas.width !== width || canvas.height !== height) {
-        canvas.width = width;
-        canvas.height = height;
+      const codedWidth = packet.codedWidth ?? width;
+      const codedHeight = packet.codedHeight ?? height;
+      if (canvas.width !== codedWidth || canvas.height !== codedHeight) {
+        canvas.width = codedWidth;
+        canvas.height = codedHeight;
       }
-      context.drawImage(source, 0, 0, width, height);
+      context.drawImage(source, 0, 0, codedWidth, codedHeight);
       publish(
         tracker.paint({
           ...packet,
           paintedAtMs: performance.now(),
           paintedAtUnixMs: Date.now(),
-          codedWidth: width,
-          codedHeight: height,
+          codedWidth,
+          codedHeight,
           ...(surfaceId === undefined ? {} : { surfaceId }),
         }),
         true,
@@ -243,6 +248,12 @@ export function useStream(
       publish(update, false);
       if (update.continuity === "sequence-gap") publishResync(syncGate.sequenceGap());
       if (update.continuity === "discontinuity") publishResync(syncGate.discontinuity());
+    };
+
+    const publishDiscontinuity = (): void => {
+      packetsByTimestamp.clear();
+      publish(tracker.discontinuity(), false);
+      publishResync(syncGate.discontinuity());
     };
 
     const installDecoder = (configuration: H264DecoderConfiguration): boolean => {
@@ -317,8 +328,29 @@ export function useStream(
         check();
       });
 
-    const runH264 = async (reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> => {
-      const parser = createFrameParser();
+    const runH264 = async (
+      reader: ReadableStreamDefaultReader<Uint8Array>,
+      contentType: string | null,
+    ): Promise<void> => {
+      const parser = createVideoEnvelopeParser(contentType);
+
+      const evidenceFor = (
+        frame: VideoEnvelopeRecord,
+        arrivedAtMs: number,
+        decoderQueue: number,
+      ): PacketEvent & { timestampMicros: number } => {
+        if (frame.version === 1) frameIndex += 1;
+        const evidence = videoPacketEvidence(frame, {
+          sequence: frameIndex,
+          timestampMicros: timestampFor(frameIndex),
+        });
+        return {
+          ...evidence,
+          arrivedAtMs,
+          bytes: frame.data.byteLength,
+          decoderQueue,
+        };
+      };
 
       for (;;) {
         // Backpressure before more bytes: the body is pull-based, so not
@@ -341,19 +373,11 @@ export function useStream(
 
         for (const frame of parser.push(value)) {
           if (disposed) return;
-          switch (frame.type) {
+          switch (frame.kind) {
             case FRAME_JPEG:
               // The instant first paint, before the decoder is configured.
-              frameIndex += 1;
               {
-                const sourcePtsMs = timestampFor(frameIndex) / 1000;
-                const packet = {
-                  sequence: frameIndex,
-                  sourcePtsMs,
-                  arrivedAtMs,
-                  bytes: frame.data.byteLength,
-                  decoderQueue: pendingBitmaps + 1,
-                };
+                const packet = evidenceFor(frame, arrivedAtMs, pendingBitmaps + 1);
                 publishH264Packet(packet);
                 paintJpeg(frame.data, packet);
               }
@@ -373,16 +397,12 @@ export function useStream(
               break;
             }
             case FRAME_KEY: {
-              frameIndex += 1;
-              const timestamp = timestampFor(frameIndex);
               const current = decoderOwner?.current ?? null;
-              const packet = {
-                sequence: frameIndex,
-                sourcePtsMs: timestamp / 1000,
+              const packet = evidenceFor(
+                frame,
                 arrivedAtMs,
-                bytes: frame.data.byteLength,
-                decoderQueue: (current?.decodeQueueSize ?? 0) + 1,
-              };
+                (current?.decodeQueueSize ?? 0) + 1,
+              );
               publishH264Packet(packet);
               const decision = syncGate.acceptAccessUnit("key", frame.data);
               publishResync(decision.resync);
@@ -391,12 +411,12 @@ export function useStream(
                 publishResync(syncGate.droppedAccessUnit());
                 break;
               }
-              rememberPacket(timestamp, packet);
+              rememberPacket(packet.timestampMicros, packet);
               try {
                 current.decode(
                   new EncodedVideoChunk({
                     type: "key",
-                    timestamp,
+                    timestamp: packet.timestampMicros,
                     data: frame.data.slice(),
                   }),
                 );
@@ -406,16 +426,12 @@ export function useStream(
               break;
             }
             case FRAME_DELTA: {
-              frameIndex += 1;
-              const timestamp = timestampFor(frameIndex);
               const current = decoderOwner?.current ?? null;
-              const packet = {
-                sequence: frameIndex,
-                sourcePtsMs: timestamp / 1000,
+              const packet = evidenceFor(
+                frame,
                 arrivedAtMs,
-                bytes: frame.data.byteLength,
-                decoderQueue: (current?.decodeQueueSize ?? 0) + 1,
-              };
+                (current?.decodeQueueSize ?? 0) + 1,
+              );
               publishH264Packet(packet);
               if (
                 current !== null &&
@@ -431,12 +447,12 @@ export function useStream(
                 publishResync(syncGate.droppedAccessUnit());
                 break;
               }
-              rememberPacket(timestamp, packet);
+              rememberPacket(packet.timestampMicros, packet);
               try {
                 current.decode(
                   new EncodedVideoChunk({
                     type: "delta",
-                    timestamp,
+                    timestamp: packet.timestampMicros,
                     data: frame.data.slice(),
                   }),
                 );
@@ -445,6 +461,9 @@ export function useStream(
               }
               break;
             }
+            case FRAME_DISCONTINUITY:
+              publishDiscontinuity();
+              break;
             default:
               break;
           }
@@ -491,8 +510,11 @@ export function useStream(
       }
       const reader = response.body.getReader();
       try {
-        if (codec === "h264") await runH264(reader);
-        else await runMjpeg(reader);
+        if (codec === "h264") {
+          await runH264(reader, response.headers.get("content-type"));
+        } else {
+          await runMjpeg(reader);
+        }
         // A clean end is still an end: the caller advances the ladder rather
         // than showing a frozen last frame as if it were live.
         if (!disposed) fail();
