@@ -87,16 +87,37 @@ describe("renderer stream evidence", () => {
       decoderQueue: 3,
     });
     expect(gap.reason).toBe("gap");
+    expect(gap.continuity).toBe("sequence-gap");
     expect(gap.sample.sequenceGaps).toBe(1);
 
-    expect(telemetry.resync(1_001).reason).toBe("resync");
-    expect(telemetry.failure(1_002)).toMatchObject({
-      reason: "failure",
-      sample: { state: "failed", sampledAt: 1_002 },
+    const discontinuity = telemetry.packet({
+      sequence: 2,
+      sourcePtsMs: 80,
+      arrivedAtMs: 130,
+      bytes: 200,
+      decoderQueue: 2,
     });
-    expect(telemetry.close(1_003)).toMatchObject({
+    expect(discontinuity.reason).toBe("gap");
+    expect(discontinuity.continuity).toBe("discontinuity");
+    expect(discontinuity.sample.discontinuities).toBe(2);
+
+    expect(telemetry.resync("drop", 1_001)).toMatchObject({
+      reason: "resync",
+      resyncCause: "drop",
+      sample: { resyncs: 1 },
+    });
+    expect(telemetry.resync("decoder-error", 1_002)).toMatchObject({
+      reason: "resync",
+      resyncCause: "decoder-error",
+      sample: { resyncs: 2 },
+    });
+    expect(telemetry.failure(1_003)).toMatchObject({
+      reason: "failure",
+      sample: { state: "failed", sampledAt: 1_003 },
+    });
+    expect(telemetry.close(1_004)).toMatchObject({
       reason: "close",
-      sample: { state: "closed", sampledAt: 1_003 },
+      sample: { state: "closed", sampledAt: 1_004 },
     });
 
     expect(vi.getTimerCount()).toBe(0);

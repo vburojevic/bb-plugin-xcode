@@ -6,6 +6,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  DecoderGeneration,
   DECODE_DROP_AT,
   DECODE_PAUSE_AT,
   DECODE_RESUME_AT,
@@ -15,6 +16,31 @@ import {
   timestampFor,
   viewerCanReachLoopback,
 } from "../../app/sim/stream-core.js";
+
+class FakeFrame {
+  closeCalls = 0;
+
+  constructor(readonly id: string) {}
+
+  close(): void {
+    this.closeCalls += 1;
+  }
+}
+
+interface FakeDecoderCallbacks {
+  output(frame: FakeFrame): void;
+  error(error: string): void;
+}
+
+class FakeDecoder {
+  closeCalls = 0;
+
+  constructor(readonly callbacks: FakeDecoderCallbacks) {}
+
+  close(): void {
+    this.closeCalls += 1;
+  }
+}
 
 describe("who may use the direct route", () => {
   it("a loopback http page may", () => {
@@ -60,5 +86,55 @@ describe("timestamps", () => {
 
   it("steps at a 30 fps cadence, not the old 1000 fps nonsense", () => {
     expect(timestampFor(1) - timestampFor(0)).toBe(33_333);
+  });
+});
+
+describe("decoder generations", () => {
+  it("closes replacements once, rejects stale callbacks, and closes every frame", () => {
+    const painted: string[] = [];
+    const errors: string[] = [];
+    const generations = new DecoderGeneration<FakeDecoder, FakeFrame, string>({
+      output: (frame) => painted.push(frame.id),
+      error: (error) => errors.push(error),
+    });
+
+    const first = generations.replace((callbacks) => new FakeDecoder(callbacks));
+    const second = generations.replace((callbacks) => {
+      expect(first.closeCalls).toBe(1);
+      return new FakeDecoder(callbacks);
+    });
+    const stale = new FakeFrame("stale");
+    const current = new FakeFrame("current");
+    first.callbacks.output(stale);
+    first.callbacks.error("stale error");
+    second.callbacks.output(current);
+
+    expect(painted).toEqual(["current"]);
+    expect(errors).toEqual([]);
+    expect(stale.closeCalls).toBe(1);
+    expect(current.closeCalls).toBe(1);
+    generations.close();
+    generations.close();
+    expect(first.closeCalls).toBe(1);
+    expect(second.closeCalls).toBe(1);
+
+    const afterClose = new FakeFrame("after close");
+    second.callbacks.output(afterClose);
+    expect(painted).toEqual(["current"]);
+    expect(afterClose.closeCalls).toBe(1);
+  });
+
+  it("still closes the frame when the current output handler throws", () => {
+    const generations = new DecoderGeneration<FakeDecoder, FakeFrame, string>({
+      output: () => {
+        throw new Error("paint failed");
+      },
+      error: () => {},
+    });
+    const decoder = generations.replace((callbacks) => new FakeDecoder(callbacks));
+    const frame = new FakeFrame("current");
+
+    expect(() => decoder.callbacks.output(frame)).toThrow("paint failed");
+    expect(frame.closeCalls).toBe(1);
   });
 });

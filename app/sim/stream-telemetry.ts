@@ -23,11 +23,22 @@ const RATE_WINDOW = 60;
 const VIEWER_KEY = "xcode-simulators.stream-viewer-id";
 
 export type TelemetryReason = "config" | "gap" | "resync" | "failure" | "close" | "cadence";
+export type StreamContinuity = "sequence-gap" | "discontinuity";
+export type StreamResyncCause =
+  | "drop"
+  | "sequence-gap"
+  | "discontinuity"
+  | "decoder-error"
+  | "configuration-change";
 
 export interface TelemetryUpdate {
   sample: LiveStreamSample;
   /** `null` means update the local HUD but do not cross the RPC boundary. */
   reason: TelemetryReason | null;
+  /** Present only on the packet that proves encoded continuity was lost. */
+  continuity?: StreamContinuity;
+  /** Keeps the recovery cause on the pixel event path even before the wire grows it. */
+  resyncCause?: StreamResyncCause;
 }
 
 export interface StreamTelemetryConfig {
@@ -117,19 +128,19 @@ export class StreamTelemetry {
     pushBounded(this.bytePoints, { at: event.arrivedAtMs, total: this.totalBytes });
     this.decoderQueuePeak = Math.max(this.decoderQueuePeak, Math.max(0, event.decoderQueue));
 
-    let exceptional = false;
+    let continuity: StreamContinuity | null = null;
     if (this.previousSequence !== null) {
       if (event.sequence > this.previousSequence + 1) {
         this.sequenceGaps += event.sequence - this.previousSequence - 1;
-        exceptional = true;
+        continuity = "sequence-gap";
       } else if (event.sequence <= this.previousSequence) {
         this.discontinuities += 1;
-        exceptional = true;
+        continuity = "discontinuity";
       }
     }
     if (this.previousPts !== null && event.sourcePtsMs < this.previousPts) {
       this.discontinuities += 1;
-      exceptional = true;
+      continuity = "discontinuity";
     }
     this.previousSequence = event.sequence;
     this.previousPts = event.sourcePtsMs;
@@ -137,7 +148,11 @@ export class StreamTelemetry {
     const offset = event.arrivedAtMs - event.sourcePtsMs;
     this.bestArrivalOffset =
       this.bestArrivalOffset === null ? offset : Math.min(this.bestArrivalOffset, offset);
-    return { sample: this.snapshot(sampledAt), reason: exceptional ? "gap" : null };
+    return {
+      sample: this.snapshot(sampledAt),
+      reason: continuity === null ? null : "gap",
+      ...(continuity === null ? {} : { continuity }),
+    };
   }
 
   paint(event: PaintEvent, sampledAt = event.paintedAtUnixMs): TelemetryUpdate {
@@ -167,9 +182,9 @@ export class StreamTelemetry {
     };
   }
 
-  resync(sampledAt = Date.now()): TelemetryUpdate {
+  resync(cause: StreamResyncCause, sampledAt = Date.now()): TelemetryUpdate {
     this.resyncs += 1;
-    return { sample: this.snapshot(sampledAt), reason: "resync" };
+    return { sample: this.snapshot(sampledAt), reason: "resync", resyncCause: cause };
   }
 
   failure(sampledAt = Date.now()): TelemetryUpdate {

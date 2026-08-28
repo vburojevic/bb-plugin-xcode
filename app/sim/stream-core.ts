@@ -107,3 +107,84 @@ export function shouldDropToKeyframe(queueSize: number): boolean {
 export function timestampFor(frameIndex: number): number {
   return frameIndex * 33_333;
 }
+
+// ---------------------------------------------------------------------------
+// Decoder ownership
+// ---------------------------------------------------------------------------
+
+export interface DecoderCallbacks<Frame, DecoderError> {
+  output(frame: Frame): void;
+  error(error: DecoderError): void;
+}
+
+interface ClosableDecoder {
+  close(): void;
+}
+
+interface ClosableFrame {
+  close(): void;
+}
+
+/**
+ * One owner for decoder replacement and every surface a decoder emits.
+ *
+ * WebCodecs callbacks may arrive after `close()`, and a description can replace
+ * a decoder while those callbacks are already queued. Invalidating the old
+ * generation before closing it prevents a late surface from painting; closing
+ * the surface in the callback's `finally` prevents the less visible failure,
+ * where discarded GPU surfaces accumulate until the replacement wedges too.
+ */
+export class DecoderGeneration<
+  Decoder extends ClosableDecoder,
+  Frame extends ClosableFrame,
+  DecoderError = DOMException,
+> {
+  private decoder: Decoder | null = null;
+  private generationId = 0;
+
+  constructor(private readonly handlers: DecoderCallbacks<Frame, DecoderError>) {}
+
+  get current(): Decoder | null {
+    return this.decoder;
+  }
+
+  get generation(): number {
+    return this.generationId;
+  }
+
+  replace(factory: (callbacks: DecoderCallbacks<Frame, DecoderError>) => Decoder): Decoder {
+    const generation = ++this.generationId;
+    this.closeCurrent();
+    const next = factory({
+      output: (frame) => {
+        try {
+          if (generation === this.generationId) this.handlers.output(frame);
+        } finally {
+          frame.close();
+        }
+      },
+      error: (error) => {
+        if (generation === this.generationId) this.handlers.error(error);
+      },
+    });
+    this.decoder = next;
+    return next;
+  }
+
+  close(): void {
+    this.generationId += 1;
+    this.closeCurrent();
+  }
+
+  private closeCurrent(): void {
+    const current = this.decoder;
+    this.decoder = null;
+    if (current === null) return;
+    try {
+      current.close();
+    } catch {
+      // An errored WebCodecs decoder is already closed, but it is still no
+      // longer owned here. The generation guard is the real lifecycle fence.
+    }
+  }
+}

@@ -31,14 +31,19 @@
 import { useEffect, useRef, useState } from "react";
 import { createMjpegParser } from "./mjpeg-frames";
 import {
+  DecoderGeneration,
   shouldDropToKeyframe,
   shouldPauseForDecoder,
   shouldResumeDecoding,
   timestampFor,
 } from "./stream-core";
+import {
+  H264SyncGate,
+  type H264DecoderConfiguration,
+  type H264ResyncCause,
+} from "./h264-sync";
 import type { StreamSource } from "./stream-sources";
 import {
-  codecStringFrom,
   createFrameParser,
   FRAME_DELTA,
   FRAME_DESCRIPTION,
@@ -122,7 +127,7 @@ export function useStream(
     });
 
     const abort = new AbortController();
-    let decoder: VideoDecoder | null = null;
+    let decoderOwner: DecoderGeneration<VideoDecoder, VideoFrame, DOMException> | null = null;
     let disposed = false;
     let frameIndex = 0;
     let painting = false;
@@ -134,6 +139,8 @@ export function useStream(
      */
     let paintSeq = 0;
     let latestTelemetry: LiveStreamSample | null = null;
+    const syncGate = new H264SyncGate();
+    const packetsByTimestamp = new Map<number, PacketEvent>();
 
     const context = canvas.getContext("2d", { alpha: false });
 
@@ -220,6 +227,65 @@ export function useStream(
 
     publish(tracker.configure(), false);
 
+    const publishResync = (cause: H264ResyncCause | null): void => {
+      if (cause !== null) publish(tracker.resync(cause), false);
+    };
+
+    const rememberPacket = (timestamp: number, packet: PacketEvent): void => {
+      packetsByTimestamp.set(timestamp, packet);
+      if (packetsByTimestamp.size <= 64) return;
+      const oldest = packetsByTimestamp.keys().next().value as number | undefined;
+      if (oldest !== undefined) packetsByTimestamp.delete(oldest);
+    };
+
+    const publishH264Packet = (packet: PacketEvent): void => {
+      const update = tracker.packet(packet);
+      publish(update, false);
+      if (update.continuity === "sequence-gap") publishResync(syncGate.sequenceGap());
+      if (update.continuity === "discontinuity") publishResync(syncGate.discontinuity());
+    };
+
+    const installDecoder = (configuration: H264DecoderConfiguration): boolean => {
+      const owner = decoderOwner;
+      if (owner === null) return false;
+      try {
+        const next = owner.replace(
+          (callbacks) => new VideoDecoder({ output: callbacks.output, error: callbacks.error }),
+        );
+        next.configure({
+          codec: configuration.codec,
+          description: configuration.description,
+          optimizeForLatency: true,
+        });
+        return true;
+      } catch {
+        owner.close();
+        return false;
+      }
+    };
+
+    const recoverDecoder = (): void => {
+      if (disposed) return;
+      const recovery = syncGate.decoderError();
+      publishResync(recovery.resync);
+      packetsByTimestamp.clear();
+      if (recovery.configuration === null || !installDecoder(recovery.configuration)) fail();
+    };
+
+    decoderOwner = new DecoderGeneration<VideoDecoder, VideoFrame, DOMException>({
+      output: (videoFrame) => {
+        if (disposed) return;
+        // Decoder output is ordered within one generation. Bitmap work and
+        // callbacks from replaced generations lose ownership independently.
+        paintSeq += 1;
+        const packet = packetsByTimestamp.get(videoFrame.timestamp);
+        if (packet === undefined) return;
+        packetsByTimestamp.delete(videoFrame.timestamp);
+        paint(videoFrame, videoFrame.displayWidth, videoFrame.displayHeight, packet);
+      },
+      error: () => recoverDecoder(),
+    });
+
     /**
      * Wait until the decoder queue has drained.
      *
@@ -229,13 +295,17 @@ export function useStream(
      */
     const waitForDecoderDrain = (): Promise<void> =>
       new Promise<void>((resolve) => {
-        const current = decoder;
+        const current = decoderOwner?.current ?? null;
         if (current === null) {
           resolve();
           return;
         }
         const check = (): void => {
-          if (disposed || decoder !== current || shouldResumeDecoding(current.decodeQueueSize)) {
+          if (
+            disposed ||
+            decoderOwner?.current !== current ||
+            shouldResumeDecoding(current.decodeQueueSize)
+          ) {
             current.removeEventListener("dequeue", check);
             clearInterval(fallback);
             resolve();
@@ -249,20 +319,19 @@ export function useStream(
 
     const runH264 = async (reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> => {
       const parser = createFrameParser();
-      // When the queue is this deep, decode keyframes only until it drains.
-      let dropping = false;
-      const packetsByTimestamp = new Map<number, PacketEvent>();
 
       for (;;) {
         // Backpressure before more bytes: the body is pull-based, so not
         // reading is what slows the encoder down.
-        while (
+        const pullDecoder = decoderOwner?.current ?? null;
+        if (
           !disposed &&
-          decoder !== null &&
-          decoder.state === "configured" &&
-          shouldPauseForDecoder(decoder.decodeQueueSize)
+          pullDecoder !== null &&
+          pullDecoder.state === "configured" &&
+          shouldPauseForDecoder(pullDecoder.decodeQueueSize)
         ) {
           await waitForDecoderDrain();
+          continue;
         }
 
         const { done, value } = await reader.read();
@@ -285,100 +354,95 @@ export function useStream(
                   bytes: frame.data.byteLength,
                   decoderQueue: pendingBitmaps + 1,
                 };
-                publish(tracker.packet(packet), false);
+                publishH264Packet(packet);
                 paintJpeg(frame.data, packet);
               }
               break;
             case FRAME_DESCRIPTION: {
-              const codec = codecStringFrom(frame.data);
-              if (codec === null) {
+              const decision = syncGate.acceptDescription(frame.data);
+              if (decision === null) {
                 fail();
                 return;
               }
-              decoder = new VideoDecoder({
-                output: (videoFrame) => {
-                  try {
-                    if (!disposed) {
-                      // Decoder output is ordered by construction; only the
-                      // sequence guard against bitmaps is needed, and bitmaps
-                      // always lose once the decoder owns the canvas.
-                      paintSeq += 1;
-                      const packet = packetsByTimestamp.get(videoFrame.timestamp);
-                      if (packet !== undefined) {
-                        packetsByTimestamp.delete(videoFrame.timestamp);
-                        paint(videoFrame, videoFrame.displayWidth, videoFrame.displayHeight, packet);
-                      }
-                    }
-                  } finally {
-                    // Unconditional: a leaked VideoFrame holds a GPU surface
-                    // and the decoder stops once enough accumulate.
-                    videoFrame.close();
-                  }
-                },
-                error: fail,
-              });
-              decoder.configure({
-                codec,
-                description: frame.data.slice(),
-                optimizeForLatency: true,
-              });
+              publishResync(decision.resync);
+              packetsByTimestamp.clear();
+              if (!installDecoder(decision.configuration)) {
+                fail();
+                return;
+              }
               break;
             }
             case FRAME_KEY: {
-              if (decoder === null || decoder.state !== "configured") break;
-              const nextDropping = shouldDropToKeyframe(decoder.decodeQueueSize);
-              if (!dropping && nextDropping) publish(tracker.resync(), false);
-              dropping = nextDropping;
               frameIndex += 1;
               const timestamp = timestampFor(frameIndex);
+              const current = decoderOwner?.current ?? null;
               const packet = {
                 sequence: frameIndex,
                 sourcePtsMs: timestamp / 1000,
                 arrivedAtMs,
                 bytes: frame.data.byteLength,
-                decoderQueue: decoder.decodeQueueSize + 1,
+                decoderQueue: (current?.decodeQueueSize ?? 0) + 1,
               };
-              packetsByTimestamp.set(timestamp, packet);
-              if (packetsByTimestamp.size > 64) {
-                const oldest = packetsByTimestamp.keys().next().value as number | undefined;
-                if (oldest !== undefined) packetsByTimestamp.delete(oldest);
+              publishH264Packet(packet);
+              const decision = syncGate.acceptAccessUnit("key", frame.data);
+              publishResync(decision.resync);
+              if (decision.decode === null) break;
+              if (current === null || current.state !== "configured") {
+                publishResync(syncGate.droppedAccessUnit());
+                break;
               }
-              publish(tracker.packet(packet), false);
-              decoder.decode(
-                new EncodedVideoChunk({
-                  type: "key",
-                  timestamp,
-                  data: frame.data.slice(),
-                }),
-              );
+              rememberPacket(timestamp, packet);
+              try {
+                current.decode(
+                  new EncodedVideoChunk({
+                    type: "key",
+                    timestamp,
+                    data: frame.data.slice(),
+                  }),
+                );
+              } catch {
+                recoverDecoder();
+              }
               break;
             }
             case FRAME_DELTA: {
-              if (decoder === null || decoder.state !== "configured") break;
               frameIndex += 1;
               const timestamp = timestampFor(frameIndex);
+              const current = decoderOwner?.current ?? null;
               const packet = {
                 sequence: frameIndex,
                 sourcePtsMs: timestamp / 1000,
                 arrivedAtMs,
                 bytes: frame.data.byteLength,
-                decoderQueue: decoder.decodeQueueSize + 1,
+                decoderQueue: (current?.decodeQueueSize ?? 0) + 1,
               };
-              publish(tracker.packet(packet), false);
-              if (dropping && shouldDropToKeyframe(decoder.decodeQueueSize)) break;
-              dropping = false;
-              packetsByTimestamp.set(timestamp, packet);
-              if (packetsByTimestamp.size > 64) {
-                const oldest = packetsByTimestamp.keys().next().value as number | undefined;
-                if (oldest !== undefined) packetsByTimestamp.delete(oldest);
+              publishH264Packet(packet);
+              if (
+                current !== null &&
+                current.state === "configured" &&
+                shouldDropToKeyframe(current.decodeQueueSize)
+              ) {
+                publishResync(syncGate.droppedAccessUnit());
+                break;
               }
-              decoder.decode(
-                new EncodedVideoChunk({
-                  type: "delta",
-                  timestamp,
-                  data: frame.data.slice(),
-                }),
-              );
+              const decision = syncGate.acceptAccessUnit("delta", frame.data);
+              if (decision.decode === null) break;
+              if (current === null || current.state !== "configured") {
+                publishResync(syncGate.droppedAccessUnit());
+                break;
+              }
+              rememberPacket(timestamp, packet);
+              try {
+                current.decode(
+                  new EncodedVideoChunk({
+                    type: "delta",
+                    timestamp,
+                    data: frame.data.slice(),
+                  }),
+                );
+              } catch {
+                recoverDecoder();
+              }
               break;
             }
             default:
@@ -451,13 +515,7 @@ export function useStream(
       disposed = true;
       telemetryConfig.onSample(tracker.close().sample);
       abort.abort();
-      if (decoder !== null && decoder.state !== "closed") {
-        try {
-          decoder.close();
-        } catch {
-          // Closing a decoder that already errored throws; nothing to do.
-        }
-      }
+      decoderOwner?.close();
     };
   }, [
     url,
