@@ -17,6 +17,11 @@ export interface ThreadScope {
   environmentId: string | null;
   /** Absolute worktree/checkout path of the thread's environment. */
   path: string;
+  /**
+   * Machine the checkout lives on. bb supports a server with enrolled Macs, so
+   * `path` is only meaningful on this host — see `checkoutHostMismatch`.
+   */
+  hostId: string | null;
   branch: string | null;
   /** True while the thread is running a turn. */
   active: boolean;

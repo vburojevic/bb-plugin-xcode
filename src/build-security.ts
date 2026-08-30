@@ -2,6 +2,7 @@
 import { realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { pathIsUnder } from "./scopes";
+import { locateCheckout, type HostSummary } from "./sim/hostcheck";
 
 const PATH_FLAGS = new Set([
   "-project",
@@ -47,6 +48,38 @@ const HOST_MUTATING_OPTIONS = new Set([
   "-enablePerformanceTestsDiagnostics",
   "-collect-test-diagnostics",
 ]);
+
+/**
+ * Refuse a tracked build whose checkout is on a different machine.
+ *
+ * bb supports a server with enrolled Macs, so a thread's environment can live
+ * on a host that is not the one running this plugin. Everything below —
+ * `confinedBuildCwd`, `validateBuildArguments`, the process probe that
+ * attributes the run — resolves paths with `node:fs` on THIS machine. Given a
+ * checkout on another host, `realpath` threw first, so the user was told
+ * "ENOENT: no such file or directory" about a directory that plainly exists on
+ * the machine they were looking at.
+ *
+ * `src/sim/hostcheck.ts` already states the rule for Stills ("a real refusal
+ * with a real sentence rather than a mysterious 'no such file'"); this applies
+ * the same rule to tracked builds.
+ *
+ * Fails OPEN when either host is unknown: an unresolved identity must never
+ * refuse the single-machine setup that every existing user has.
+ */
+export function checkoutHostMismatch(
+  scope: { hostId: string | null },
+  serverHostId: string | null,
+  hosts: readonly HostSummary[],
+): string | null {
+  const location = locateCheckout(serverHostId, scope.hostId, hosts);
+  if (location.kind !== "other-host") return null;
+  return (
+    `This thread's checkout lives on ${location.hostName}, but tracked xcodebuild runs ` +
+    `on the machine running bb. Run the build on ${location.hostName} instead — ` +
+    `xcodebuild there is not tracked by this plugin.`
+  );
+}
 
 export async function confinedBuildCwd(root: string, requested?: string): Promise<string> {
   const realRoot = await realpath(root);

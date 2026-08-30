@@ -15,6 +15,7 @@ const SCOPE: ThreadScope = {
   projectId: "proj_app",
   environmentId: "env_app",
   path: "/Users/me/.bb/worktrees/env_app/App",
+  hostId: null,
   branch: "feature/security",
   active: true,
   updatedAt: NOW,
@@ -25,6 +26,7 @@ const OTHER_SCOPE: ThreadScope = {
   projectId: "proj_other",
   environmentId: "env_other",
   path: "/Users/me/Git/Other",
+  hostId: null,
   branch: "main",
 };
 
@@ -66,7 +68,7 @@ function run(id: string, overrides: Partial<Run> = {}): Run {
   };
 }
 
-function fixture() {
+function fixture(checkoutRefusal: string | null = null) {
   const store = makeStore();
   store.insertRun(run("r:mine"));
   store.insertRun(
@@ -107,6 +109,7 @@ function fixture() {
   } as unknown as Collector;
   const confirmHostAction = vi.fn(async () => false);
   const common = {
+    checkoutElsewhere: async () => checkoutRefusal,
     store,
     collector,
     dataDir: "/tmp/xcode-security-test",
@@ -132,6 +135,36 @@ function fixture() {
   });
   return { cli, confirmHostAction, tools };
 }
+
+describe("a checkout on another machine is refused with a sentence", () => {
+  const REFUSAL =
+    "This thread's checkout lives on scw-mini, but tracked xcodebuild runs on the machine running bb.";
+
+  it("refuses the agent build tool before touching the filesystem", async () => {
+    const { tools, confirmHostAction } = fixture(REFUSAL);
+    const result = await tools.build.execute(
+      { args: ["-scheme", "App"] },
+      { threadId: SCOPE.threadId, signal: new AbortController().signal },
+    );
+    expect(result).toBe(REFUSAL);
+    // The old failure was an ENOENT thrown by realpath; nothing should have
+    // got as far as asking the user to approve a host action.
+    expect(result).not.toContain("ENOENT");
+    expect(confirmHostAction).not.toHaveBeenCalled();
+  });
+
+  it("lets a checkout on this machine through the host gate", async () => {
+    const { tools } = fixture(null);
+    const result = await tools.build.execute(
+      { args: ["-scheme", "App"] },
+      { threadId: SCOPE.threadId, signal: new AbortController().signal },
+    );
+    // It gets past the host gate and on to the real build path; whatever it
+    // fails on next, it must not be the cross-machine refusal.
+    expect(result).not.toBe(REFUSAL);
+    expect(result).not.toContain("lives on");
+  });
+});
 
 describe("agent Xcode surfaces fail closed to the invoking thread", () => {
   it("removes the machine-wide escape hatch from agent tool schemas", () => {

@@ -21,11 +21,14 @@ import { Engine } from "./src/engine";
 import { VERDICT_STATUSES, type Run } from "./src/model";
 import { createRpcHandlers } from "./src/rpc";
 import { ScopeSync } from "./src/scope-sync";
+import type { ThreadScope } from "./src/scopes";
 import { pruneShimBundles, isShimInstalled } from "./src/shim";
 import { safely, detach } from "./src/safe";
 import { MIGRATIONS, Store, type Db } from "./src/store";
 import { installSimulators, type SimulatorCliRun } from "./src/sim/wire";
 import { CLI_COMMANDS as SIM_VERBS } from "./src/sim/cli";
+import { checkoutHostMismatch } from "./src/build-security";
+import { resolveServerHostId } from "./src/sim/hostcheck";
 import { SETTINGS_DESCRIPTORS as SIMULATOR_SETTINGS } from "./src/sim/settings";
 import { ThreadSync } from "./src/thread-sync";
 import { AGENT_INSTRUCTIONS, createTools } from "./src/tools";
@@ -238,6 +241,49 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     onChanged: publishSoon,
   });
 
+  /**
+   * Which machine is this plugin running on?
+   *
+   * Derived once (nonce file + `hosts.pathsExist`) and cached, exactly as the
+   * Stills path does. Only needed when a scope names a host, so it is resolved
+   * lazily rather than on every startup.
+   */
+  let serverHostId: string | null = null;
+  const resolveHostId = async (): Promise<string | null> => {
+    if (serverHostId !== null) return serverHostId;
+    const hosts = await bb.sdk.hosts.list();
+    serverHostId = await resolveServerHostId({
+      pluginDataDir: dataDir,
+      listHosts: async () => hosts.map((entry) => ({ id: entry.id, name: entry.name })),
+      pathsExist: async (id, paths) =>
+        (await bb.sdk.hosts.pathsExist({ hostId: id, paths })).existence,
+      kvGet: async (key) => (await bb.storage.kv.get<string>(key)) ?? null,
+      kvSet: async (key, value) => bb.storage.kv.set(key, value),
+    });
+    return serverHostId;
+  };
+
+  /**
+   * A tracked build only works on the machine holding the checkout, because
+   * every path check and the process probe use `node:fs` here. Answer with the
+   * plugin's sentence instead of letting `realpath` throw ENOENT.
+   */
+  const checkoutElsewhere = async (scope: ThreadScope): Promise<string | null> => {
+    if (scope.hostId === null) return null;
+    try {
+      const hosts = await bb.sdk.hosts.list();
+      return checkoutHostMismatch(
+        scope,
+        await resolveHostId(),
+        hosts.map((entry) => ({ id: entry.id, name: entry.name })),
+      );
+    } catch (error) {
+      // Never block a build because host discovery failed.
+      log.debug(`host check skipped: ${String(error)}`);
+      return null;
+    }
+  };
+
   const engine: Engine = new Engine(store, {
     projectFor: (signals): string | null =>
       collectorRef ? collectorRef.projectFor(signals) : null,
@@ -446,6 +492,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     phaseFor,
     refreshProjectNames: () => dto.refreshProjectNames(),
     scopeFor: (threadId) => scopeSync.bounded(threadId),
+    checkoutElsewhere,
     wrapped,
     onShimStateKnown,
     confirmHostAction: async (threadId, consent) => {
@@ -729,6 +776,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     projectName: (id) => dto.projectName(id),
     phaseFor,
     scopeFor: (threadId) => scopeSync.bounded(threadId),
+    checkoutElsewhere,
     showRun: (id) => cli.show(id),
   });
 

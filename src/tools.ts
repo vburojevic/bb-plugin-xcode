@@ -52,6 +52,8 @@ export interface ToolDeps {
   phaseFor(run: Run): BuildPhase | null;
   /** Cached scope, or one bounded resolve. Never blocks on a slow SDK call. */
   scopeFor(threadId: string): Promise<ThreadScope | null>;
+  /** Refusal sentence when the checkout is on another machine, else null. */
+  checkoutElsewhere(scope: ThreadScope): Promise<string | null>;
   showRun(id: string): { stdout?: string; stderr?: string };
 }
 
@@ -192,6 +194,10 @@ export function createTools(deps: ToolDeps) {
       if (scope === null) {
         return "This thread has no resolvable checkout, so xcodebuild was not started.";
       }
+      // Before any node:fs work: this thread's checkout may live on another
+      // enrolled Mac, where every path below resolves to nothing.
+      const elsewhere = await deps.checkoutElsewhere(scope);
+      if (elsewhere !== null) return elsewhere;
       let workingDir: string;
       try {
         workingDir = await confinedBuildCwd(scope.path, cwd);

@@ -47,6 +47,8 @@ export interface ScopeSyncDeps {
     path?: string | null;
     projectId?: string | null;
     branchName?: string | null;
+    /** Machine the checkout is on; `path` is only local when this is ours. */
+    hostId?: string | null;
   }>;
   log(message: string): void;
   isDisposed(): boolean;
@@ -116,6 +118,7 @@ export class ScopeSync {
           projectId: env.projectId ?? null,
           environmentId,
           path: env.path,
+          hostId: env.hostId ?? null,
           branch: env.branchName ?? null,
           active,
         },

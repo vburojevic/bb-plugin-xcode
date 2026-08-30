@@ -55,6 +55,8 @@ export interface CliDeps {
   refreshProjectNames(): void;
   /** Resolve the invoking thread's checkout before host-side execution. */
   scopeFor(threadId: string): Promise<ThreadScope | null>;
+  /** Refusal sentence when the checkout is on another machine, else null. */
+  checkoutElsewhere(scope: ThreadScope): Promise<string | null>;
   wrapped: WrappedDeps;
   onShimStateKnown(installed: boolean): void;
   confirmHostAction(
@@ -240,6 +242,10 @@ export function createCli(deps: CliDeps) {
           stderr: "The invoking checkout does not match this thread, so xcodebuild was not started.\n",
         };
       }
+      // Before any node:fs work: this thread's checkout may live on another
+      // enrolled Mac, where every path below resolves to nothing.
+      const elsewhere = await deps.checkoutElsewhere(scope);
+      if (elsewhere !== null) return { exitCode: 1, stderr: `${elsewhere}\n` };
       root = scope.path;
       workingDir = await confinedBuildCwd(root, ctx.cwd);
       await validateBuildArguments(argv, root, workingDir);

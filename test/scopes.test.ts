@@ -21,6 +21,7 @@ function makeScopes(): ThreadScopes {
       projectId: "proj_1",
       environmentId: "env_1",
       path: "/Users/me/.bb/worktrees/env_app/App",
+      hostId: null,
       branch: "feature/login",
       active: true,
     },
@@ -32,6 +33,7 @@ function makeScopes(): ThreadScopes {
       projectId: "proj_1",
       environmentId: "env_2",
       path: "/Users/me/Git/App",
+      hostId: null,
       branch: "main",
       active: false,
     },
@@ -66,6 +68,7 @@ describe("ThreadScopes.threadFor", () => {
         projectId: "proj_1",
         environmentId: "env_3",
         path: "/Users/me/Git/App/Modules/Kit",
+        hostId: null,
         branch: "main",
         active: false,
       },
@@ -84,6 +87,7 @@ describe("ThreadScopes.threadFor", () => {
         projectId: "proj_1",
         environmentId: "env_1",
         path: "/Users/me/.bb/worktrees/env_app/App",
+        hostId: null,
         branch: "feature/login",
         active: false,
       },
@@ -110,6 +114,7 @@ describe("runMatchesScope", () => {
   const scope = {
     threadId: "th_app",
     path: "/Users/me/.bb/worktrees/env_app/App",
+    hostId: null,
     branch: "feature/login",
   };
   const base = {
@@ -205,6 +210,7 @@ describe("scopeFilter", () => {
   const scope = {
     threadId: "thr_mine",
     path: "/Users/v/.bb/worktrees/env_mine/indexed",
+    hostId: null,
     branch: "feature",
   };
   const foreign = {
