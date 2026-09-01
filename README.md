@@ -377,3 +377,10 @@ The engine, the store and the thread reconciler are tested against a real
 in-memory SQLite. `test/store-scope.test.ts` asserts the SQL and in-memory
 scope predicates agree on the same fixtures, because two implementations of
 one rule is how a thread quietly stops seeing its own builds.
+
+---
+
+## More bb plugins
+
+This is one of eight bb plugins I publish — see them all at
+[**vburojevic/bb-plugins**](https://github.com/vburojevic/bb-plugins).
