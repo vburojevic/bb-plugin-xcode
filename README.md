@@ -382,5 +382,5 @@ one rule is how a thread quietly stops seeing its own builds.
 
 ## More bb plugins
 
-This is one of eight bb plugins I publish — see them all at
+See every bb plugin I publish at
 [**vburojevic/bb-plugins**](https://github.com/vburojevic/bb-plugins).
