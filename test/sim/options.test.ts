@@ -13,6 +13,7 @@ describe("the ui options allowlist", () => {
       ["showThreadActivity", true],
       ["postChangedPreviews", true],
       ["showDeviceChrome", false],
+      ["openSimulatorOnDrive", false],
     ]);
 
     const flipped = uiOptions({ showThreadActivity: false, showDeviceChrome: true });
@@ -48,7 +49,12 @@ describe("the ui options allowlist", () => {
     // Every allowlisted key must be one of the known display toggles — a new
     // key added to the menu has to be added HERE too, which is the point: two
     // lists that must agree force the security question to be asked twice.
-    const display = new Set(["showThreadActivity", "postChangedPreviews", "showDeviceChrome"]);
+    const display = new Set([
+      "showThreadActivity",
+      "postChangedPreviews",
+      "showDeviceChrome",
+      "openSimulatorOnDrive",
+    ]);
     for (const option of uiOptions({})) {
       expect(display.has(option.key)).toBe(true);
     }

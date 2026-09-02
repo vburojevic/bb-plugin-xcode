@@ -23,3 +23,17 @@ export interface Signal {
 export function signal(kind: SignalKind): Signal {
   return { kind };
 }
+
+/**
+ * A thread has started driving the simulator through the agent tools or the
+ * CLI. Its own composer, and nothing else, reacts by opening the simulator tab
+ * — see `app/sim/useOpenOnDrive.ts`. Separate from `CHANNEL` so the panels
+ * that refetch on every `simulator-changed` do not pay for a signal that is
+ * not about state.
+ */
+export const DRIVE_CHANNEL = "simulator-driven";
+
+export interface DriveSignal {
+  threadId: string;
+  deviceUdid: string;
+}

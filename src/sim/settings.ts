@@ -28,6 +28,8 @@ export interface Settings {
   allowIntelLive: boolean;
   allowAgentCapture: boolean;
   postChangedPreviews: boolean;
+  /** Open the thread's simulator tab when its agent starts driving. Off by default. */
+  openSimulatorOnDrive: boolean;
 }
 
 export const DEFAULTS: Settings = {
@@ -42,6 +44,7 @@ export const DEFAULTS: Settings = {
   allowIntelLive: false,
   allowAgentCapture: false,
   postChangedPreviews: true,
+  openSimulatorOnDrive: false,
 };
 
 /**
@@ -124,6 +127,13 @@ export const SETTINGS_DESCRIPTORS = {
     description: "Show a banner above the composer when a preview render finishes in this thread.",
     default: DEFAULTS.postChangedPreviews,
   },
+  openSimulatorOnDrive: {
+    type: "boolean",
+    label: "Open the simulator when an agent drives it",
+    description:
+      "When a thread starts driving the simulator through the agent tools or the CLI, open the simulator tab in that thread's side panel. Off by default; needs allowAgentCapture to have anything to react to.",
+    default: DEFAULTS.openSimulatorOnDrive,
+  },
 } as const;
 
 /** The raw shape `settings.get()` returns, before normalization. */
@@ -185,5 +195,6 @@ export function normalizeSettings(raw: RawSettings): Settings {
     allowIntelLive: parseBoolean(raw.allowIntelLive, DEFAULTS.allowIntelLive),
     allowAgentCapture: parseBoolean(raw.allowAgentCapture, DEFAULTS.allowAgentCapture),
     postChangedPreviews: parseBoolean(raw.postChangedPreviews, DEFAULTS.postChangedPreviews),
+    openSimulatorOnDrive: parseBoolean(raw.openSimulatorOnDrive, DEFAULTS.openSimulatorOnDrive),
   };
 }

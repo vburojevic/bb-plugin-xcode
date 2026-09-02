@@ -20,7 +20,8 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 
 import { rpcContract } from "./contract.js";
-import { CHANNEL } from "./channel.js";
+import { CHANNEL, DRIVE_CHANNEL, type DriveSignal } from "./channel.js";
+import { DriveAnnouncer } from "./announce.js";
 import { prepareConnection } from "./store.js";
 import { dataDirOf, framesRootOf, type Ctx, type ThreadScope } from "./context.js";
 import { FrameStore } from "./framestore.js";
@@ -230,6 +231,14 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // resource: `stillsDevice` is one shared UDID by design, and two callers with
   // different scopes still drive the same simulator.
   const leases = new LeaseRegistry(() => live.currentDevice()?.name ?? "the simulator");
+  // "Started driving" is a session, not a lease: see `src/sim/announce.ts`.
+  // Announced straight to the socket rather than through the coalescer, which
+  // exists for state signals; this one carries its own payload and is already
+  // at most once per thread per quiet window.
+  const drives = new DriveAnnouncer();
+  const announceDrive = (payload: DriveSignal): void => {
+    safely(isDisposed, () => bb.realtime.publish(DRIVE_CHANNEL, payload));
+  };
 
   // The stills queue is keyed on the device UDID rather than the project: the
   // contended resource is the simulator, and `stillsDevice` is one shared UDID
@@ -603,7 +612,14 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
     leases: {
       acquire: (threadId) => {
         const device = live.currentDevice();
-        return leases.acquire(device?.udid ?? "none", threadId);
+        const outcome = leases.acquire(device?.udid ?? "none", threadId);
+        // A person in the panel is `null` and already has the panel open.
+        if (outcome.ok && threadId !== null && device !== null && drives.touch(threadId)) {
+          if (settings.openSimulatorOnDrive) {
+            announceDrive({ threadId, deviceUdid: device.udid });
+          }
+        }
+        return outcome;
       },
     },
     log,

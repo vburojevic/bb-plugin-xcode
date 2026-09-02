@@ -45,6 +45,12 @@ const SPECS: readonly UiOptionSpec[] = [
     detail: "A bezel around the live frame.",
     defaultValue: false,
   },
+  {
+    key: "openSimulatorOnDrive",
+    label: "Open the simulator when an agent drives it",
+    detail: "The thread's simulator tab opens as its agent starts driving.",
+    defaultValue: false,
+  },
 ];
 
 export function isUiOptionKey(key: string): boolean {
