@@ -16,7 +16,7 @@
  * `safely`, and every fire-and-forget through `detach`.
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 
 import { rpcContract } from "./contract.js";
@@ -167,9 +167,15 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // Probed on first use, not at load: the probes cost a few seconds of child
   // processes and nothing needs them until someone opens the doctor. Memoized
   // on the in-flight promise so two panels mounting together share one sweep.
-  // Two above `src/sim/`, so this is the plugin root either way — bundled at
-  // `dist/server.js` or evaluated from source.
-  const preflightDeps = defaultDeps(new URL("../../", import.meta.url).pathname);
+  //
+  // The plugin root is wherever `sim-host.mjs` lives: `resolveSimHostPath`
+  // already knows both layouts. Counting `../` from `import.meta.url` does not
+  // — two above `src/sim/wire.ts` is the root, but two above `dist/server.js`
+  // is the directory *containing* a git install, where there is no
+  // `node_modules`, and the doctor then reports serve-sim as not installed on
+  // a machine where it is.
+  const simHost = resolveSimHostPath(import.meta.url);
+  const preflightDeps = defaultDeps(dirname(simHost.path));
   let preflight: Promise<Preflight> | null = null;
   const getPreflight = (): Promise<Preflight> => {
     preflight ??= runPreflight(preflightDeps);
@@ -203,7 +209,6 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // ---------------------------------------------------------------------------
 
   const driver = new DeviceDriver();
-  const simHost = resolveSimHostPath(import.meta.url);
   log("info", `capture host at ${simHost.path}`);
   const live = new LiveService({
     driver,
