@@ -22,6 +22,7 @@
  * main bb panel; tools never create or return a simulator share.
  */
 import { z } from "zod";
+import type { PluginAgentToolContext } from "@get-bb/plugin-sdk";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -399,14 +400,20 @@ export function makeStillsTool(ctx: Ctx) {
       },
     },
     parameters: stillsParameters,
-    async execute(args: z.infer<typeof stillsParameters>): Promise<ToolResult> {
+    async execute(
+      args: z.infer<typeof stillsParameters>,
+      toolCtx: PluginAgentToolContext,
+    ): Promise<ToolResult> {
       if (!ctx.settings().allowAgentCapture) {
         return textError("Simulator agent access is disabled in Xcode plugin settings.");
       }
+      if (!toolCtx?.threadId?.trim() || !toolCtx.projectId?.trim()) {
+        return textError("Xcode Simulators requires a calling thread and project to render previews.");
+      }
       let summary;
       try {
-        const scope = await ctx.scopeForThread(null);
-        if (scope === null) {
+        const scope = await ctx.scopeForThread(toolCtx.threadId);
+        if (scope === null || scope.projectId !== toolCtx.projectId) {
           return textError("Xcode Simulators could not work out which project this is.");
         }
         summary = await ctx.stills.run(scope, args.device ?? null);
