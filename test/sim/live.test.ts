@@ -108,6 +108,42 @@ const DEVICE: SimDevice = {
 
 let now = 1_000_000;
 
+describe("device discovery fan-out", () => {
+  it("shares one simctl pair across 20 simultaneous readers without caching settled results", async () => {
+    const deps = makeDeps(new Set());
+    let release!: (value: SimDevice[]) => void;
+    const list = vi.fn(() => new Promise<SimDevice[]>((resolve) => { release = resolve; }));
+    const runtimes = vi.fn(async () => []);
+    deps.driver.list = list;
+    deps.driver.runtimes = runtimes;
+    const service = new LiveService(deps);
+    const requests = Array.from({ length: 20 }, () => service.devices());
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(runtimes).toHaveBeenCalledTimes(1);
+    release([DEVICE]);
+    const results = await Promise.all(requests);
+    expect(results.every((result) => result.devices[0] === DEVICE)).toBe(true);
+    const next = service.devices();
+    expect(list).toHaveBeenCalledTimes(2);
+    release([]);
+    expect((await next).devices).toEqual([]);
+    await service.dispose();
+  });
+
+  it("retries failed discovery and isolates callers with cancellation signals", async () => {
+    const deps = makeDeps(new Set());
+    const list = vi.fn().mockRejectedValueOnce(new Error("simctl unavailable")).mockResolvedValue([]);
+    deps.driver.list = list;
+    const service = new LiveService(deps);
+    await expect(service.devices()).rejects.toThrow("simctl unavailable");
+    await service.devices();
+    expect(list).toHaveBeenCalledTimes(2);
+    await Promise.all([service.devices(new AbortController().signal), service.devices(new AbortController().signal)]);
+    expect(list).toHaveBeenCalledTimes(4);
+    await service.dispose();
+  });
+});
+
 function makeDeps(booted: Set<string>): LiveDeps {
   return {
     driver: {

@@ -749,7 +749,21 @@ export class LiveService {
    * its own sentence, which is why the failure is thrown rather than swallowed
    * into an empty array.
    */
-  async devices(signal?: AbortSignal): Promise<{
+  private deviceListing: ReturnType<LiveService["readDevices"]> | null = null;
+
+  devices(signal?: AbortSignal): ReturnType<LiveService["readDevices"]> {
+    // Panels and thread pickers ask together after a shared realtime signal.
+    // Share only outstanding reads; never reuse a settled device state or
+    // let one caller's cancellation terminate another caller's request.
+    if (signal) return this.readDevices(signal);
+    if (this.deviceListing) return this.deviceListing;
+    this.deviceListing = this.readDevices().finally(() => {
+      this.deviceListing = null;
+    });
+    return this.deviceListing;
+  }
+
+  private async readDevices(signal?: AbortSignal): Promise<{
     devices: SimDevice[];
     bootedUdids: string[];
     suggested: LiveDevice | null;
