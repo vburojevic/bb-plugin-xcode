@@ -16,6 +16,7 @@ import { Icon } from "@/components/ui/icon";
 import type { rpcContract } from "../../src/sim/wire";
 import { PANEL_PATH } from "./route";
 import { TONE_CLASS } from "./copy";
+import { useOpenOnDrive } from "./useOpenOnDrive";
 
 interface Row {
   id: string;
@@ -50,6 +51,10 @@ export function ActivityBanner() {
 
   useEffect(refresh, [refresh]);
   useRealtime("simulator-changed", refresh);
+  // This banner is the one plugin surface mounted in every thread's composer
+  // with the thread id and navigation in scope, so the auto-open lives here
+  // even though it draws nothing.
+  useOpenOnDrive(threadId);
 
   const visible = rows.filter((row) => !hidden.has(row.id));
   if (visible.length === 0) return null;

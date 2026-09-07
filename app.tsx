@@ -31,6 +31,7 @@ import { StillsDirective } from "./app/sim/StillsDirective";
 import { ActivityBanner as SimulatorBanner } from "./app/sim/ActivityBanner";
 import { ServerConfirm } from "./app/sim/ServerConfirm";
 import { ThreadSimulator } from "./app/sim/ThreadSimulator";
+import { SIMULATOR_PANEL_ACTION } from "./app/sim/useOpenOnDrive";
 import { PANEL_PATH } from "./app/sim/route";
 
 export default definePluginApp((app) => {
@@ -59,7 +60,7 @@ export default definePluginApp((app) => {
    * host's padded scroll container.
    */
   app.slots.threadPanelAction({
-    id: "simulator",
+    id: SIMULATOR_PANEL_ACTION,
     title: "Open simulator",
     icon: "Smartphone",
     layout: "flush",

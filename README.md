@@ -191,6 +191,13 @@ The four simulator tools are off by default and gated behind the
 that is a decision the plugin refuses to make for you. Flipping it off revokes
 already-registered tools on their next call.
 
+With `openSimulatorOnDrive` on (off by default; also in the panel's gear
+menu), a thread's simulator tab opens in its side panel the moment its agent
+starts driving — through the tools or the CLI — so you watch what the agent
+does without going looking for it. It fires once per driving session, not per
+gesture: a tab you close stays closed until the agent has been quiet for a
+minute and a half and starts again.
+
 Stream evidence is generation-scoped and correlated with `simulator_capture`
 in the tool's text; it never replaces or rewrites the full-resolution durable
 JPEG. `sourceFps` remains approximate because the current v1 AVCC stream has no
