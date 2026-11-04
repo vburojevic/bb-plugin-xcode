@@ -9,12 +9,13 @@ import { validateBuildArguments } from './build-security';
 import { startWrappedBuild, type WrappedDeps } from './wrapped';
 import { DeviceDriver } from './sim/devices';
 import { HidSocket } from './sim/hid';
-import { executeStep, coordinatesOnly } from './sim/steps';
+import { coordinatesOnly } from './sim/steps';
 import { flatten, findByLabel, describeMiss } from './sim/ax';
 import { startSimHost, resolveSimHostPath, type SimHostHandle } from './sim/sim-host-sup';
 import * as host from './sim/sim-host-client';
 import { z } from 'zod';
 import { saveNativePngReceipt, writeNativeReceipt } from './native-evidence';
+import {preflightNativeDrive,executeNativeDrive} from './native-drive';
 import {archiveOwnedTestPlans,snapshotTestPlans,attestPreparedTests,verifyPreparedTests,type PreparedTests,type PlanSnapshot} from './native-test-products';
 import { createHash } from 'node:crypto';
 
@@ -124,6 +125,7 @@ export async function installNativeExecutor(bb: BbPluginApi, wrapped: WrappedDep
   };
   const perform = async (input:z.infer<typeof nativeExecuteInput>, lane:Lane, job:Job) => {
     const d=lane.descriptor;
+    if(input.action==='drive')preflightNativeDrive(input.steps!);
     if (input.action === 'open') return;
     if (input.action === 'close') {
       lane.socket?.close(); lane.host?.stop();
@@ -187,18 +189,14 @@ export async function installNativeExecutor(bb: BbPluginApi, wrapped: WrappedDep
     await attestForeground(lane,input.bundleId);
     if (input.action === 'drive') {
       const socket=await socketFor(lane);
-      for (const step of input.steps!) {
-        job.abort.signal.throwIfAborted();
-        const resolvePoint = async (point:Parameters<typeof coordinatesOnly>[0]) => {
-          if ('x' in point) return point;
-          const tree=flatten(await host.accessibility(lane.host!,input.deviceId));
-          const match=findByLabel(tree,point.element.label);
-          if (!match) throw new Error(describeMiss(tree,point.element.label));
-          return match.point;
-        };
-        const result=await executeStep(socket,step,resolvePoint);
-        job.value.log.push(result.log);
-      }
+      const resolvePoint = async (point:Parameters<typeof coordinatesOnly>[0]) => {
+        if ('x' in point) return point;
+        const tree=flatten(await host.accessibility(lane.host!,input.deviceId));
+        const match=findByLabel(tree,point.element.label);
+        if (!match) throw new Error(describeMiss(tree,point.element.label));
+        return match.point;
+      };
+      await executeNativeDrive({deviceId:input.deviceId,steps:input.steps!,socket,resolve:resolvePoint,driver,signal:job.abort.signal,ensureDevice,onStep:log=>job.value.log.push(log)});
     }
     await attestInstalled(lane,input.bundleId,job.abort.signal);
     await attestForeground(lane,input.bundleId);

@@ -443,6 +443,19 @@ drive/capture also require the attested app to be foreground. Device creation
 and boot remain Atlas preparation.
 Drive uses a dedicated UDID-bound helper/HID session and captures an unaltered
 PNG; capture uses the explicit device, never the panel's global selection.
+Drive text supports well-formed Unicode with LF/tab as the only permitted control
+characters. Printable ASCII and LF/tab use canonical HID; text needing Unicode
+is copied as one complete string using `DeviceDriver.pbcopy(exactUDID, …)` and
+the same device's supported paste chord after pasteboard synchronization. It
+never types an ASCII prefix before pasting the remainder, or uses the host
+clipboard. CR (including CRLF), NUL, other C0/DEL/C1 controls and malformed
+surrogates are refused for the entire batch before device/UI actions. Known
+invalid key/orientation names are likewise preflighted. Paste failures,
+cancellation and any unexpected dropped characters fail the job and prevent a
+success capture; already completed steps may have changed the UI on runtime
+failure. This is transport execution evidence, not an assertion that an app
+accepted the requested text; live native behavior remains unverified.
+
 
 Legacy native commands and panel input refuse throughout open and closed custody. A lane
 cannot open while tracked legacy work or a global Live session remains active.

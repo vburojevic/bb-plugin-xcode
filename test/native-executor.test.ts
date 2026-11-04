@@ -128,6 +128,12 @@ describe('native resource executor boundaries without native execution',()=>{
     const result=await f.settled(f.id.operationId);expect(result.state).toBe('failed');expect(result.error).toContain('clean');
     expect(()=>assertLegacyNativeAllowed()).toThrow();
   });
+  it('rejects lossy drive input before device access or success capture',async()=>{
+    const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);
+    const drive={...f.id,action:'drive',operationId:randomUUID(),bundleId:'app.example',steps:[{kind:'tap',at:{x:0.5,y:0.5}},{kind:'type',text:'bad\rtext'}]};
+    await f.invoke('experimental_nativeExecute',drive);const result=await f.settled(drive.operationId);expect(result.state).toBe('failed');expect(result.error).toContain('unsupported control');
+    expect(DeviceDriver.prototype.list).not.toHaveBeenCalled();expect(await f.invoke('experimental_nativeStatus',{capability:f.id.capability,operationId:drive.operationId})).toMatchObject({imagePath:null});
+  });
   it('does not expose status to another capability',async()=>{
     const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);
     expect(()=>f.invoke('experimental_nativeStatus',{operationId:f.id.operationId,capability:'b'.repeat(64)})).toThrow('capability');
