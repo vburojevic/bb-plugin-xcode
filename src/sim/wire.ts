@@ -1,3 +1,4 @@
+import { interlockHandlers, enterLegacyNative } from "../native-gate";
 /**
  * Simulator wiring — everything the Simulators half of this plugin registers.
  *
@@ -603,7 +604,10 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
     leases: {
       acquire: (threadId) => {
         const device = live.currentDevice();
-        return leases.acquire(device?.udid ?? "none", threadId);
+        const releaseLegacy = enterLegacyNative();
+        const lease = leases.acquire(device?.udid ?? "none", threadId);
+        if (!lease.ok) { releaseLegacy(); return lease; }
+        return { ok: true as const, release: () => { lease.release(); releaseLegacy(); } };
       },
     },
     log,
@@ -773,7 +777,7 @@ export async function installSimulators(bb: BbPluginApi, host: SimulatorHost): P
   // RPC
   // ---------------------------------------------------------------------------
 
-  bb.rpc.register(rpcContract, makeRpcHandlers(ctx, liveStreamStats));
+  bb.rpc.register(rpcContract, interlockHandlers(makeRpcHandlers(ctx, liveStreamStats)));
 
   // ---------------------------------------------------------------------------
   // The stream proxy

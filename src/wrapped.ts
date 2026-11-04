@@ -7,6 +7,7 @@
  * in whether the caller waits.
  */
 
+import { enterLegacyNative } from "./native-gate";
 import type { Collector } from "./collector";
 import type { Engine } from "./engine";
 import { describeExit, runWrapped } from "./runner";
@@ -65,12 +66,13 @@ let activeWrappedBuilds = 0;
  */
 export async function startWrappedBuild(
   deps: WrappedDeps,
-  options: { argv: readonly string[]; cwd?: string; killSignal?: AbortSignal },
+  options: { argv: readonly string[]; cwd?: string; killSignal?: AbortSignal; nativeFence?: boolean; onStart?: (info: {pid: number | null; bundlePath: string; isAlive: () => boolean}) => void },
 ): Promise<StartedBuild | null> {
   if (activeWrappedBuilds >= MAX_CONCURRENT_WRAPPED_BUILDS) {
     deps.log.warn(`refused wrapped build: ${MAX_CONCURRENT_WRAPPED_BUILDS} are already running`);
     return null;
   }
+  const releaseLegacy = options.nativeFence ? () => {} : enterLegacyNative();
   activeWrappedBuilds += 1;
   let lastLivePublishAt = 0;
   let bundlePath: string | null = null;
@@ -82,6 +84,7 @@ export async function startWrappedBuild(
 
   const completed = runWrapped({
     argv: options.argv,
+    ownedProcessGroup: options.nativeFence,
     cwd: options.cwd,
     // Bundles go where the shim's do, so one retention policy covers every
     // bundle this plugin causes to exist.
@@ -92,6 +95,7 @@ export async function startWrappedBuild(
     detachSignal: deps.detachSignal,
     onStart: (info) => {
       bundlePath = info.bundlePath;
+      options.onStart?.(info);
       resolveStarted();
     },
     onEvent: (_event, progress) => {
@@ -159,6 +163,7 @@ export async function startWrappedBuild(
       };
     })
     .finally(() => {
+      releaseLegacy();
       activeWrappedBuilds = Math.max(0, activeWrappedBuilds - 1);
     });
 

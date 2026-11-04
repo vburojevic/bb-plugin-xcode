@@ -31,6 +31,8 @@ export const RUNNER_STOP_GRACE_MS = 2000;
 
 export interface RunnerOptions {
   argv: readonly string[];
+  /** Native fenced jobs own a fresh process group; legacy builds keep their existing lifetime. */
+  ownedProcessGroup?: boolean;
   cwd?: string;
   /**
    * Where the result bundle is written when the argv does not name one.
@@ -45,7 +47,7 @@ export interface RunnerOptions {
   /** Called on every parsed event; keep it cheap, it runs on the tail loop. */
   onEvent?: (event: StreamEvent, progress: StreamProgress) => void;
   /** Called once the child is spawned, with the paths it will write. */
-  onStart?: (info: { bundlePath: string; streamPath: string; pid: number | null }) => void;
+  onStart?: (info: { bundlePath: string; streamPath: string; pid: number | null; isAlive: () => boolean }) => void;
   /** Poll interval for the stream file tail. */
   pollMs?: number;
   /** Aborting this kills the child (SIGTERM). */
@@ -111,6 +113,7 @@ export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> 
 
   const child = spawn(command, args, {
     cwd: options.cwd,
+    detached: options.ownedProcessGroup === true,
     env: curatedChildEnv(process.env),
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -120,13 +123,15 @@ export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> 
   let killTimer: ReturnType<typeof setTimeout> | null = null;
   const terminate = (): void => {
     try {
-      child.kill("SIGTERM");
+      if (options.ownedProcessGroup && child.pid) process.kill(-child.pid, "SIGTERM");
+      else child.kill("SIGTERM");
     } catch {
       // Already gone.
     }
     killTimer ??= setTimeout(() => {
       try {
-        child.kill("SIGKILL");
+        if (options.ownedProcessGroup && child.pid) process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
       } catch {
         // Already gone.
       }
@@ -138,6 +143,7 @@ export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> 
       bundlePath: injected.bundlePath,
       streamPath: injected.streamPath,
       pid: child.pid ?? null,
+      isAlive: () => child.pid !== undefined && child.exitCode === null && child.signalCode === null,
     });
   } catch (error) {
     terminate();
@@ -223,6 +229,14 @@ export async function runWrapped(options: RunnerOptions): Promise<RunnerResult> 
   if (options.bundleDir) {
     await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
+
+  // A fenced job cannot acknowledge terminality while its owned process group survives.
+  // Keep Atlas busy for explicit recovery rather than guessing from a parent PID's exit.
+  if (options.ownedProcessGroup && child.pid) {
+    try { process.kill(-child.pid, 0); throw new Error("Native owned process group remains after xcodebuild exit."); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+  }
+
 
   return {
     exitCode: exit.code,

@@ -1,3 +1,4 @@
+import { assertLegacyNativeAllowed } from "../native-gate";
 /**
  * `bb xcode sim …`
  *
@@ -219,6 +220,7 @@ const NO_INVOCATION_SCOPE =
 
 export function makeCli(base: Ctx) {
   return async function run(argv: string[], cliCtx: CliContext): Promise<CliResult> {
+    assertLegacyNativeAllowed();
     const ctx = forInvocation(base, cliCtx);
     const command = argv[0] ?? "";
     if (!ctx.settings().allowAgentCapture && AGENT_CAPTURE_COMMANDS.has(command)) {

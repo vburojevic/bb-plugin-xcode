@@ -384,3 +384,48 @@ one rule is how a thread quietly stops seeing its own builds.
 
 See every bb plugin I publish at
 [**vburojevic/bb-plugins**](https://github.com/vburojevic/bb-plugins).
+
+### Experimental Atlas native resource executor
+
+`experimental_nativeCapabilities`, `experimental_nativeExecute`,
+`experimental_nativeStatus`, `experimental_nativeCancel` and
+`experimental_nativeActive` are public RPCs restricted to the host-authenticated
+`atlas` plugin caller. The contract is in `src/native-contract.ts`; agents, CLI,
+frontend clients and other plugins cannot supply their own caller identity.
+This requires Plugin SDK 0.6.104 (the authenticated RPC context), and the two
+frontend registrations use its current tab/composer APIs.
+
+Atlas remains the sole allocator. It validates every operation through
+`experimental_validateNativeLane` with `phase: begin/end`; `end` includes
+`outcome: passed/failed/cancelled`. Its descriptor pins the SDK-resolved thread,
+environment, local host, clean source SHA, exact device and canonical owned
+thread-storage paths. Open a lane before starting jobs; close it after all jobs
+settle. Each call returns a job receipt immediately. Poll status with the same
+capability and operation UUID. Cancellation requests termination; a returned
+`running` state never proves termination. No operation UUID may be reused.
+
+Build/test routing is minted by the executor: exact simulator destination,
+DerivedData, operation-specific result bundle, compiler workers and disabled
+parallel simulator testing. The API accepts project/scheme/configuration and
+optional test selectors, never arbitrary command arguments. Install accepts only a successful exact-source product receipt. Launch, drive
+and capture require fresh matching product and installed-app tree hashes;
+drive/capture also require the attested app to be foreground. Device creation
+and boot remain Atlas preparation.
+Drive uses a dedicated UDID-bound helper/HID session and captures an unaltered
+PNG; capture uses the explicit device, never the panel's global selection.
+
+Legacy native commands and panel input refuse while lanes are open. A lane
+cannot open while tracked legacy work or a global Live session remains active.
+Active managed build receipts retain a liveness closure over their actual
+ChildProcess, rather than treating a stored PID as attribution proof. Fenced
+builds own a process group; cancellation signals that group. If process-group
+terminality, Atlas acknowledgement or journal persistence is uncertain, the
+job remains `fence-held`. There is no lease timeout. A restart with a lane
+journal refuses activation and legacy execution pending explicit recovery;
+automatic journal reconciliation is deliberately unavailable.
+
+These controls govern this plugin's routes. Manual Xcode, Simulator.app and
+external processes remain outside the fence; Atlas must reconcile its host
+inventory before admission. No live native loop is implied by unit tests or a
+capabilities response. This change has not installed/reloaded the shared plugin
+or run a simulator/build action.

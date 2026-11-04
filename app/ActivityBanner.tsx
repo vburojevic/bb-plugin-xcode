@@ -55,7 +55,7 @@
  */
 
 import { useCallback } from "react";
-import { useComposerView, useRpc } from "@get-bb/plugin-sdk/app";
+import { useComposer, useRpc } from "@get-bb/plugin-sdk/app";
 
 import { cn } from "@/lib/utils";
 
@@ -78,7 +78,7 @@ const PROMPT_STACK_CARD_ROW_HEIGHT = 32;
 const MAX_ROWS = 4;
 
 export function XcodeActivityBanner() {
-  const view = useComposerView();
+  const view = useComposer();
   if (view.scope.kind !== "thread") return null;
   return <XcodeActivityBannerLoaded threadId={view.scope.threadId} />;
 }

@@ -154,7 +154,7 @@ export function definePluginApp(setup: (app: unknown) => void): RegisteredApp {
   setup({
     slots: {
       navPanel: (entry: Record<string, unknown>) => registered.navPanels.push(entry),
-      threadPanelAction: (entry: Record<string, unknown>) => registered.threadPanelActions.push(entry),
+      experimental_tab: (entry: Record<string, unknown>) => registered.threadPanelActions.push(entry),
       messageDirective: (entry: Record<string, unknown>) => registered.messageDirectives.push(entry),
       homepageSection: () => {},
       settingsSection: () => {},

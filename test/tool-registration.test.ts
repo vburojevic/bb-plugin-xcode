@@ -19,8 +19,8 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  parsePluginAgentToolPresentation,
-  rejectStaleAgentToolFields,
+  parsePluginRowPresentation,
+  normalizeAgentToolRegistration,
 } from "@get-bb/plugin-sdk/internal/host-policy";
 
 import { createTools, type ToolDeps } from "../src/tools";
@@ -66,19 +66,18 @@ describe("agent tool registrations against the host validator", () => {
     ]);
   });
 
+
   it.each(tools.map((tool) => [tool.name, tool] as const))(
-    "%s carries no field the current SDK rejects",
-    (name, tool) => {
-      // Throws on a renamed field (the v0.2.1 failure) and on any unknown
-      // `experimental_*` key.
-      expect(() => rejectStaleAgentToolFields(name, tool)).not.toThrow();
+    "%s passes the current host registration validator",
+    (_name, tool) => {
+      expect(() => normalizeAgentToolRegistration({pluginId:"xcode", declaredIconNames:new Set(), tool})).not.toThrow();
     },
   );
 
   it.each(tools.map((tool) => [tool.name, tool] as const))(
     "%s declares a presentation the host accepts",
     (name, tool) => {
-      const presentation = parsePluginAgentToolPresentation(
+      const presentation = parsePluginRowPresentation(
         name,
         (tool as { presentation?: unknown }).presentation,
       );

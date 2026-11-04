@@ -1,3 +1,4 @@
+import { assertLegacyNativeAllowed } from "../native-gate";
 /**
  * Agent tools.
  *
@@ -159,9 +160,11 @@ export function makeCaptureTool(
       args: z.infer<typeof captureParameters>,
       context: { threadId: string },
     ): Promise<ToolResult> {
+      assertLegacyNativeAllowed();
       if (!ctx.settings().allowAgentCapture) {
         return textError("Simulator agent access is disabled in Xcode plugin settings.");
       }
+      if (args.udid !== undefined && ctx.live.currentDevice()?.udid !== args.udid) return textError("The requested exact simulator is not the selected live device. Use an Atlas resource lane for isolated routing.");
       const lease = ctx.leases.acquire(context.threadId);
       if (!lease.ok) return textError(lease.reason);
 
@@ -217,6 +220,7 @@ export function makeStreamStatusTool(
     },
     parameters: z.object({}),
     async execute(): Promise<ToolResult> {
+      assertLegacyNativeAllowed();
       if (!ctx.settings().allowAgentCapture) {
         return textError("Simulator agent access is disabled in Xcode plugin settings.");
       }
@@ -254,6 +258,7 @@ export const GLOBAL_INSTRUCTIONS = [
 ].join(" ");
 
 export const driveParameters = z.object({
+  udid: z.string().uuid().optional().describe("Refuse unless this exact device is selected; never retarget the global session."),
   steps: z
     .array(stepSchema)
     .min(1)
@@ -324,12 +329,14 @@ export function makeDriveTool(ctx: Ctx) {
       args: z.infer<typeof driveParameters>,
       context: { threadId: string },
     ): Promise<ToolResult> {
+      assertLegacyNativeAllowed();
       if (!ctx.settings().allowAgentCapture) {
         return textError("Simulator agent access is disabled in Xcode plugin settings.");
       }
       const device = ctx.live.currentDevice();
       if (device === null) return textError("No simulator is running.");
 
+      if (args.udid !== undefined && ctx.live.currentDevice()?.udid !== args.udid) return textError("The requested exact simulator is not the selected live device. Use an Atlas resource lane for isolated routing.");
       const lease = ctx.leases.acquire(context.threadId);
       if (!lease.ok) return textError(lease.reason);
 
@@ -404,6 +411,7 @@ export function makeStillsTool(ctx: Ctx) {
       args: z.infer<typeof stillsParameters>,
       toolCtx: PluginAgentToolContext,
     ): Promise<ToolResult> {
+      assertLegacyNativeAllowed();
       if (!ctx.settings().allowAgentCapture) {
         return textError("Simulator agent access is disabled in Xcode plugin settings.");
       }

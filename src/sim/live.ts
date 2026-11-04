@@ -1,3 +1,4 @@
+import { assertLegacyNativeAllowed, enterLegacyNative, registerLegacyNativeIdleProbe } from "../native-gate";
 /**
  * The Live surface: one supervised capture host, one device session, one HID
  * socket, and the state machine that decides which sentence the panel says.
@@ -111,7 +112,10 @@ export class LiveService {
   private generation = 0;
   private disposed = false;
 
-  constructor(private readonly deps: LiveDeps) {}
+  private unregisterIdle:()=>void;
+  constructor(private readonly deps: LiveDeps) {
+    this.unregisterIdle=registerLegacyNativeIdleProbe(()=>this.session===null && this.child===null && this.starting===null && this.viewers===0);
+  }
 
   private now(): number {
     return (this.deps.now ?? Date.now)();
@@ -276,6 +280,7 @@ export class LiveService {
    * the "Booting" sentence that explains the wait.
    */
   async start(query: string | null, signal?: AbortSignal): Promise<LiveState> {
+    assertLegacyNativeAllowed();
     const device = await this.resolveDevice(query, signal);
     if (device === null) {
       return this.state();
@@ -302,7 +307,7 @@ export class LiveService {
     this.deps.publish();
 
     detach(
-      () => this.attach(device.udid),
+      () => { const release = enterLegacyNative(); return this.attach(device.udid).finally(release); },
       (error) => {
         if (this.session?.device.udid !== device.udid) return;
         this.session.kind = "boot-failed";
@@ -319,6 +324,12 @@ export class LiveService {
    * socket that pushes dimensions.
    */
   private async attach(udid: string): Promise<void> {
+    const release = enterLegacyNative();
+    try { await this.attachUnlocked(udid); } finally { release(); }
+  }
+
+  private async attachUnlocked(udid: string): Promise<void> {
+    assertLegacyNativeAllowed();
     const session = this.session;
     if (session?.device.udid !== udid) return;
     const handle = await this.ensureHost();
@@ -536,6 +547,7 @@ export class LiveService {
    * erase, which reads as a crash.
    */
   async erase(udid: string): Promise<void> {
+    assertLegacyNativeAllowed();
     const session = this.session;
     if (session?.device.udid === udid) {
       session.hid?.close();
@@ -562,6 +574,7 @@ export class LiveService {
   }
 
   async shutdown(udid: string): Promise<void> {
+    assertLegacyNativeAllowed();
     const address = this.address();
     if (address !== null) {
       // Through the child, so its cached capture session is evicted too.
@@ -584,6 +597,7 @@ export class LiveService {
 
   /** The control socket for the current device, or a sentence saying why not. */
   requireSocket(): HidSocket {
+    assertLegacyNativeAllowed();
     const session = this.session;
     if (session === null) throw new Error("No simulator is running.");
     if (session.hid === null) {
@@ -620,6 +634,7 @@ export class LiveService {
    * rejections. Begin and end callers can read the boolean if they care.
    */
   touch(phase: "begin" | "move" | "end", x: number, y: number): boolean {
+    assertLegacyNativeAllowed();
     const session = this.session;
     if (session === null || session.hid === null) return false;
     switch (phase) {
@@ -643,6 +658,7 @@ export class LiveService {
    * silently do nothing.
    */
   stream(events: readonly LiveStreamEvent[]): boolean {
+    assertLegacyNativeAllowed();
     const session = this.session;
     if (session === null || session.hid === null) return false;
     return session.hid.streamLive(events);
@@ -796,6 +812,7 @@ export class LiveService {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.unregisterIdle();
     const starting = this.starting;
     this.clearViewerIdleTimer();
     await this.detachDevice();

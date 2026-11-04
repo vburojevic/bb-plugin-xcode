@@ -1,3 +1,4 @@
+import { installNativeExecutor } from "./src/native-executor";
 /**
  * Xcode activity tracker — backend, v2.
  *
@@ -442,6 +443,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     log,
     isDisposed,
   };
+
+  await installNativeExecutor(bb, wrapped, resolveHostId);
 
   /**
    * Runs the user has dismissed from the activity banner.

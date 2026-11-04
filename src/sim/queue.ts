@@ -1,3 +1,4 @@
+import { enterLegacyNative } from "../native-gate";
 /**
  * The stills queue, keyed on the **device UDID** rather than on the project.
  *
@@ -77,11 +78,14 @@ export class DeviceQueue {
   }
 
   private start(entry: Entry<unknown>): void {
+    let release: () => void;
+    try { release = enterLegacyNative(); } catch (error) { entry.reject(error); return; }
     this.running.set(entry.key.udid, entry);
     entry
       .run(this.controller.signal)
       .then(entry.resolve, entry.reject)
       .finally(() => {
+        release();
         this.running.delete(entry.key.udid);
         const pending = this.waiting.get(entry.key.udid) ?? [];
         const next = pending.shift();
