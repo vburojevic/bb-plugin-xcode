@@ -79,7 +79,8 @@ describe('native resource executor boundaries without native execution',()=>{
     const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);
     expect(()=>f.invoke('experimental_nativeStatus',{operationId:f.id.operationId,capability:'b'.repeat(64)})).toThrow('capability');
   });
-  it('mints exact build resources and retains busy ownership until cancellation actually settles',async()=>{
+  it.each(['build','test'] as const)('mints exact %s resources and retains busy ownership until cancellation actually settles',async(action)=>{
+    vi.mocked(startWrappedBuild).mockClear();
     const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);
     await mkdir(join(f.id.derivedData,'Build','Products','Debug-iphonesimulator'),{recursive:true});
     let finish!:(value:{failed:boolean;exitCode:number|null;signal:string|null;bundlePath:string;errors:number;warnings:number})=>void;
@@ -88,12 +89,14 @@ describe('native resource executor boundaries without native execution',()=>{
       options.onStart?.({pid:12345,bundlePath:join(f.descriptor.resultsRoot,'job.xcresult'),isAlive:()=>alive});
       return {bundlePath:join(f.descriptor.resultsRoot,'job.xcresult'),completed:new Promise(resolve=>{finish=resolve;})};
     });
-    const build={...f.id,action:'build',operationId:randomUUID(),project:'App.xcodeproj',scheme:'App'};
+    const build={...f.id,action,operationId:randomUUID(),project:'App.xcodeproj',scheme:'App'};
     await f.invoke('experimental_nativeExecute',build);
     await vi.waitFor(async()=>{const status=await f.invoke('experimental_nativeStatus',{capability:f.id.capability,operationId:build.operationId});expect(startWrappedBuild,JSON.stringify(status)).toHaveBeenCalled();});
     const options=vi.mocked(startWrappedBuild).mock.calls.at(-1)![1];
     expect(options.argv).toContain('platform=iOS Simulator,id='+f.id.deviceId);
     expect(options.argv).toContain(f.id.derivedData);expect(options.argv).toContain(join(f.descriptor.resultsRoot,build.operationId+'.xcresult'));
+    expect(options.argv.at(-1)).toBe(action==='build'?'build-for-testing':'test-without-building');
+    expect(options.argv).toContain('OTHER_SWIFT_FLAGS=$(inherited) -j2 -num-threads 1');
     expect(options.argv).toContain('-parallel-testing-enabled');expect(options.argv).toContain('NO');expect(options.nativeFence).toBe(true);
     expect(await f.invoke('experimental_nativeActive')).toMatchObject({active:[{pid:12345,operationId:build.operationId,deviceId:f.id.deviceId,sourceSha:f.id.sourceSha}]});
     await f.invoke('experimental_nativeCancel',{capability:f.id.capability,operationId:build.operationId});

@@ -404,9 +404,14 @@ settle. Each call returns a job receipt immediately. Poll status with the same
 capability and operation UUID. Cancellation requests termination; a returned
 `running` state never proves termination. No operation UUID may be reused.
 
-Build/test routing is minted by the executor: exact simulator destination,
+Build maps to `build-for-testing`; test maps to `test-without-building` so
+test runs reuse the lane products. Routing is minted by the executor: exact simulator destination,
 DerivedData, operation-specific result bundle, compiler workers and disabled
-parallel simulator testing. The API accepts project/scheme/configuration and
+parallel simulator testing. The executor also requests `-j<compilerWorkers>`
+and `-num-threads 1` through `OTHER_SWIFT_FLAGS=$(inherited) …`, preserving
+project flags. These requested settings are not evidence of a measured Swift
+worker cap: the emitted compiler command and actual subprocess concurrency
+remain unverified until native acceptance. The API accepts project/scheme/configuration and
 optional test selectors, never arbitrary command arguments. Install accepts only a successful exact-source product receipt. Launch, drive
 and capture require fresh matching product and installed-app tree hashes;
 drive/capture also require the attested app to be foreground. Device creation
@@ -429,3 +434,10 @@ external processes remain outside the fence; Atlas must reconcile its host
 inventory before admission. No live native loop is implied by unit tests or a
 capabilities response. This change has not installed/reloaded the shared plugin
 or run a simulator/build action.
+
+Swift flag provenance: Apple's [build setting inheritance documentation](https://help.apple.com/xcode/mac/current/en.lproj/dev745c5c974.html)
+documents retaining existing flags with `$(inherited)`, and its
+[target settings documentation](https://developer.apple.com/documentation/xcode/configuring-the-build-settings-of-a-target/)
+states command-line setting precedence. The installed Swift driver help
+accepts `-j <n>` and `-num-threads <n>`. No native compile was run to verify
+the final Xcode-generated driver argument order or a global worker bound.

@@ -115,7 +115,7 @@ export async function installNativeExecutor(bb: BbPluginApi, wrapped: WrappedDep
       const project=resolve(d.checkoutPath,input.project!);
       if (!project.endsWith('.xcodeproj') && !project.endsWith('.xcworkspace')) throw new Error('A project or workspace path is required.');
       const bundle=join(d.resultsRoot,input.operationId+'.xcresult');
-      const argv=['/usr/bin/xcodebuild',project.endsWith('.xcworkspace')?'-workspace':'-project',project,'-scheme',input.scheme!,'-configuration',input.configuration??'Debug','-destination',`platform=iOS Simulator,id=${input.deviceId}`,'-derivedDataPath',input.derivedData,'-resultBundlePath',bundle,'-jobs',String(d.compilerWorkers),'-parallel-testing-enabled','NO','-maximum-concurrent-test-simulator-destinations','1',...(input.onlyTesting??[]).map(v=>'-only-testing:'+v),input.action];
+      const argv=['/usr/bin/xcodebuild',project.endsWith('.xcworkspace')?'-workspace':'-project',project,'-scheme',input.scheme!,'-configuration',input.configuration??'Debug','-destination',`platform=iOS Simulator,id=${input.deviceId}`,'-derivedDataPath',input.derivedData,'-resultBundlePath',bundle,'-jobs',String(d.compilerWorkers),'-parallel-testing-enabled','NO','-maximum-concurrent-test-simulator-destinations','1',`OTHER_SWIFT_FLAGS=$(inherited) -j${d.compilerWorkers} -num-threads 1`,...(input.onlyTesting??[]).map(v=>'-only-testing:'+v),input.action==='build'?'build-for-testing':'test-without-building'];
       await validateBuildArguments(["/usr/bin/xcodebuild",project.endsWith(".xcworkspace")?"-workspace":"-project",project],d.checkoutPath,d.checkoutPath);
       job.value.bundlePath=bundle;
       job.terminal=false;
