@@ -56,7 +56,8 @@ export const nativeJob = z.object({
 export type NativeJob = z.infer<typeof nativeJob>;
 const credentials = z.object({capability: z.string().regex(/^[a-f0-9]{64}$/), operationId: z.string().uuid()}).strict();
 export const nativeContract = defineRpcContract({
-  experimental_nativeCapabilities: {input:z.object({}).strict(),output:z.object({version:z.literal(1), exactDevice:z.literal(true), fencing:z.literal(true), managedRuns:z.literal(true), legacyInterlock:z.literal(true)}).strict()},
+  experimental_nativeCapabilities: {input:z.object({}).strict(),output:z.object({version:z.literal(2), exactDevice:z.literal(true), fencing:z.literal(true), managedRuns:z.literal(true), legacyInterlock:z.literal(true)}).strict()},
+  experimental_nativeRelease: {input:z.object({capability:z.string().regex(/^[a-f0-9]{64}$/),threadId:z.string().min(1),deviceId:z.string().uuid()}).strict(),output:z.object({released:z.literal(true)}).strict()},
   experimental_nativeActive: {input:z.object({}).strict(),output:z.object({active:z.array(z.object({pid:z.number().int().positive(),operationId:z.string().uuid(),deviceId:z.string().uuid(),threadId:z.string(),derivedData:z.string(),sourceSha:z.string(),hostId:z.string()}).strict())}).strict()},
   experimental_nativeExecute: {input:nativeExecuteInput,output:nativeJob},
   experimental_nativeStatus: {input:credentials,output:nativeJob},

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, mkdir, rm, writeFile, realpath } from 'node:fs/promises';
-import { tmpdir, homedir } from 'node:os';
+import { mkdtemp, mkdir, rm, writeFile, realpath, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -8,6 +8,7 @@ import type { BbPluginApi } from '@get-bb/plugin-sdk';
 import { startWrappedBuild } from '../src/wrapped';
 vi.mock('../src/wrapped',()=>({startWrappedBuild:vi.fn()}));
 import type { WrappedDeps } from '../src/wrapped';
+import { DeviceDriver, type SimDevice } from '../src/sim/devices';
 import { installNativeExecutor } from '../src/native-executor';
 import { nativeExecuteInput, type LaneIdentity } from '../src/native-contract';
 import { assertLegacyNativeAllowed, enterLegacyNative, enterNativeLane, leaveNativeLane } from '../src/native-gate';
@@ -16,27 +17,29 @@ type Rpc = Record<string,(input:unknown,ctx:{experimental_caller:{kind:string;pl
 const atlas:{experimental_caller:{kind:string;pluginId?:string}}={experimental_caller:{kind:'plugin',pluginId:'atlas'}};
 const dirs:string[]=[];
 const devices:string[]=[];
-afterEach(async()=>{for(const d of devices.splice(0))leaveNativeLane(d);leaveNativeLane('unreconciled-native-journal');await Promise.all(dirs.splice(0).map(p=>rm(p,{recursive:true,force:true})));});
+afterEach(async()=>{vi.restoreAllMocks();for(const d of devices.splice(0))leaveNativeLane(d);leaveNativeLane('unreconciled-native-journal');await Promise.all(dirs.splice(0).map(p=>rm(p,{recursive:true,force:true})));});
 async function setup() {
   const source=await realpath(await mkdtemp(join(tmpdir(),'xcode-source-')));dirs.push(source);
   const git=(...args:string[])=>execFileSync('/usr/bin/git',['-C',source,...args],{encoding:'utf8'}).trim();
   git('init','-q');await mkdir(join(source,'App.xcodeproj'));await writeFile(join(source,'App.xcodeproj','project.pbxproj'),'fixture');await writeFile(join(source,'README'),'source');git('add','.');git('-c','user.name=Native test','-c','user.email=native@example.invalid','commit','-qm','fixture');
   const threadId='thr_native_test_'+randomUUID();
-  const owner=join(homedir(),'.bb','thread-storage',threadId);dirs.push(owner);
+  const owner=await realpath(await mkdtemp(join(tmpdir(),'native-sdk-storage-')));dirs.push(owner);
   const lane=join(owner,'native-lanes',randomUUID());
   const derivedData=join(lane,'DerivedData');const resultsRoot=join(lane,'results');
   await mkdir(derivedData,{recursive:true});await mkdir(resultsRoot);
   const dataDir=await mkdtemp(join(tmpdir(),'xcode-data-'));dirs.push(dataDir);
   const deviceId=randomUUID();devices.push(deviceId);
+  const deviceState={state:'Shutdown'};
+  vi.spyOn(DeviceDriver.prototype,'list').mockImplementation(async()=>[{udid:deviceId,state:deviceState.state} as SimDevice]);
   const id:LaneIdentity={capability:'a'.repeat(64),operationId:randomUUID(),action:'open',threadId,deviceId,derivedData,sourceSha:git('rev-parse','HEAD')};
   const descriptor={ok:true,threadId,environmentId:'env-test',checkoutPath:source,hostId:'host-test',deviceId,derivedData,sourceSha:id.sourceSha,resultsRoot,compilerWorkers:2};
   let handlers:Rpc={};
   const validate=vi.fn(async()=>descriptor);
-  const bb={rpc:{register:(_c:unknown,h:Rpc)=>{handlers=h;}},sdk:{plugins:{callRpc:validate},threads:{get:vi.fn(async()=>({id:threadId,environmentId:'env-test'}))},environments:{get:vi.fn(async()=>({path:source,hostId:'host-test'}))}},onDispose:vi.fn()} as unknown as BbPluginApi;
+  const bb={rpc:{register:(_c:unknown,h:Rpc)=>{handlers=h;}},sdk:{plugins:{callRpc:validate},threads:{get:vi.fn(async()=>({id:threadId,environmentId:'env-test'})),storageLocation:vi.fn(async()=>({hostId:'host-test',storageRootPath:owner}))},environments:{get:vi.fn(async()=>({path:source,hostId:'host-test'}))}},onDispose:vi.fn()} as unknown as BbPluginApi;
   await installNativeExecutor(bb,{dataDir} as WrappedDeps,async()=>'host-test');
   const invoke=(method:string,input:unknown={},ctx=atlas)=>handlers[method]!(input,ctx);
-  const settled=async(operationId:string)=>{let result:unknown;await vi.waitFor(async()=>{result=await invoke('experimental_nativeStatus',{capability:id.capability,operationId});expect((result as {state:string}).state).not.toBe('running');});return result as {state:string;error:string|null};};
-  return {id,descriptor,source,dataDir,validate,invoke,settled};
+  const settled=async(operationId:string,capability=id.capability)=>{let result:unknown;await vi.waitFor(async()=>{result=await invoke('experimental_nativeStatus',{capability,operationId});expect((result as {state:string}).state).not.toBe('running');});return result as {state:string;error:string|null};};
+  return {id,descriptor,source,dataDir,validate,invoke,settled,deviceState,bb,wrapped:{dataDir} as WrappedDeps};
 }
 describe('native resource executor boundaries without native execution',()=>{
   it('requires explicit device and rejects caller identity in input',()=>{
@@ -52,14 +55,46 @@ describe('native resource executor boundaries without native execution',()=>{
     await expect(f.invoke('experimental_nativeExecute',f.id,{experimental_caller:{kind:'plugin',pluginId:'other'}})).rejects.toThrow('authenticated Atlas');
     expect(f.validate).not.toHaveBeenCalled();
   });
-  it('pins SDK checkout and holds legacy interlock until acknowledged close',async()=>{
+  it('pins SDK checkout and holds legacy interlock after close until explicit Shutdown release',async()=>{
     const f=await setup();await f.invoke('experimental_nativeExecute',f.id);
     expect((await f.settled(f.id.operationId)).state).toBe('passed');
     expect(()=>assertLegacyNativeAllowed()).toThrow('Atlas owns');
     const close={...f.id,action:'close',operationId:randomUUID()};
     await f.invoke('experimental_nativeExecute',close);expect((await f.settled(close.operationId)).state).toBe('passed');
+    expect(()=>assertLegacyNativeAllowed()).toThrow();
+    expect(await f.invoke('experimental_nativeRelease',{capability:f.id.capability,threadId:f.id.threadId,deviceId:f.id.deviceId})).toEqual({released:true});
     expect(()=>assertLegacyNativeAllowed()).not.toThrow();
     expect(f.validate.mock.calls.map(c=>(c as unknown as [{input:{phase:string}}])[0].input.phase)).toEqual(['begin','end','begin','end']);
+  });
+  it('retains custody across close/reopen and rejects a new capability until release',async()=>{
+    const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);
+    // Closing only tears down executor state; changing source does not prevent safe teardown.
+    await writeFile(join(f.source,'README'),'source changed');
+    const close={...f.id,action:'close',operationId:randomUUID()};await f.invoke('experimental_nativeExecute',close);expect((await f.settled(close.operationId)).state).toBe('passed');
+    expect(()=>assertLegacyNativeAllowed()).toThrow();
+    await expect(f.invoke('experimental_nativeExecute',{...f.id,capability:'b'.repeat(64),operationId:randomUUID()})).rejects.toThrow('custody');
+    execFileSync('/usr/bin/git',['-C',f.source,'add','.']);execFileSync('/usr/bin/git',['-C',f.source,'-c','user.name=Native test','-c','user.email=native@example.invalid','commit','-qm','refresh']);
+    const sourceSha=execFileSync('/usr/bin/git',['-C',f.source,'rev-parse','HEAD'],{encoding:'utf8'}).trim();f.descriptor.sourceSha=sourceSha;
+    const reopen={...f.id,sourceSha,operationId:randomUUID()};await f.invoke('experimental_nativeExecute',reopen);expect((await f.settled(reopen.operationId)).state).toBe('passed');
+    expect(()=>assertLegacyNativeAllowed()).toThrow();
+  });
+  it('releases only closed Shutdown custody and exact old tombstones cannot free a newer lane',async()=>{
+    const f=await setup();const release={capability:f.id.capability,threadId:f.id.threadId,deviceId:f.id.deviceId};
+    await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);
+    await expect(f.invoke('experimental_nativeRelease',release)).rejects.toThrow('closed');
+    const close={...f.id,action:'close',operationId:randomUUID()};await f.invoke('experimental_nativeExecute',close);await f.settled(close.operationId);
+    f.deviceState.state='Booted';await expect(f.invoke('experimental_nativeRelease',release)).rejects.toThrow('Shutdown');expect(()=>assertLegacyNativeAllowed()).toThrow();
+    f.deviceState.state='Shutdown';expect(await f.invoke('experimental_nativeRelease',release)).toEqual({released:true});expect(()=>assertLegacyNativeAllowed()).not.toThrow();
+    // An exact retry after a restart is a no-op tombstone acknowledgement.
+    await installNativeExecutor(f.bb,f.wrapped,async()=>'host-test');
+    expect(await f.invoke('experimental_nativeRelease',release)).toEqual({released:true});
+    const next={...f.id,capability:'b'.repeat(64),operationId:randomUUID()};await f.invoke('experimental_nativeExecute',next);expect((await f.settled(next.operationId,next.capability)).state).toBe('passed');
+    expect(await f.invoke('experimental_nativeRelease',release)).toEqual({released:true});expect(()=>assertLegacyNativeAllowed()).toThrow();
+    await expect(f.invoke('experimental_nativeRelease',{...release,capability:'c'.repeat(64)})).rejects.toThrow();
+  });
+  it('uses SDK storage authority and refuses a different storage host',async()=>{
+    const f=await setup();vi.mocked(f.bb.sdk.threads.storageLocation).mockResolvedValue({hostId:'other-host',storageRootPath:'/not-the-authority'});
+    await f.invoke('experimental_nativeExecute',f.id);const result=await f.settled(f.id.operationId);expect(result.state).toBe('failed');expect(result.error).toContain('storage');expect(()=>assertLegacyNativeAllowed()).toThrow();
   });
   it('retains busy fence when Atlas cannot acknowledge operation terminality',async()=>{
     const f=await setup();f.validate.mockImplementation(async(...args:unknown[])=>{
@@ -73,7 +108,7 @@ describe('native resource executor boundaries without native execution',()=>{
   it('fails source identity closed before any device operation',async()=>{
     const f=await setup();await writeFile(join(f.source,'README'),'dirty');await f.invoke('experimental_nativeExecute',f.id);
     const result=await f.settled(f.id.operationId);expect(result.state).toBe('failed');expect(result.error).toContain('clean');
-    expect(()=>assertLegacyNativeAllowed()).not.toThrow();
+    expect(()=>assertLegacyNativeAllowed()).toThrow();
   });
   it('does not expose status to another capability',async()=>{
     const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);
@@ -106,6 +141,14 @@ describe('native resource executor boundaries without native execution',()=>{
     alive=false;finish({failed:false,exitCode:null,signal:'SIGTERM',bundlePath:'result',errors:0,warnings:0});
     expect((await f.settled(build.operationId)).state).toBe('cancelled');
     expect(await f.invoke('experimental_nativeActive')).toEqual({active:[]});
+  });
+  it('saves successful build provenance without a capability',async()=>{
+    const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);
+    await mkdir(join(f.id.derivedData,'Build','Products','Debug-iphonesimulator'),{recursive:true});
+    vi.mocked(startWrappedBuild).mockImplementation(async()=>({bundlePath:'result',completed:Promise.resolve({failed:false,exitCode:0,signal:null,bundlePath:'result',errors:0,warnings:0})}));
+    const build={...f.id,action:'build',operationId:randomUUID(),project:'App.xcodeproj',scheme:'App'};await f.invoke('experimental_nativeExecute',build);expect((await f.settled(build.operationId)).state).toBe('passed');
+    const receipt=JSON.parse(await readFile(join(f.descriptor.resultsRoot,build.operationId+'.build.json'),'utf8'));
+    expect(receipt).toMatchObject({operationId:build.operationId,threadId:f.id.threadId,deviceId:f.id.deviceId,sourceSha:f.id.sourceSha,environmentId:f.descriptor.environmentId,hostId:f.descriptor.hostId,role:'iteration-only',swiftWorkerCapVerified:false,action:'build-for-testing'});expect(receipt).not.toHaveProperty('capability');
   });
   it('refuses capture/install of an app without a same-lane product receipt',async()=>{
     const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);

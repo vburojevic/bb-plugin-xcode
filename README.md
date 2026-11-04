@@ -388,8 +388,8 @@ See every bb plugin I publish at
 ### Experimental Atlas native resource executor
 
 `experimental_nativeCapabilities`, `experimental_nativeExecute`,
-`experimental_nativeStatus`, `experimental_nativeCancel` and
-`experimental_nativeActive` are public RPCs restricted to the host-authenticated
+`experimental_nativeStatus`, `experimental_nativeCancel`,
+`experimental_nativeActive` and `experimental_nativeRelease` are public RPCs restricted to the host-authenticated
 `atlas` plugin caller. The contract is in `src/native-contract.ts`; agents, CLI,
 frontend clients and other plugins cannot supply their own caller identity.
 This requires Plugin SDK 0.6.104 (the authenticated RPC context), and the two
@@ -399,10 +399,27 @@ Atlas remains the sole allocator. It validates every operation through
 `experimental_validateNativeLane` with `phase: begin/end`; `end` includes
 `outcome: passed/failed/cancelled`. Its descriptor pins the SDK-resolved thread,
 environment, local host, clean source SHA, exact device and canonical owned
-thread-storage paths. Open a lane before starting jobs; close it after all jobs
-settle. Each call returns a job receipt immediately. Poll status with the same
+thread storage from `bb.sdk.threads.storageLocation`, including matching local
+host identity. Capabilities report version 2. Open a lane before starting jobs;
+close it after all jobs settle. Close discards helper/product state but retains
+custody and the legacy interlock. A matching capability/thread may reopen to
+refresh source. Only `experimental_nativeRelease({capability,threadId,deviceId})`
+can end custody after Atlas parks the device and this executor independently
+confirms exact Shutdown. Release refuses open/busy/uncertain jobs and rechecks
+the static SDK actor. Durable capability-hash tombstones make exact retries
+idempotent; an old retry cannot free a newer capability's custody. Execute
+returns a job receipt immediately; release returns an acknowledgement. Poll
+job status with the same
 capability and operation UUID. Cancellation requests termination; a returned
 `running` state never proves termination. No operation UUID may be reused.
+
+PNG captures have a sibling `<operationId>.png.json` receipt with original PNG
+SHA-256, exact source/SDK actor/device, app-product hash, verified foreground,
+time and `role: iteration-only`. Successful builds write
+`<operationId>.build.json` with the same source/job binding, result path and
+requested compiler policy. Receipts are bounded to 64KiB, refuse capabilities
+and never overwrite existing evidence. They require the paired successful job
+and are not canonical Atlas capture acceptance.
 
 Build maps to `build-for-testing`; test maps to `test-without-building` so
 test runs reuse the lane products. Routing is minted by the executor: exact simulator destination,
@@ -419,7 +436,7 @@ and boot remain Atlas preparation.
 Drive uses a dedicated UDID-bound helper/HID session and captures an unaltered
 PNG; capture uses the explicit device, never the panel's global selection.
 
-Legacy native commands and panel input refuse while lanes are open. A lane
+Legacy native commands and panel input refuse throughout open and closed custody. A lane
 cannot open while tracked legacy work or a global Live session remains active.
 Active managed build receipts retain a liveness closure over their actual
 ChildProcess, rather than treating a stored PID as attribution proof. Fenced
