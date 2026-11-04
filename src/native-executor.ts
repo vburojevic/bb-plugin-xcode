@@ -15,10 +15,11 @@ import { startSimHost, resolveSimHostPath, type SimHostHandle } from './sim/sim-
 import * as host from './sim/sim-host-client';
 import { z } from 'zod';
 import { saveNativePngReceipt, writeNativeReceipt } from './native-evidence';
+import {archiveOwnedTestPlans,snapshotTestPlans,attestPreparedTests,verifyPreparedTests,type PreparedTests,type PlanSnapshot} from './native-test-products';
 import { createHash } from 'node:crypto';
 
 const exec = promisify(execFile);
-interface Lane { identity: LaneIdentity; descriptor: LaneDescriptor; busy: boolean; host: SimHostHandle | null; socket: HidSocket | null; products:Map<string,{path:string;hash:string}>; }
+interface Lane { identity: LaneIdentity; descriptor: LaneDescriptor; busy: boolean; host: SimHostHandle | null; socket: HidSocket | null; products:Map<string,{path:string;hash:string}>; prepared?:PreparedTests; ownedPlans:Map<string,string>; }
 interface Job { identity: LaneIdentity; value: NativeJob; abort: AbortController; done: Promise<void>; isAlive:()=>boolean; terminal:boolean; }
 const failure = (e: unknown) => e instanceof Error ? e.message : String(e);
 const atlasOnly = (caller: {kind:string;pluginId?:string}) => {
@@ -129,27 +130,44 @@ export async function installNativeExecutor(bb: BbPluginApi, wrapped: WrappedDep
       return;
     }
     if (input.action === 'build' || input.action === 'test') {
-      const project=resolve(d.checkoutPath,input.project!);
+      const project=await realpath(resolve(d.checkoutPath,input.project!));
       if (!project.endsWith('.xcodeproj') && !project.endsWith('.xcworkspace')) throw new Error('A project or workspace path is required.');
+      await validateBuildArguments(['/usr/bin/xcodebuild',project.endsWith('.xcworkspace')?'-workspace':'-project',project],d.checkoutPath,d.checkoutPath);
+      const key={sourceSha:input.sourceSha,project,scheme:input.scheme!,configuration:input.configuration??'Debug',onlyTesting:input.onlyTesting??[]};
+      const productsRoot=join(input.derivedData,'Build','Products');
+      let before:PlanSnapshot=new Map();let prepared:PreparedTests|undefined;
+      if(input.action==='build') {
+        // Failed/replaced builds cannot leave an executable attestation behind.
+        lane.prepared=undefined;lane.products.clear();
+        await archiveOwnedTestPlans(productsRoot,lane.ownedPlans,d.resultsRoot,input.operationId);
+        before=await snapshotTestPlans(productsRoot);
+      } else prepared=await verifyPreparedTests(lane.prepared,key);
       const bundle=join(d.resultsRoot,input.operationId+'.xcresult');
-      const argv=['/usr/bin/xcodebuild',project.endsWith('.xcworkspace')?'-workspace':'-project',project,'-scheme',input.scheme!,'-configuration',input.configuration??'Debug','-destination',`platform=iOS Simulator,id=${input.deviceId}`,'-derivedDataPath',input.derivedData,'-resultBundlePath',bundle,'-jobs',String(d.compilerWorkers),'-parallel-testing-enabled','NO','-maximum-concurrent-test-simulator-destinations','1',`OTHER_SWIFT_FLAGS=$(inherited) -j${d.compilerWorkers} -num-threads 1`,...(input.onlyTesting??[]).map(v=>'-only-testing:'+v),input.action==='build'?'build-for-testing':'test-without-building'];
-      await validateBuildArguments(["/usr/bin/xcodebuild",project.endsWith(".xcworkspace")?"-workspace":"-project",project],d.checkoutPath,d.checkoutPath);
-      job.value.bundlePath=bundle;
-      job.terminal=false;
+      const routing=input.action==='build'
+        ?[project.endsWith('.xcworkspace')?'-workspace':'-project',project,'-scheme',input.scheme!,'-configuration',key.configuration,'-derivedDataPath',input.derivedData,`OTHER_SWIFT_FLAGS=$(inherited) -j${d.compilerWorkers} -num-threads 1`]
+        :['-xctestrun',prepared!.xctestrun];
+      const argv=['/usr/bin/xcodebuild',...routing,'-destination',`platform=iOS Simulator,id=${input.deviceId}`,'-resultBundlePath',bundle,'-jobs',String(d.compilerWorkers),'-parallel-testing-enabled','NO','-maximum-concurrent-test-simulator-destinations','1',...(input.onlyTesting??[]).map(v=>'-only-testing:'+v),input.action==='build'?'build-for-testing':'test-without-building'];
+      job.value.bundlePath=bundle;job.terminal=false;
       const started=await startWrappedBuild(wrapped,{argv,cwd:d.checkoutPath,killSignal:job.abort.signal,nativeFence:true,onStart:info=>{job.value.pid=info.pid;job.isAlive=info.isAlive;}});
       if (!started) throw new Error('Native build runner refused to start.');
       const result=await started.completed;
       if (!result.failed) job.terminal=true;
       if (result.failed || result.exitCode !== 0 || result.errors) throw new Error('Native build/test failed; inspect its tracked result bundle.');
-      const products=join(input.derivedData,'Build','Products',(input.configuration??'Debug')+'-iphonesimulator');
-      for(const entry of await readdir(products,{withFileTypes:true})) {
-        if(!entry.isDirectory() || !entry.name.endsWith('.app')) continue;
-        const app=join(products,entry.name);
-        const bundle=await exec('/usr/bin/plutil',['-extract','CFBundleIdentifier','raw','-o','-',join(app,'Info.plist')]);
-        lane.products.set(bundle.stdout.trim(),{path:app,hash:await treeHash(app)});
+      await resolveIdentity(input,d);
+      if(input.action==='test') {
+        prepared=await verifyPreparedTests(prepared,key);
+        await writeNativeReceipt(join(d.resultsRoot,input.operationId+'.test.json'),{operationId:input.operationId,deviceId:input.deviceId,sourceSha:input.sourceSha,environmentId:d.environmentId,threadId:input.threadId,hostId:d.hostId,resultBundlePath:bundle,action:'test-without-building',buildOperationId:prepared.buildOperationId,xctestrun:prepared.xctestrun,xctestrunHash:prepared.xctestrunHash,onlyTesting:key.onlyTesting,testProductHashes:prepared.closure,completedAt:Date.now(),role:'iteration-only'});
+        return; // Test never creates build or app-product provenance.
+      }
+      prepared=await attestPreparedTests(key,productsRoot,before,input.operationId);
+      const appProducts=new Map<string,{path:string;hash:string}>();
+      for(const app of Object.keys(prepared.closure).filter(path=>path.endsWith('.app'))) {
+        const bundleId=await exec('/usr/bin/plutil',['-extract','CFBundleIdentifier','raw','-o','-',join(app,'Info.plist')]);
+        appProducts.set(bundleId.stdout.trim(),{path:app,hash:await treeHash(app)});
       }
       await resolveIdentity(input,d);
-      await writeNativeReceipt(join(d.resultsRoot,input.operationId+'.build.json'),{operationId:input.operationId,deviceId:input.deviceId,sourceSha:input.sourceSha,environmentId:d.environmentId,threadId:input.threadId,hostId:d.hostId,derivedData:input.derivedData,resultBundlePath:bundle,action:input.action==='build'?'build-for-testing':'test-without-building',compilerWorkers:d.compilerWorkers,swiftDriverFlagsRequested:`-j${d.compilerWorkers} -num-threads 1`,swiftWorkerCapVerified:false,pid:job.value.pid,appProducts:[...lane.products.entries()].map(([bundleId,p])=>({bundleId,path:p.path,sha256:p.hash})),completedAt:Date.now(),role:'iteration-only'});
+      await writeNativeReceipt(join(d.resultsRoot,input.operationId+'.build.json'),{operationId:input.operationId,deviceId:input.deviceId,sourceSha:input.sourceSha,environmentId:d.environmentId,threadId:input.threadId,hostId:d.hostId,derivedData:input.derivedData,project,scheme:input.scheme,configuration:key.configuration,onlyTesting:key.onlyTesting,resultBundlePath:bundle,action:'build-for-testing',compilerWorkers:d.compilerWorkers,swiftDriverFlagsRequested:`-j${d.compilerWorkers} -num-threads 1`,swiftWorkerCapVerified:false,pid:job.value.pid,xctestrun:prepared.xctestrun,xctestrunHash:prepared.xctestrunHash,testProductHashes:prepared.closure,appProducts:[...appProducts.entries()].map(([bundleId,p])=>({bundleId,path:p.path,sha256:p.hash})),completedAt:Date.now(),role:'iteration-only'});
+      lane.prepared=prepared;lane.products=appProducts;lane.ownedPlans.set(prepared.xctestrun,prepared.xctestrunHash);
       return;
     }
     if (!input.bundleId) throw new Error('Device execution requires an attested app bundle ID.');
@@ -216,7 +234,7 @@ export async function installNativeExecutor(bb: BbPluginApi, wrapped: WrappedDep
           if(prior.busy || prior.identity.capability!==input.capability || prior.identity.threadId!==input.threadId)throw new Error('Closed native custody belongs to another actor or is busy.');
           reopening=prior;closed.delete(input.deviceId);
         } else enterNativeLane(input.deviceId);
-        lane={identity:input,descriptor:null as unknown as LaneDescriptor,busy:true,host:null,socket:null,products:new Map()};
+        lane={identity:input,descriptor:null as unknown as LaneDescriptor,busy:true,host:null,socket:null,products:new Map(),ownedPlans:reopening?.ownedPlans??new Map()};
         lanes.set(input.deviceId,lane);
       } else {
         if (!lane || lane.identity.capability !== input.capability || lane.identity.threadId !== input.threadId || lane.identity.derivedData !== input.derivedData || lane.identity.sourceSha !== input.sourceSha) throw new Error('No matching open native lane.');
@@ -251,7 +269,7 @@ export async function installNativeExecutor(bb: BbPluginApi, wrapped: WrappedDep
           job.isAlive=()=>false;
           held.busy=false;
           if (input.action==='close' && outcome==='passed' || input.action==='open' && outcome!=='passed') {
-            held.socket?.close();held.host?.stop();held.socket=null;held.host=null;held.products.clear();
+            held.socket?.close();held.host?.stop();held.socket=null;held.host=null;held.products.clear();held.prepared=undefined;
             lanes.delete(input.deviceId);closed.set(input.deviceId,held);
           }
           try { await persist(); } catch(e) {if(!closed.has(input.deviceId))lanes.set(input.deviceId,held);throw e;}

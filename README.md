@@ -416,13 +416,21 @@ capability and operation UUID. Cancellation requests termination; a returned
 PNG captures have a sibling `<operationId>.png.json` receipt with original PNG
 SHA-256, exact source/SDK actor/device, app-product hash, verified foreground,
 time and `role: iteration-only`. Successful builds write
-`<operationId>.build.json` with the same source/job binding, result path and
+`<operationId>.build.json` and tests write `<operationId>.test.json` referencing
+the successful build; both retain source/job binding, result path and
 requested compiler policy. Receipts are bounded to 64KiB, refuse capabilities
 and never overwrite existing evidence. They require the paired successful job
 and are not canonical Atlas capture acceptance.
 
 Build maps to `build-for-testing`; test maps to `test-without-building` so
-test runs reuse the lane products. Routing is minted by the executor: exact simulator destination,
+test runs reuse stable lane products and DerivedData caches. A test requires a
+successful same-source/project/scheme/configuration build-for-testing attestation
+and a verified explicit xctestrun/test-product closure. Selection may narrow the
+build-prepared coverage. Changed plans/products and source-refresh reopen clear
+or invalidate reuse; test never creates build/app-product provenance. Builds
+archive/remove only previously owned xctestrun files and require a freshly
+emitted unambiguous plan, retaining products and caches. Test receipts reference
+the original successful build. Routing is minted by the executor: exact simulator destination,
 DerivedData, operation-specific result bundle, compiler workers and disabled
 parallel simulator testing. The executor also requests `-j<compilerWorkers>`
 and `-num-threads 1` through `OTHER_SWIFT_FLAGS=$(inherited) …`, preserving
@@ -458,3 +466,9 @@ documents retaining existing flags with `$(inherited)`, and its
 states command-line setting precedence. The installed Swift driver help
 accepts `-j <n>` and `-num-threads <n>`. No native compile was run to verify
 the final Xcode-generated driver argument order or a global worker bound.
+
+The supported build-for-testing/explicit-xctestrun reuse follows Apple's
+[command-line testing contract](https://developer.apple.com/library/archive/technotes/tn2339/_index.html).
+An unknown unchanged retained plan cannot become new-source proof merely because
+a command exits successfully. Multiple newly emitted plans, unsupported product
+path placeholders and references outside the owned products root fail closed.

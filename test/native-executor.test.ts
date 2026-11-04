@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, mkdir, rm, writeFile, realpath, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, realpath, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 import { startWrappedBuild } from '../src/wrapped';
 vi.mock('../src/wrapped',()=>({startWrappedBuild:vi.fn()}));
+vi.mock('../src/sim/xctestrun',()=>({readXctestrun:async(path:string)=>JSON.parse(await (await import('node:fs/promises')).readFile(path,'utf8'))}));
 import type { WrappedDeps } from '../src/wrapped';
 import { DeviceDriver, type SimDevice } from '../src/sim/devices';
 import { installNativeExecutor } from '../src/native-executor';
@@ -21,7 +22,7 @@ afterEach(async()=>{vi.restoreAllMocks();for(const d of devices.splice(0))leaveN
 async function setup() {
   const source=await realpath(await mkdtemp(join(tmpdir(),'xcode-source-')));dirs.push(source);
   const git=(...args:string[])=>execFileSync('/usr/bin/git',['-C',source,...args],{encoding:'utf8'}).trim();
-  git('init','-q');await mkdir(join(source,'App.xcodeproj'));await writeFile(join(source,'App.xcodeproj','project.pbxproj'),'fixture');await writeFile(join(source,'README'),'source');git('add','.');git('-c','user.name=Native test','-c','user.email=native@example.invalid','commit','-qm','fixture');
+  git('init','-q');await mkdir(join(source,'Other.xcodeproj'));await writeFile(join(source,'Other.xcodeproj','project.pbxproj'),'other fixture');await mkdir(join(source,'App.xcodeproj'));await writeFile(join(source,'App.xcodeproj','project.pbxproj'),'fixture');await writeFile(join(source,'README'),'source');git('add','.');git('-c','user.name=Native test','-c','user.email=native@example.invalid','commit','-qm','fixture');
   const threadId='thr_native_test_'+randomUUID();
   const owner=await realpath(await mkdtemp(join(tmpdir(),'native-sdk-storage-')));dirs.push(owner);
   const lane=join(owner,'native-lanes',randomUUID());
@@ -40,6 +41,23 @@ async function setup() {
   const invoke=(method:string,input:unknown={},ctx=atlas)=>handlers[method]!(input,ctx);
   const settled=async(operationId:string,capability=id.capability)=>{let result:unknown;await vi.waitFor(async()=>{result=await invoke('experimental_nativeStatus',{capability,operationId});expect((result as {state:string}).state).not.toBe('running');});return result as {state:string;error:string|null};};
   return {id,descriptor,source,dataDir,validate,invoke,settled,deviceState,bb,wrapped:{dataDir} as WrappedDeps};
+}
+async function emitTestProducts(f:Awaited<ReturnType<typeof setup>>) {
+  const root=join(f.id.derivedData,'Build','Products');const bundle=join(root,'Debug-iphonesimulator','AppTests.xctest');
+  await mkdir(bundle,{recursive:true});await writeFile(join(bundle,'Tests'),'compiled test bytes');
+  const plan=join(root,'App_iphonesimulator.xctestrun');
+  await writeFile(plan,JSON.stringify({ContainerInfo:{SchemeName:'App'},TestConfigurations:[{TestTargets:[{BlueprintName:'AppTests',TestBundlePath:'__TESTROOT__/Debug-iphonesimulator/AppTests.xctest'}]}]}));
+  return {root,bundle,plan};
+}
+function successfulRunner(f:Awaited<ReturnType<typeof setup>>) {
+  vi.mocked(startWrappedBuild).mockImplementation(async(_deps,options)=>{
+    if(options.argv.at(-1)==='build-for-testing')await emitTestProducts(f);
+    return {bundlePath:'result',completed:Promise.resolve({failed:false,exitCode:0,signal:null,bundlePath:'result',errors:0,warnings:0})};
+  });
+}
+async function prepareBuild(f:Awaited<ReturnType<typeof setup>>,overrides:Record<string,unknown>={}) {
+  successfulRunner(f);const build={...f.id,action:'build',operationId:randomUUID(),project:'App.xcodeproj',scheme:'App',...overrides};
+  await f.invoke('experimental_nativeExecute',build);expect((await f.settled(build.operationId)).state).toBe('passed');return build;
 }
 describe('native resource executor boundaries without native execution',()=>{
   it('requires explicit device and rejects caller identity in input',()=>{
@@ -117,7 +135,8 @@ describe('native resource executor boundaries without native execution',()=>{
   it.each(['build','test'] as const)('mints exact %s resources and retains busy ownership until cancellation actually settles',async(action)=>{
     vi.mocked(startWrappedBuild).mockClear();
     const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);
-    await mkdir(join(f.id.derivedData,'Build','Products','Debug-iphonesimulator'),{recursive:true});
+    if(action==='test')await prepareBuild(f);
+    vi.mocked(startWrappedBuild).mockClear();
     let finish!:(value:{failed:boolean;exitCode:number|null;signal:string|null;bundlePath:string;errors:number;warnings:number})=>void;
     let alive=true;
     vi.mocked(startWrappedBuild).mockImplementation(async(_deps,options)=>{
@@ -129,9 +148,10 @@ describe('native resource executor boundaries without native execution',()=>{
     await vi.waitFor(async()=>{const status=await f.invoke('experimental_nativeStatus',{capability:f.id.capability,operationId:build.operationId});expect(startWrappedBuild,JSON.stringify(status)).toHaveBeenCalled();});
     const options=vi.mocked(startWrappedBuild).mock.calls.at(-1)![1];
     expect(options.argv).toContain('platform=iOS Simulator,id='+f.id.deviceId);
-    expect(options.argv).toContain(f.id.derivedData);expect(options.argv).toContain(join(f.descriptor.resultsRoot,build.operationId+'.xcresult'));
+    if(action==='build')expect(options.argv).toContain(f.id.derivedData);else {expect(options.argv).toContain('-xctestrun');expect(options.argv).not.toContain('-scheme');}
+    expect(options.argv).toContain(join(f.descriptor.resultsRoot,build.operationId+'.xcresult'));
     expect(options.argv.at(-1)).toBe(action==='build'?'build-for-testing':'test-without-building');
-    expect(options.argv).toContain('OTHER_SWIFT_FLAGS=$(inherited) -j2 -num-threads 1');
+    if(action==='build')expect(options.argv).toContain('OTHER_SWIFT_FLAGS=$(inherited) -j2 -num-threads 1');
     expect(options.argv).toContain('-parallel-testing-enabled');expect(options.argv).toContain('NO');expect(options.nativeFence).toBe(true);
     expect(await f.invoke('experimental_nativeActive')).toMatchObject({active:[{pid:12345,operationId:build.operationId,deviceId:f.id.deviceId,sourceSha:f.id.sourceSha}]});
     await f.invoke('experimental_nativeCancel',{capability:f.id.capability,operationId:build.operationId});
@@ -142,10 +162,42 @@ describe('native resource executor boundaries without native execution',()=>{
     expect((await f.settled(build.operationId)).state).toBe('cancelled');
     expect(await f.invoke('experimental_nativeActive')).toEqual({active:[]});
   });
+  it('rejects retained DD after close/source refresh/reopen before starting test',async()=>{
+    const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);await prepareBuild(f);
+    const close={...f.id,action:'close',operationId:randomUUID()};await f.invoke('experimental_nativeExecute',close);await f.settled(close.operationId);
+    await writeFile(join(f.source,'README'),'new source');execFileSync('/usr/bin/git',['-C',f.source,'add','.']);execFileSync('/usr/bin/git',['-C',f.source,'-c','user.name=Native test','-c','user.email=native@example.invalid','commit','-qm','refresh']);
+    f.id.sourceSha=execFileSync('/usr/bin/git',['-C',f.source,'rev-parse','HEAD'],{encoding:'utf8'}).trim();f.descriptor.sourceSha=f.id.sourceSha;
+    const reopen={...f.id,operationId:randomUUID()};await f.invoke('experimental_nativeExecute',reopen);expect((await f.settled(reopen.operationId)).state).toBe('passed');
+    vi.mocked(startWrappedBuild).mockClear();const test={...f.id,action:'test',operationId:randomUUID(),project:'App.xcodeproj',scheme:'App'};
+    await f.invoke('experimental_nativeExecute',test);const result=await f.settled(test.operationId);expect(result.state).toBe('failed');expect(result.error).toContain('build-for-testing attestation');expect(startWrappedBuild).not.toHaveBeenCalled();
+    // A new explicit build archives only its owned plan; stable product paths and caches remain.
+    await prepareBuild(f);expect((await readdir(f.descriptor.resultsRoot)).some(n=>n.includes('.prior-'))).toBe(true);
+  });
+  it.each([{scheme:'Other'},{configuration:'Release'},{project:'Other.xcodeproj'}])('refuses test settings different from its successful build: %j',async(overrides)=>{
+    const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);await prepareBuild(f);vi.mocked(startWrappedBuild).mockClear();
+    const test={...f.id,action:'test',operationId:randomUUID(),project:'App.xcodeproj',scheme:'App',...overrides};await f.invoke('experimental_nativeExecute',test);const result=await f.settled(test.operationId);expect(result.state).toBe('failed');expect(result.error).toContain('differs');expect(startWrappedBuild).not.toHaveBeenCalled();
+  });
+  it.each(['product','plan'] as const)('refuses changed prepared test %s before dispatch',async(kind)=>{
+    const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);await prepareBuild(f);vi.mocked(startWrappedBuild).mockClear();
+    await writeFile(kind==='product'?join(f.id.derivedData,'Build','Products','Debug-iphonesimulator','AppTests.xctest','Tests'):join(f.id.derivedData,'Build','Products','App_iphonesimulator.xctestrun'),'changed retained bytes');
+    const test={...f.id,action:'test',operationId:randomUUID(),project:'App.xcodeproj',scheme:'App'};await f.invoke('experimental_nativeExecute',test);const result=await f.settled(test.operationId);expect(result.state).toBe('failed');expect(result.error).toContain('changed');expect(startWrappedBuild).not.toHaveBeenCalled();
+  });
+  it('reuses matching build products and binds only test provenance to the original build',async()=>{
+    const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);const build=await prepareBuild(f,{onlyTesting:['AppTests/Case']});vi.mocked(startWrappedBuild).mockClear();
+    const test={...f.id,action:'test',operationId:randomUUID(),project:'App.xcodeproj',scheme:'App',onlyTesting:['AppTests/Case/testA']};await f.invoke('experimental_nativeExecute',test);expect((await f.settled(test.operationId)).state).toBe('passed');
+    const argv=vi.mocked(startWrappedBuild).mock.calls.at(-1)![1].argv;expect(argv).toContain('-xctestrun');expect(argv).toContain(join(f.id.derivedData,'Build','Products','App_iphonesimulator.xctestrun'));expect(argv).not.toContain('-scheme');
+    const receipt=JSON.parse(await readFile(join(f.descriptor.resultsRoot,test.operationId+'.test.json'),'utf8'));expect(receipt).toMatchObject({buildOperationId:build.operationId,sourceSha:f.id.sourceSha,action:'test-without-building',onlyTesting:['AppTests/Case/testA']});await expect(readFile(join(f.descriptor.resultsRoot,test.operationId+'.build.json'))).rejects.toThrow();
+    for(const onlyTesting of [[],['AppTests/OtherCase'],['OtherTests/Case']]){vi.mocked(startWrappedBuild).mockClear();const wider={...test,operationId:randomUUID(),onlyTesting};await f.invoke('experimental_nativeExecute',wider);expect((await f.settled(wider.operationId)).state).toBe('failed');expect(startWrappedBuild).not.toHaveBeenCalled();}
+  });
+  it('does not attest an unchanged foreign xctestrun even when build command succeeds',async()=>{
+    const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);await emitTestProducts(f);
+    vi.mocked(startWrappedBuild).mockImplementation(async()=>({bundlePath:'result',completed:Promise.resolve({failed:false,exitCode:0,signal:null,bundlePath:'result',errors:0,warnings:0})}));
+    const build={...f.id,action:'build',operationId:randomUUID(),project:'App.xcodeproj',scheme:'App'};await f.invoke('experimental_nativeExecute',build);expect((await f.settled(build.operationId)).error).toContain('freshly emit');
+  });
   it('saves successful build provenance without a capability',async()=>{
     const f=await setup();await f.invoke('experimental_nativeExecute',f.id);await f.settled(f.id.operationId);
     await mkdir(join(f.id.derivedData,'Build','Products','Debug-iphonesimulator'),{recursive:true});
-    vi.mocked(startWrappedBuild).mockImplementation(async()=>({bundlePath:'result',completed:Promise.resolve({failed:false,exitCode:0,signal:null,bundlePath:'result',errors:0,warnings:0})}));
+    successfulRunner(f);
     const build={...f.id,action:'build',operationId:randomUUID(),project:'App.xcodeproj',scheme:'App'};await f.invoke('experimental_nativeExecute',build);expect((await f.settled(build.operationId)).state).toBe('passed');
     const receipt=JSON.parse(await readFile(join(f.descriptor.resultsRoot,build.operationId+'.build.json'),'utf8'));
     expect(receipt).toMatchObject({operationId:build.operationId,threadId:f.id.threadId,deviceId:f.id.deviceId,sourceSha:f.id.sourceSha,environmentId:f.descriptor.environmentId,hostId:f.descriptor.hostId,role:'iteration-only',swiftWorkerCapVerified:false,action:'build-for-testing'});expect(receipt).not.toHaveProperty('capability');
