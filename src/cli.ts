@@ -7,6 +7,7 @@
  */
 
 import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@get-bb/plugin-sdk";
+import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { confinedBuildCwd, validateBuildArguments } from "./build-security";
@@ -129,8 +130,13 @@ export function createCli(deps: CliDeps) {
     const scope = await deps.scopeFor(ctx.threadId);
     if (scope === null) return null;
     if (ctx.projectId !== undefined && scope.projectId !== ctx.projectId) return null;
-    const cwd = resolve(ctx.cwd);
-    const root = resolve(scope.path);
+    // Compare real paths. The OS reports the invoking process's cwd
+    // physically, so a checkout bb knows through a symlink (`/tmp` on macOS,
+    // a symlinked `~/Git`) never matched its own builds. A path that does not
+    // exist on this machine (a checkout on another host) keeps its resolved
+    // form, exactly as before.
+    const cwd = await physicalPath(ctx.cwd);
+    const root = await physicalPath(scope.path);
     return pathIsUnder(cwd, root) ? scope : null;
   };
 
@@ -610,6 +616,16 @@ export function capOutput(text: string): string {
   return Buffer.byteLength(text, "utf8") <= PLUGIN_CLI_OUTPUT_MAX_BYTES - 1024
     ? text
     : `${text.slice(0, 200_000)}\n… truncated …\n`;
+}
+
+/** The real path when it exists here, otherwise the resolved one. */
+async function physicalPath(path: string): Promise<string> {
+  const resolved = resolve(path);
+  try {
+    return await realpath(resolved);
+  } catch {
+    return resolved;
+  }
 }
 
 function sleep(ms: number): Promise<void> {
