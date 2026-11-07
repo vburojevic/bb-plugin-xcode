@@ -54,8 +54,8 @@
  * is worse than no dismissal at all.
  */
 
-import { useCallback } from "react";
-import { useComposerView, useRpc } from "@get-bb/plugin-sdk/app";
+import { memo, useCallback } from "react";
+import { useComposer, useRpc } from "@get-bb/plugin-sdk/app";
 
 import { cn } from "@/lib/utils";
 
@@ -78,12 +78,21 @@ const PROMPT_STACK_CARD_ROW_HEIGHT = 32;
 const MAX_ROWS = 4;
 
 export function XcodeActivityBanner() {
-  const view = useComposerView();
-  if (view.scope.kind !== "thread") return null;
-  return <XcodeActivityBannerLoaded threadId={view.scope.threadId} />;
+  const { scope } = useComposer();
+  if (scope.kind !== "thread") return null;
+  return <XcodeActivityBannerLoaded threadId={scope.threadId} />;
 }
 
-function XcodeActivityBannerLoaded({ threadId }: { threadId: string }) {
+/**
+ * Memoized on `threadId` because `useComposer()` re-renders its caller on
+ * every draft change. The rows depend only on the thread, so typing in the
+ * composer must not re-render the card.
+ */
+const XcodeActivityBannerLoaded = memo(function XcodeActivityBannerLoaded({
+  threadId,
+}: {
+  threadId: string;
+}) {
   const rpc = useRpc<typeof rpcContract>();
   const { data } = useChatStatus(threadId, null);
   // The gear menu's "Build activity in threads" toggle, answered by the same
@@ -152,7 +161,7 @@ function XcodeActivityBannerLoaded({ threadId }: { threadId: string }) {
       ) : null}
     </section>
   );
-}
+});
 
 /**
  * `chatStatus` only returns findings for the run it focused, so an expanded
