@@ -154,15 +154,11 @@ Each tier works alone and degrades gracefully.
 A run is born from a process observation, and every later source can only add to it. Its confidence never goes backward, and its outcome is never guessed:
 
 ```mermaid
-stateDiagram-v2
-  direction LR
-  [*] --> running: seen in ps
-  running --> finishing: process gone
-  finishing --> passed
-  finishing --> warnings
-  finishing --> failed
-  finishing --> cancelled
-  finishing --> ended: no verdict in time
+flowchart LR
+  seen(("ps")) -- seen --> running
+  running -- process gone --> finishing
+  finishing -- verdict --> verdict["passed, warnings,<br>failed or cancelled"]
+  finishing -- no verdict in time --> ended
 ```
 
 ## Getting real pass/fail: `bb xcode shim`
@@ -176,7 +172,7 @@ Measured here: every DerivedData root on the machine had *zero* Build entries, o
 bb xcode shim install     # confirm in bb, then add the printed PATH line
 ```
 
-The shim is a ~30-line POSIX `sh` script that adds `-resultBundlePath` to build/test invocations lacking one and `exec`s the real `/usr/bin/xcodebuild`. Queries (`-version`, `-list`, `-showBuildSettings`) pass through untouched, as does anything that already sets a bundle path. It has no dependency on bb, node, or the network, and any unexpected condition falls through to the real tool: it must never be the reason a build fails. `bb xcode shim uninstall` removes it.
+The shim is a ~30-line POSIX `sh` script that adds `-resultBundlePath` to build/test invocations lacking one, then hands over to the real `/usr/bin/xcodebuild` with `exec`. Queries (`-version`, `-list`, `-showBuildSettings`) pass through untouched, as does anything that already sets a bundle path. It has no dependency on bb, node, or the network, and any unexpected condition falls through to the real tool: it must never be the reason a build fails. `bb xcode shim uninstall` removes it.
 
 ## Reference
 
