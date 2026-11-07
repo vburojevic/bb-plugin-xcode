@@ -154,7 +154,7 @@ Each tier works alone and degrades gracefully.
 A run is born from a process observation, and every later source can only add to it. Its confidence never goes backward, and its outcome is never guessed:
 
 ```mermaid
-flowchart LR
+flowchart TB
   seen(("ps")) -- seen --> running
   running -- process gone --> finishing
   finishing -- verdict --> verdict["passed, warnings,<br>failed or cancelled"]
