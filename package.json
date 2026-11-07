@@ -3,8 +3,8 @@
   "version": "0.3.2",
   "type": "module",
   "engines": {
-    "bb": ">=0.49",
-    "bbPluginSdk": ">=0.6.132"
+    "bb": ">=0.47",
+    "bbPluginSdk": ">=0.6.75"
   },
   "bb": {
     "name": "Xcode",
