@@ -218,8 +218,7 @@ These commands require a bb thread with a resolvable checkout, must be run from 
 | `simulator_stills` | Renders every SwiftUI preview and reports what changed |
 | `simulator_stream_status` | Current transport, decode and paint health for every active simulator viewer |
 
-> [!NOTE]
-> The four simulator tools are off by default and gated behind the `allowAgentCapture` setting. Captured frames go to your model provider, and that is a decision the plugin refuses to make for you. Flipping it off revokes already-registered tools on their next call.
+**The four simulator tools are off by default** and gated behind the `allowAgentCapture` setting. Captured frames go to your model provider, and that is a decision the plugin refuses to make for you. Flipping it off revokes already-registered tools on their next call.
 
 Stream evidence is generation-scoped and correlated with `simulator_capture` in the tool's text; it never replaces or rewrites the full-resolution durable JPEG. `sourceFps` remains approximate because the current v1 AVCC stream has no source timestamps and supplies a synthetic cadence. `excessLatencyMs` is also approximate: it is viewer backlog above that viewer's best observed clock offset, never absolute end-to-end latency.
 
