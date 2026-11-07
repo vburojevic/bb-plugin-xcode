@@ -77,10 +77,27 @@ afterEach(async () => {
   }
 });
 
-async function load(options: Parameters<typeof createFakePluginHost>[0] = {}) {
+/**
+ * Load the Simulators half as a bb server on `platform` would.
+ *
+ * `installSimulators` registers nothing unless the server runs on macOS, so
+ * the platform is pinned rather than inherited: CI runs this suite on Linux,
+ * where an unpinned load registered nothing and every test that drives a
+ * registration failed.
+ */
+async function load(
+  options: Parameters<typeof createFakePluginHost>[0] = {},
+  platform: NodeJS.Platform = "darwin",
+) {
   const { bb, harness } = createFakePluginHost({ sdk: sdkStubs(), ...options });
   harnesses.push(harness);
-  await installSimulators(bb as never, simulatorHost(bb));
+  const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { value: platform, configurable: true });
+  try {
+    await installSimulators(bb as never, simulatorHost(bb));
+  } finally {
+    Object.defineProperty(process, "platform", original);
+  }
   return harness;
 }
 
@@ -216,18 +233,12 @@ describe("a bb server that is not on macOS", () => {
     // bb supports a Linux server with enrolled Macs — which is why
     // `bb.sdk.terminals` takes an explicit host scope. Without this check that
     // topology gets told to run `xcode-select --install`.
-    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
-    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
-    try {
-      const harness = await load();
-      expect(harness.needsConfiguration[0]).toContain("only works when the bb server itself runs on macOS");
-      expect(harness.needsConfiguration[0]).toContain("This server runs on Linux.");
-      expect(harness.registrations.rpcMethods).toEqual([]);
-      expect(harness.registrations.services).toEqual([]);
-      expect(harness.registrations.cli).toBeNull();
-    } finally {
-      Object.defineProperty(process, "platform", original);
-    }
+    const harness = await load({}, "linux");
+    expect(harness.needsConfiguration[0]).toContain("only works when the bb server itself runs on macOS");
+    expect(harness.needsConfiguration[0]).toContain("This server runs on Linux.");
+    expect(harness.registrations.rpcMethods).toEqual([]);
+    expect(harness.registrations.services).toEqual([]);
+    expect(harness.registrations.cli).toBeNull();
   });
 });
 
