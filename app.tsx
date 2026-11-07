@@ -58,7 +58,9 @@ export default definePluginApp((app) => {
    * because the frame manages its own layout and must not be wrapped in the
    * host's padded scroll container.
    */
-  app.slots.threadPanelAction({
+  app.slots.experimental_tab({
+    context: { kind: "thread" },
+    availability: "action",
     id: "simulator",
     title: "Open simulator",
     icon: "Smartphone",

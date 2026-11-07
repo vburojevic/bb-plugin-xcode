@@ -11,17 +11,15 @@
  * SDK the locally installed bb happened to carry, which was still 0.4.8.
  *
  * So the assertions below deliberately do not restate the field names. They
- * import the genuine, executable validators out of the SDK package and run the
- * real registration objects through them, which means this test starts failing
- * the moment the pinned SDK renames a field again — the failure mode it was
- * written for.
+ * import the genuine, executable validator out of the SDK package, the one
+ * `registerTool` runs at startup, and pass the real registration objects
+ * through it, which means this test starts failing the moment the pinned SDK
+ * renames a field again — the failure mode it was written for. SDK 0.6 folded
+ * the separate stale-field and presentation checks into that one validator.
  */
 
 import { describe, expect, it } from "vitest";
-import {
-  parsePluginAgentToolPresentation,
-  rejectStaleAgentToolFields,
-} from "@get-bb/plugin-sdk/internal/host-policy";
+import { normalizeAgentToolRegistration } from "@get-bb/plugin-sdk/internal/host-policy";
 
 import { createTools, type ToolDeps } from "../src/tools";
 import {
@@ -66,22 +64,27 @@ describe("agent tool registrations against the host validator", () => {
     ]);
   });
 
+  /** What the host passes: this plugin declares no icons of its own. */
+  const register = (tool: (typeof tools)[number]) =>
+    normalizeAgentToolRegistration({
+      pluginId: "bb-plugin-xcode",
+      declaredIconNames: new Set(),
+      tool: tool as Parameters<typeof normalizeAgentToolRegistration>[0]["tool"],
+    });
+
   it.each(tools.map((tool) => [tool.name, tool] as const))(
-    "%s carries no field the current SDK rejects",
-    (name, tool) => {
-      // Throws on a renamed field (the v0.2.1 failure) and on any unknown
-      // `experimental_*` key.
-      expect(() => rejectStaleAgentToolFields(name, tool)).not.toThrow();
+    "%s passes the host's registration validator",
+    (_name, tool) => {
+      // Throws on a renamed field (the v0.2.1 failure), on any unknown
+      // `experimental_*` key, and on a presentation the host rejects.
+      expect(() => register(tool)).not.toThrow();
     },
   );
 
   it.each(tools.map((tool) => [tool.name, tool] as const))(
     "%s declares a presentation the host accepts",
-    (name, tool) => {
-      const presentation = parsePluginAgentToolPresentation(
-        name,
-        (tool as { presentation?: unknown }).presentation,
-      );
+    (_name, tool) => {
+      const { presentation } = register(tool);
       // Labels are the whole point of declaring one: a tool that silently lost
       // its presentation would still register, and the regression would only
       // show up as a generic `Ran xcode_build` row in the timeline.
