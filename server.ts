@@ -7,8 +7,6 @@
  * `src/scope-sync.ts`, `src/thread-sync.ts`, `src/wrapped.ts`.
  */
 
-import { homedir } from "node:os";
-import { join } from "node:path";
 
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
@@ -25,6 +23,7 @@ import type { ThreadScope } from "./src/scopes";
 import { pruneShimBundles, isShimInstalled } from "./src/shim";
 import { safely, detach } from "./src/safe";
 import { MIGRATIONS, Store, type Db } from "./src/store";
+import { dataDirOf } from "./src/sim/context";
 import { installSimulators, type SimulatorCliRun } from "./src/sim/wire";
 import { CLI_COMMANDS as SIM_VERBS } from "./src/sim/cli";
 import { checkoutHostMismatch } from "./src/build-security";
@@ -114,8 +113,12 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     ...SIMULATOR_SETTINGS,
   });
 
-  const dataDir = join(homedir(), ".bb", "plugins", bb.pluginId);
-  const db = bb.storage.database() as unknown as Db;
+  const database = bb.storage.database();
+  // This bb's folder for the plugin, next to its database. Never a guessed
+  // `~/.bb`: a dev or test bb keeps its data elsewhere, and guessing would
+  // put its result bundles and shim into the main bb's folder.
+  const dataDir = dataDirOf(database);
+  const db = database as unknown as Db;
   bb.storage.migrate(db as never, [...MIGRATIONS]);
   const store = new Store(db);
 
