@@ -29,7 +29,7 @@ bb plugin install vburojevic/bb-plugin-xcode
 ```
 
 > [!TIP]
-> Command-line builds only report real pass or fail once the shim is on your `PATH`. Run `bb xcode shim install` once; [Getting real pass/fail](#getting-real-passfail-bb-xcode-shim) explains why.
+> Plain `xcodebuild` runs only report real pass or fail when they write a result bundle. Run `bb xcode shim install` and add the `PATH` line it prints; [Getting real pass/fail](#getting-real-passfail-bb-xcode-shim) explains why.
 
 ## Highlights
 
@@ -330,7 +330,7 @@ Architecture (v2): **one run, one identity, monotonic enrichment.** A run is bor
 | `src/scope-sync.ts`, `src/thread-sync.ts` | Talking to bb about threads |
 | `server.ts` | Wiring, and nothing else |
 
-Identity is the thing to be careful with. A run is keyed by pid *within one instance's lifetime*, because the tracker drops a pid the moment it leaves the snapshot, but not across a restart, where the OS may have handed that pid to something else. A re-adopted run therefore has to prove itself by reporting the start time the store expects (`ADOPTION_SLACK_MS`), or it is retired and the build genuinely holding the pid gets its own row. A bundle path, by contrast, *is* an identity, and is indexed as one.
+Identity is the thing to be careful with. A run is keyed by pid *within one instance's lifetime*, because the tracker drops a pid the moment it leaves the snapshot. It is not keyed by pid across a restart, where the OS may have handed that pid to something else. A re-adopted run therefore has to prove itself by reporting the start time the store expects (`ADOPTION_SLACK_MS`), or it is retired and the build genuinely holding the pid gets its own row. A bundle path, by contrast, *is* an identity, and is indexed as one.
 
 The engine, the store and the thread reconciler are tested against a real in-memory SQLite. `test/store-scope.test.ts` asserts the SQL and in-memory scope predicates agree on the same fixtures, because two implementations of one rule is how a thread quietly stops seeing its own builds.
 

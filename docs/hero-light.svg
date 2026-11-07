@@ -45,11 +45,9 @@
 
   <!-- side panel: the simulator, streamed and touchable -->
   <line x1="900" y1="84" x2="900" y2="520" stroke="#d0d7de" stroke-width="2"/>
-  <rect x="930" y="100" width="280" height="30" rx="8" fill="none" stroke="#d0d7de" stroke-width="2"/>
-  <rect x="1024" y="104" width="92" height="22" rx="6" fill="#eaeef2"/>
-  <text x="977" y="120" font-size="14" fill="#59636e" text-anchor="middle">Builds</text>
-  <text x="1070" y="120" font-size="14" font-weight="600" fill="#1f2430" text-anchor="middle">Live</text>
-  <text x="1163" y="120" font-size="14" fill="#59636e" text-anchor="middle">Stills</text>
+  <text x="926" y="110" font-size="14" font-weight="600" fill="#1f2430">iPhone 17 Pro</text>
+  <text x="926" y="129" font-size="12" fill="#59636e">Picked the device this thread last built for.</text>
+  <text x="1214" y="110" font-size="13" fill="#59636e" text-anchor="end">Change</text>
 
   <rect x="1006" y="152" width="128" height="268" rx="24" fill="none" stroke="#1f2430" stroke-width="2"/>
   <rect x="1046" y="164" width="48" height="12" rx="6" fill="#1f2430"/>
