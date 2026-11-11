@@ -104,6 +104,12 @@ export interface LiveActivity extends ActivityAttribution {
    * when the build ends, they just go quiet.
    */
   isDaemon: boolean;
+  /**
+   * For a build service: when the Xcode action it is serving began, read from
+   * DerivedData (`src/xcode-actions.ts`). The service's own start is when
+   * Xcode opened; this is the build's.
+   */
+  actionStartedAt?: number | null;
 }
 
 /** One entry from a `LogStoreManifest.plist` `logs` dict. */

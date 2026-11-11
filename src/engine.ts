@@ -105,6 +105,9 @@ export interface EngineHooks {
  */
 export const ADOPTION_SLACK_MS = 10_000;
 
+/** Two actions starting this close are one (a test action's bundle, then its build). */
+const ACTION_SLACK_MS = 5_000;
+
 /**
  * A `running` row older than this cannot be believed.
  *
@@ -127,6 +130,10 @@ interface LiveEntry {
    */
   root: string | null;
   container: string | null;
+  /** For a build service: when the Xcode action it serves began. */
+  actionStartedAt?: number | null;
+  /** The result bundle the run is known to write, once it is. */
+  bundlePath?: string | null;
   misses: number;
   lastSeenAt: number;
   /**
@@ -173,9 +180,14 @@ export function observedRunId(hostId: string | null, pid: number, startedAt: num
 
 /** Is a build service now serving another root or workspace than its run's? */
 function switchedBuild(
-  entry: Pick<LiveEntry, "root" | "container">,
+  entry: Pick<LiveEntry, "root" | "container" | "actionStartedAt">,
   activity: LiveActivity,
 ): boolean {
+  // Another action began: back to back in one workspace, with no quiet
+  // snapshot between them to end the first.
+  const began = activity.actionStartedAt ?? null;
+  const was = entry.actionStartedAt ?? null;
+  if (began !== null && was !== null && Math.abs(began - was) > ACTION_SLACK_MS) return true;
   const root = activity.derivedDataPath ?? activity.roots[0] ?? null;
   if (entry.root !== null && root !== null) return !activity.roots.includes(entry.root) && root !== entry.root;
   if (entry.container !== null && activity.container !== null) {
@@ -227,6 +239,7 @@ export class Engine {
           pid: run.pid,
           root: run.root,
           container: run.container,
+          bundlePath: run.bundlePath,
           misses: 0,
           lastSeenAt: now,
           expectedStartedAt: run.startedAt,
@@ -341,6 +354,19 @@ export class Engine {
           delete tracked.expectedStartedAt;
           tracked.misses = 0;
           tracked.lastSeenAt = now;
+          // A test action's bundle can be named after the run began: claim it,
+          // so its verdict is read from that bundle when the action ends.
+          if (!tracked.bundlePath && activity.resultBundlePath) {
+            tracked.bundlePath = activity.resultBundlePath;
+            const current = this.store.getRun(tracked.runId);
+            if (current && current.bundlePath === null) {
+              current.bundlePath = activity.resultBundlePath;
+              if (activity.kind === "test") current.kind = "test";
+              current.scheme ??= activity.scheme;
+              this.store.updateRun(current);
+              changed = true;
+            }
+          }
           if (activity.phase && activity.phase !== "preparing") {
             tracked.sawWork = true;
           }
@@ -360,7 +386,9 @@ export class Engine {
        * first one already had, and was silently dropped. The service shows up
        * here only while it has work, so the first sighting is the start.
        */
-      const startedAt = activity.isDaemon ? Math.max(now, activity.startedAt) : activity.startedAt;
+      const startedAt = activity.isDaemon
+        ? (activity.actionStartedAt ?? Math.max(now, activity.startedAt))
+        : activity.startedAt;
       const run: Run = {
         id: observedRunId(hostId, activity.pid, startedAt),
         status: "running",
@@ -412,6 +440,8 @@ export class Engine {
         pid: activity.pid,
         root,
         container: activity.container,
+        actionStartedAt: activity.actionStartedAt ?? null,
+        bundlePath: activity.resultBundlePath,
         misses: 0,
         lastSeenAt: now,
         sawWork: Boolean(activity.phase && activity.phase !== "preparing"),

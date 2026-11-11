@@ -188,6 +188,7 @@ const activitySchema = z
     phase: buildPhase.nullable(),
     currentFile: z.string().max(1000).nullable(),
     isDaemon: z.boolean(),
+    actionStartedAt: z.number().nullable(),
     kind: runKind,
     scheme: z.string().max(1000).nullable(),
     container: z.string().max(4096).nullable(),

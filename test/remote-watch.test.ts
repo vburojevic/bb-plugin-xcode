@@ -14,7 +14,7 @@
  */
 
 import Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
@@ -300,4 +300,79 @@ describe("the live row, end to end", () => {
     expect(stop.exitCode).toBe(1);
     expect(stop.stderr).toContain("only watches on MacBook Pro");
   }, 20_000);
+});
+
+describe("RunAllTests through Xcode's agent tools, as it was reported", () => {
+  const SERVICE =
+    "/Applications/Xcode-27.2.0.app/Contents/SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/SWBBuildService.bundle/Contents/MacOS/SWBBuildService";
+  const ps = (lines: string[] = []) =>
+    [
+      `    1     0 10-00:00:00 /sbin/launchd`,
+      `  700     1 02:00:00 /Applications/Xcode-27.2.0.app/Contents/MacOS/Xcode`,
+      `11699   700 01:30:00 ${SERVICE}`,
+      ...lines,
+      "",
+    ].join("\n");
+  /** Xcode's own bundle name: local time, with its offset. */
+  const bundleName = (at: number) => {
+    const d = new Date(at);
+    const two = (n: number) => String(n).padStart(2, "0");
+    return `Test-Amion-${d.getUTCFullYear()}.${two(d.getUTCMonth() + 1)}.${two(d.getUTCDate())}_${two(d.getUTCHours())}-${two(d.getUTCMinutes())}-${two(d.getUTCSeconds())}-+0000.xcresult`;
+  };
+
+  it("is one run on the thread from its first seconds, through quiet stretches and a blip, to its verdict", async () => {
+    const mac = macBook();
+    const { store, scopes, scope, watch, signal } = watcher(mac);
+    scopes.upsert(scope, Date.now());
+    watch.reconcile(signal);
+
+    // RunAllTests begins: Xcode names the test bundle before anything runs.
+    // The service has no children yet, and its first ones (explicit module
+    // builds) name no DerivedData root of this workspace.
+    const began = Math.floor(Date.now() / 1000) * 1000 - 2_000;
+    const bundle = join(mac.root, "Logs", "Test", bundleName(began));
+    mkdirSync(join(bundle, "Data"), { recursive: true });
+    mac.machine.ps = ps();
+    const live = await until(() => store.listUnresolved()[0]);
+    expect(live).toMatchObject({
+      hostId: MBP.id,
+      pid: 11699,
+      threadId: THREAD,
+      container: mac.workspace,
+      root: mac.root,
+      kind: "test",
+      bundlePath: bundle,
+      startedAt: began,
+    });
+
+    const pause = () => new Promise((resolve) => setTimeout(resolve, 150));
+    mac.machine.ps = ps([
+      `20001 11699 00:03 /Applications/Xcode-27.2.0.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend -frontend -emit-pcm -o ${mac.derivedData}/SDKExplicitPrecompiledModules/Foundation.pcm`,
+    ]);
+    await pause();
+    // "Host is not connected" for a while: nothing is concluded from silence.
+    mac.machine.offline = true;
+    await pause();
+    mac.machine.offline = false;
+    mac.machine.ps = xcodeAppPs({ servicePid: 11699, root: mac.root, workers: 2 }).replace(
+      /\/Applications\/Xcode\.app\/Contents\/SharedFrameworks\/SwiftBuild\.framework\/Versions\/A\/PlugIns\/SWBBuildService\.bundle\/Contents\/MacOS\/SWBBuildService/,
+      SERVICE,
+    );
+    await pause();
+    // The tests run in the simulator, not under the service: minutes with no
+    // children at all, which used to end the run within seconds.
+    mac.machine.ps = ps();
+    await pause();
+    expect(store.getRun(live.id)?.status).toBe("running");
+    expect(store.listRuns({ limit: 10, includeNoise: true }).map((row) => row.id)).toEqual([live.id]);
+
+    // The action ends: Xcode finalizes its bundle.
+    writeFileSync(join(bundle, "Info.plist"), "");
+    const settled = await until(() => {
+      const row = store.getRun(live.id);
+      return row?.status === "passed" ? row : null;
+    });
+    expect(settled).toMatchObject({ statusRank: 2, threadId: THREAD, bundlePath: bundle });
+    expect(store.listRuns({ limit: 10, includeNoise: true }).map((row) => row.id)).toEqual([live.id]);
+  });
 });

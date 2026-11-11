@@ -722,3 +722,38 @@ function inheritFromAncestors(
 export function activityKey(activity: LiveActivity): string {
   return String(activity.pid);
 }
+
+/**
+ * Xcode.app's build services in a snapshot, busy or idle: the ones not
+ * running under an `xcodebuild`, which would make them part of that build.
+ */
+export function buildServices(procs: readonly ObservedProcess[]): ObservedProcess[] {
+  const byPid = new Map(procs.map((proc) => [proc.pid, proc]));
+  return procs.filter((proc) => {
+    if (!DAEMON_ROOTS.has(proc.comm)) return false;
+    const seen = new Set<number>([proc.pid]);
+    let cursor = byPid.get(proc.ppid);
+    while (cursor && !seen.has(cursor.pid)) {
+      seen.add(cursor.pid);
+      if (cursor.comm === DIRECT_ROOT) return false;
+      cursor = byPid.get(cursor.ppid);
+    }
+    return true;
+  });
+}
+
+/** A build service with nothing under it, as an activity of its own. */
+export function quietServiceActivity(proc: ObservedProcess, now: number): LiveActivity {
+  return {
+    ...parseXcodebuildArgs(proc.args),
+    pid: proc.pid,
+    comm: proc.comm,
+    args: proc.args,
+    startedAt: proc.startedAt ?? now,
+    roots: [],
+    workerCount: 0,
+    phase: null,
+    currentFile: null,
+    isDaemon: true,
+  };
+}

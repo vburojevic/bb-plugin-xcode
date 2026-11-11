@@ -35,6 +35,7 @@ import { LOG_DOMAINS, parseManifest } from "../manifest";
 import { ProcessObserver, readRootWorkspace, type ObserverDeps } from "../observe";
 import { shimPaths } from "../shim";
 import type { LiveActivity } from "../types";
+import { DerivedDataActions } from "../xcode-actions";
 import { boundSummary } from "./builds";
 import type {
   DiscoverRootsReply,
@@ -72,6 +73,7 @@ export class HostWatch {
 
   constructor(private readonly deps: HostWatchDeps) {
     this.observer = new ProcessObserver({
+      actions: new DerivedDataActions(deps.derivedDataDir ?? DEFAULT_DERIVED_DATA),
       // `info.plist` is read from inside the root only, like its manifests.
       workspaceOf: async (root) =>
         (await staysInside(join(root, "info.plist"), root)) ? readRootWorkspace(root) : null,
@@ -312,6 +314,7 @@ function toWire(activity: LiveActivity): WireActivity {
     phase: activity.phase,
     currentFile: clip(activity.currentFile, 1000),
     isDaemon: activity.isDaemon,
+    actionStartedAt: activity.actionStartedAt ?? null,
     kind: activity.kind,
     scheme: clip(activity.scheme, 1000),
     container: within(activity.container, 4096),

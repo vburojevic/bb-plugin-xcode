@@ -16,8 +16,9 @@ import { readTextFileBounded } from "./bounded-file";
 import { processCwd, psSnapshot } from "./exec";
 import { gitInfoFor, type GitInfo } from "./git";
 import { isRecord, parsePlist } from "./plist";
-import { findRootActivities, parsePsOutput } from "./proc";
+import { buildServices, findRootActivities, parsePsOutput, quietServiceActivity } from "./proc";
 import type { LiveActivity } from "./types";
+import { DerivedDataActions, type XcodeAction, type XcodeActionSource } from "./xcode-actions";
 
 /** `info.plist` in a DerivedData root is a few hundred bytes. */
 const MAX_ROOT_INFO_BYTES = 64 * 1024;
@@ -52,6 +53,8 @@ export interface ObserverDeps {
   cwdOf?: (pid: number) => Promise<string | null>;
   gitOf?: (dir: string) => Promise<GitInfo | null>;
   workspaceOf?: (root: string) => Promise<string | null>;
+  /** Xcode.app's actions in progress, from DerivedData. */
+  actions?: XcodeActionSource;
 }
 
 /**
@@ -65,6 +68,7 @@ export class ProcessObserver {
   private readonly cwdOf: (pid: number) => Promise<string | null>;
   private readonly gitOf: (dir: string) => Promise<GitInfo | null>;
   private readonly workspaceOf: (root: string) => Promise<string | null>;
+  private readonly actions: XcodeActionSource;
   private readonly cwdCache = new Map<number, string | null>();
   /** Git context per source directory; a checkout's branch rarely changes mid-build. */
   private readonly gitCache = new Map<string, { branch: string | null; worktree: string | null }>();
@@ -76,6 +80,7 @@ export class ProcessObserver {
     this.cwdOf = deps.cwdOf ?? processCwd;
     this.gitOf = deps.gitOf ?? gitInfoFor;
     this.workspaceOf = deps.workspaceOf ?? readRootWorkspace;
+    this.actions = deps.actions ?? new DerivedDataActions();
   }
 
   /**
@@ -87,7 +92,9 @@ export class ProcessObserver {
     const stdout = await this.ps();
     if (!stdout.trim()) return null;
 
-    const activities = findRootActivities(parsePsOutput(stdout, now));
+    const procs = parsePsOutput(stdout, now);
+    const activities = findRootActivities(procs);
+    await this.addXcodeActions(procs, activities, now);
     for (const activity of activities) {
       if (signal?.aborted) return null;
       let cwd = this.cwdCache.get(activity.pid);
@@ -107,6 +114,58 @@ export class ProcessObserver {
       if (!activities.some((activity) => activity.pid === pid)) this.cwdCache.delete(pid);
     }
     return activities;
+  }
+
+  /**
+   * Give Xcode.app's build service the action it is serving.
+   *
+   * Its children come and go — none while it plans a build, none for the
+   * whole of a test run — and with them it drops out of `findRootActivities`,
+   * which reads only the process tree. An action in progress in DerivedData
+   * keeps it in the snapshot, says which root (so workspace, so thread) from
+   * its first second, when it began, and for a test, the bundle its verdict
+   * will be read from. Only while a service process exists.
+   */
+  private async addXcodeActions(
+    procs: ReturnType<typeof parsePsOutput>,
+    activities: LiveActivity[],
+    now: number,
+  ): Promise<void> {
+    const service = buildServices(procs)[0];
+    if (!service) return;
+    let activity = activities.find((entry) => entry.pid === service.pid);
+    const seenRoots = activity ? [...activity.roots] : [];
+    let actions: XcodeAction[];
+    try {
+      actions = await this.actions.inProgress(now, seenRoots);
+    } catch {
+      return;
+    }
+    // The action of a root the service is visibly working in, else the one
+    // action there is. Two at once with no other clue: liveness, no claim.
+    const own = actions.filter((action) => seenRoots.includes(action.root));
+    const roots = new Set(actions.map((action) => action.root));
+    const tests = actions.filter((action) => action.kind === "test");
+    const chosen =
+      own.find((action) => action.kind === "test") ??
+      own[0] ??
+      (tests.length === 1 ? tests[0] : null) ??
+      (roots.size === 1 ? actions[0] : null);
+    if (actions.length === 0) return;
+    if (!activity) {
+      activity = quietServiceActivity(service, now);
+      activities.push(activity);
+    }
+    if (!chosen) return;
+    if (!activity.roots.includes(chosen.root)) activity.roots.unshift(chosen.root);
+    activity.actionStartedAt = Math.min(
+      ...actions.filter((action) => action.root === chosen.root).map((action) => action.startedAt),
+    );
+    if (chosen.kind === "test") {
+      activity.kind = "test";
+      activity.resultBundlePath = chosen.bundlePath;
+      activity.scheme ??= chosen.scheme;
+    }
   }
 
   /** The cached workspace of a root, read once. */
