@@ -10,7 +10,7 @@
  */
 
 import Database from "better-sqlite3";
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import { afterEach, describe, expect, it } from "vitest";
@@ -34,20 +34,28 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function setup() {
+function setup(options: { firstWorker?: Parameters<typeof createHostEntry>[0] } = {}) {
   const ws = makeWorkspace("xcode-recovery-");
   cleanups.push(() => ws.cleanup());
-  const mbp = experimental_createHostEntryHarness(
-    createHostEntry({
-      xcodebuildBinary: ws.fake,
-      pollMs: 20,
-      progressIntervalMs: 0,
-      livenessMs: 50,
-      findTool: async () => "/usr/bin/xcresulttool",
-      xcresult: fakeXcresult,
-    }),
-    { experimental_paths: { dataDir: ws.dataDir, tempDir: join(ws.base, "temp") } },
-  );
+  const worker = (extra: Parameters<typeof createHostEntry>[0] = {}) =>
+    experimental_createHostEntryHarness(
+      createHostEntry({
+        xcodebuildBinary: ws.fake,
+        pollMs: 20,
+        progressIntervalMs: 0,
+        livenessMs: 50,
+        findTool: async () => "/usr/bin/xcresulttool",
+        xcresult: fakeXcresult,
+        ...extra,
+      }),
+      { experimental_paths: { dataDir: ws.dataDir, tempDir: join(ws.base, "temp") } },
+    );
+  // `let`: a test may replace the Mac's worker, as a reload or crash would.
+  let mbp = worker(options.firstWorker);
+  const replaceWorker = async () => {
+    await mbp.experimental_dispose();
+    mbp = worker();
+  };
   cleanups.push(async () => {
     // Never leave a gated build behind.
     ws.release();
@@ -64,15 +72,33 @@ function setup() {
   });
 
   const clock = { now: Date.now() };
-  const net = { offline: false, dropStartRequest: false, dropStartReply: false };
+  const net = {
+    offline: false,
+    dropStartRequest: false,
+    dropStartReply: false,
+    /** When set, the start reply waits for it. */
+    holdStartReply: null as Promise<void> | null,
+    /** When set, a start call gives up after this long, as bb's timeout would. */
+    startTimeoutMs: null as number | null,
+  };
   const calls: string[] = [];
   const host = {
     call: async (method: string, input: unknown) => {
       calls.push(method);
       if (net.offline) throw new Error("host host_mbp is offline");
       if (method === "startBuild" && net.dropStartRequest) throw new Error("connection reset");
-      const output = await mbp.experimental_call(method as never, input as never);
+      const call = mbp.experimental_call(method as never, input as never);
+      const output =
+        method === "startBuild" && net.startTimeoutMs !== null
+          ? await Promise.race([
+              call,
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error("host call timed out")), net.startTimeoutMs!),
+              ),
+            ])
+          : await call;
       if (method === "startBuild" && net.dropStartReply) throw new Error("connection reset");
+      if (method === "startBuild" && net.holdStartReply) await net.holdStartReply;
       return output;
     },
   } as unknown as HostCaller;
@@ -108,7 +134,22 @@ function setup() {
   const buildDirs = () =>
     existsSync(join(ws.dataDir, "builds")) ? readdirSync(join(ws.dataDir, "builds")) : [];
 
-  return { ws, mbp, store, engine, clock, net, calls, server, scope, request, buildDirs };
+  return {
+    ws,
+    get mbp() {
+      return mbp;
+    },
+    replaceWorker,
+    store,
+    engine,
+    clock,
+    net,
+    calls,
+    server,
+    scope,
+    request,
+    buildDirs,
+  };
 }
 
 function runIdIn(message: string): string {
@@ -190,6 +231,73 @@ describe("a start whose reply is lost", () => {
       message: "-allowProvisioningUpdates is not available through the tracked build runner.",
     });
     expect(t.store.listRuns({ limit: 10, includeNoise: true })).toEqual([]);
+  });
+});
+
+describe("a build that finishes before its start reply arrives", () => {
+  it("still answers whoever is waiting on it", async () => {
+    const t = setup();
+    let letReplyThrough!: () => void;
+    t.net.holdStartReply = new Promise<void>((resolve) => {
+      letReplyThrough = resolve;
+    });
+    const remote = t.server();
+    const pending = remote.start(MBP, t.request("fail"), t.scope);
+
+    // The exit overtakes the reply, and is folded, bundle and all.
+    const exited = await until(() =>
+      t.mbp.experimental_getSignals().find((signal) => signal.signal === "exited"),
+    );
+    if (exited.signal !== "exited") return;
+    remote.onExited({ hostId: MBP.hostId, payload: exited.payload });
+    const runId = `w:${exited.payload.state.buildId}`;
+    await until(() => {
+      const run = t.store.getRun(runId);
+      return run?.status === "failed" && run.detailed;
+    });
+
+    letReplyThrough();
+    const started = await pending;
+    if (!started.ok) throw new Error(started.message);
+    expect(started.runId).toBe(runId);
+    const outcome = await Promise.race([
+      started.completed,
+      new Promise<"still waiting">((resolve) => setTimeout(() => resolve("still waiting"), 2_000)),
+    ]);
+    expect(outcome).toMatchObject({ exitCode: 65, signal: null, failed: false });
+  });
+});
+
+describe("a worker replaced between spawning a build and recording it", () => {
+  it("leaves a build the next worker adopts, rather than one written off", async () => {
+    // The first worker hangs right after the spawn, before the record: the
+    // moment a reload or crash would interrupt it.
+    const t = setup({ firstWorker: { readIdentity: () => new Promise(() => undefined) } });
+    t.net.startTimeoutMs = 300;
+    const remote = t.server();
+    const started = await remote.start(MBP, t.request("pass"), t.scope);
+    if (started.ok) throw new Error("expected the start to time out");
+    const runId = runIdIn(started.message);
+    const dir = join(t.ws.dataDir, "builds", runId.slice(2));
+    await until(() => existsSync(join(dir, "wrapper.pid")));
+    // Held at its gate: xcodebuild has not run, so nothing is lost yet.
+    expect(existsSync(join(dir, "record.json"))).toBe(false);
+    expect(readFileSync(join(dir, "stream.ndjson"), "utf8")).toBe("");
+
+    await t.replaceWorker();
+    t.net.startTimeoutMs = null;
+    // Well past the grace for a start that never arrived.
+    t.clock.now += UNCONFIRMED_START_GRACE_MS + 60_000;
+    await remote.reconcile();
+    const adopted = t.store.getRun(runId)!;
+    expect(adopted.status).toBe("running");
+    expect(adopted.bundlePath).toBe(join(dir, "result.xcresult"));
+
+    await until(async () => {
+      await remote.reconcile();
+      return t.store.getRun(runId)?.status === "passed";
+    });
+    expect(t.buildDirs()).toEqual([runId.slice(2)]);
   });
 });
 

@@ -32,7 +32,7 @@ printf '%s\\n' '{"name":"invocationStarted","structuredPayload":{}}' >> "$stream
 printf '%s\\n' '{"name":"logSectionCreated","structuredPayload":{"section":{"title":"Compile App"}}}' >> "$stream"
 case "$scheme" in
   slow) sleep 30 ;;
-  gated) while [ ! -f "$PWD/go" ]; do sleep 0.05; done ;;
+  gated) while [ ! -f "$PWD/go" ] && [ -d "$PWD" ]; do sleep 0.05; done ;;
 esac
 case "$scheme" in
   fail) printf '%s\\n' '{"name":"issueEmitted","structuredPayload":{"severity":"error"}}' >> "$stream" ;;

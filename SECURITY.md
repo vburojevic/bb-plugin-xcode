@@ -60,7 +60,10 @@ builds at once, counting builds still starting.
 Builds are addressed by an id the server mints and records before it asks for
 the start, so a start whose reply is lost is still accounted for; the id's
 format admits no path characters, and starting an id the worker already
-recorded returns that build rather than starting another. The worker acts only
+recorded returns that build rather than starting another. xcodebuild does not
+run until the worker's record of it is on disk: the wrapper waits at a gate the
+worker opens only after writing it, so no build runs that the plugin cannot
+find, stop or clean up. The worker acts only
 on builds it recorded in its own data dir. A server request cannot name a
 bundle to parse, a directory to delete, or a process to signal. Before
 `stop` signals anything, the worker proves that the recorded pid is still the

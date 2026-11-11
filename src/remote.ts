@@ -212,6 +212,11 @@ export class RemoteBuilds {
       hostId: target.hostId,
     };
     this.starting.add(runId);
+    // Registered before the Mac is asked: on a short build its `exited`
+    // signal can overtake the start reply, and the finish it triggers must
+    // have someone to tell. The promise keeps that answer for whoever awaits
+    // it once the reply does arrive.
+    const waiter = this.waiterFor(runId);
     try {
       this.deps.store.insertRun(run);
       this.deps.store.addCleanupHost(target.hostId, this.now());
@@ -234,6 +239,8 @@ export class RemoteBuilds {
         // adopts it from the worker's record, or writes it off once the Mac
         // has had `UNCONFIRMED_START_GRACE_MS` to know about it.
         this.unreached(target.hostId);
+        // Nobody will await this start; reconcile settles the run on its own.
+        this.waiters.delete(runId);
         const reason = error instanceof Error ? error.message : String(error);
         return {
           ok: false,
@@ -245,6 +252,7 @@ export class RemoteBuilds {
       this.reached(target.hostId);
       if (!started.ok) {
         // A definite refusal: nothing runs, so there is no run.
+        this.waiters.delete(runId);
         this.deps.store.deleteRun(runId);
         this.deps.publishSoon();
         return started;
@@ -257,7 +265,6 @@ export class RemoteBuilds {
     this.deps.publishSoon();
 
     const current = this.deps.store.getRun(runId) ?? run;
-    const waiter = this.waiterFor(runId);
     if (killSignal) {
       const onAbort = (): void => {
         void this.stop(current, REMOTE_STOP_GRACE_MS).catch(() => undefined);

@@ -17,7 +17,10 @@
  * not the one that started it, and so cannot `wait()` for it. Hence:
  *
  *  - every build has a durable record in the host data dir (pid, start time,
- *    marker, paths), so a fresh worker can re-adopt it;
+ *    marker, paths), so a fresh worker can re-adopt it. A launch intent is
+ *    written before the wrapper is spawned, and the wrapper holds xcodebuild
+ *    at a gate until the record exists, so a worker that dies mid-launch
+ *    leaves a build the next one adopts, never one that runs unrecorded;
  *  - liveness is pid + start time + a marker in the command line, never the
  *    pid alone (see `identity.ts`);
  *  - xcodebuild runs under a tiny `sh` wrapper that writes its exit status to
@@ -75,6 +78,7 @@ export const XCODEBUILD = "/usr/bin/xcodebuild";
 export const MAX_LIVE_BUILDS = 4;
 
 const RECORD_FILE = "record.json";
+const LAUNCH_FILE = "launch.json";
 const STREAM_READ_BYTES = 64 * 1024;
 const MAX_STREAM_BYTES = 64 * 1024 * 1024;
 const MAX_STREAM_LINE_BYTES = 1024 * 1024;
@@ -95,6 +99,14 @@ const MAX_ISSUES = 2_000;
 export const LOST_AFTER_MISSES = 3;
 /** Longest `stop` waits for a just-started build to finish launching. */
 const LAUNCH_WAIT_MS = 3_000;
+/**
+ * How long a launch intent without a wrapper is taken to be a launch still
+ * under way. Past it, nothing is coming: the worker died before the wrapper
+ * started, and the build never ran.
+ */
+export const LAUNCH_SETTLE_MS = 30_000;
+/** Exit status the wrapper writes when its gate never opened. */
+const UNLAUNCHED_STATUS = 125;
 /** A record with no exit status is only pruned once it is this old. */
 const UNSETTLED_PRUNE_AFTER_MS = 24 * 3_600_000;
 
@@ -102,10 +114,21 @@ const UNSETTLED_PRUNE_AFTER_MS = 24 * 3_600_000;
  * The wrapper xcodebuild runs under.
  *
  * `$0` is the build's marker (so `ps` shows it and identity checks can find
- * it), `$@` is the validated argv. It forwards SIGTERM/SIGHUP to xcodebuild
- * rather than dying of them, waits for the real exit, and writes the status
- * atomically. A status above 128 is a signal, as sh reports one. A stop that
- * arrives before xcodebuild has even forked is remembered and delivered.
+ * it), `$@` is the validated argv.
+ *
+ * First it records its own pid and then waits at a gate: xcodebuild does not
+ * run until the worker has made the build's record durable and created the
+ * `ready` file. A worker that dies between spawning the wrapper and writing
+ * the record therefore leaves a wrapper that has run nothing and says where
+ * it is, and the next worker adopts it from the launch intent and opens the
+ * gate (`HostBuilds.recover`). A gate that never opens times out after about
+ * fifteen minutes: the wrapper marks the build unlaunched and leaves. It
+ * leaves at once if the build's directory disappears.
+ *
+ * Then it forwards SIGTERM/SIGHUP to xcodebuild rather than dying of them,
+ * waits for the real exit, and writes the status atomically. A status above
+ * 128 is a signal, as sh reports one. A stop that arrives at the gate, or
+ * before xcodebuild has even forked, is remembered and delivered.
  *
  * xcodebuild runs as a background job so the wrapper can trap signals while
  * waiting; a non-interactive sh gives such a job /dev/null as stdin and
@@ -116,13 +139,25 @@ const UNSETTLED_PRUNE_AFTER_MS = 24 * 3_600_000;
 export const WRAPPER_SCRIPT =
   `child=""; stop=""; ` +
   `trap 'stop=1; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; fi' TERM HUP; ` +
+  `printf '%s\n' "$$" > "$XCODE_TRACK_WRAPPER.tmp" && mv -f "$XCODE_TRACK_WRAPPER.tmp" "$XCODE_TRACK_WRAPPER"; ` +
+  `ticks=0; ` +
+  `while [ ! -f "$XCODE_TRACK_READY" ] && [ -z "$stop" ]; do ` +
+  // Its directory gone (pruned, or the data dir removed): nobody can ever
+  // open the gate, and there is nowhere to report to.
+  `if [ ! -d "$XCODE_TRACK_DIR" ]; then exit ${UNLAUNCHED_STATUS}; fi; ` +
+  `if [ "$ticks" -ge 9000 ]; then : > "$XCODE_TRACK_UNLAUNCHED"; break; fi; ` +
+  `sleep 0.1; ticks=$((ticks + 1)); done; ` +
+  `if [ -n "$stop" ] || [ ! -f "$XCODE_TRACK_READY" ]; then ` +
+  `if [ -n "$stop" ]; then status=143; else status=${UNLAUNCHED_STATUS}; fi; ` +
+  `printf '%s\n' "$status" > "$XCODE_TRACK_EXIT.tmp" && mv -f "$XCODE_TRACK_EXIT.tmp" "$XCODE_TRACK_EXIT"; ` +
+  `exit "$status"; fi; ` +
   `"$@" & child=$!; ` +
   // A stop that landed before `$child` was known is delivered now.
   `if [ -n "$stop" ]; then kill -TERM "$child" 2>/dev/null; fi; ` +
-  `printf '%s\\n' "$child" > "$XCODE_TRACK_PID"; ` +
+  `printf '%s\n' "$child" > "$XCODE_TRACK_PID"; ` +
   `wait "$child"; status=$?; ` +
   `while kill -0 "$child" 2>/dev/null; do wait "$child"; status=$?; done; ` +
-  `printf '%s\\n' "$status" > "$XCODE_TRACK_EXIT.tmp" && mv -f "$XCODE_TRACK_EXIT.tmp" "$XCODE_TRACK_EXIT"`;
+  `printf '%s\n' "$status" > "$XCODE_TRACK_EXIT.tmp" && mv -f "$XCODE_TRACK_EXIT.tmp" "$XCODE_TRACK_EXIT"`;
 
 const SIGNALS: Readonly<Record<number, string>> = {
   1: "SIGHUP",
@@ -144,16 +179,15 @@ export function decodeExitStatus(status: number): {
   return signal ? { exitCode: null, signal } : { exitCode: status, signal: null };
 }
 
-/** What survives a worker: everything needed to find the build again. */
-export interface BuildRecord {
+/**
+ * What is written before the wrapper is spawned: enough to adopt it if this
+ * worker dies before the record is written.
+ */
+export interface LaunchIntent {
   version: 1;
   buildId: string;
   /** `$0` of the wrapper, so its command line names the build. */
   marker: string;
-  /** The wrapper's pid, which is also its process group. */
-  pid: number;
-  /** The wrapper's start time as `ps` reported it, epoch ms. */
-  startedAt: number;
   root: string;
   workingDir: string;
   argv: string[];
@@ -162,7 +196,33 @@ export interface BuildRecord {
   exitPath: string;
   pidPath: string;
   stderrPath: string;
+  /** Where the wrapper writes its own pid, before its gate. */
+  wrapperPidPath: string;
+  /** The gate: xcodebuild runs once this file exists. */
+  readyPath: string;
+  /** Created by a wrapper whose gate never opened. */
+  unlaunchedPath: string;
+  /** This worker's clock when the intent was written. */
+  requestedAt: number;
 }
+
+/** What survives a worker: everything needed to find the build again. */
+export interface BuildRecord extends LaunchIntent {
+  /** The wrapper's pid, which is also its process group. */
+  pid: number;
+  /** The wrapper's start time as `ps` reported it, epoch ms. */
+  startedAt: number;
+}
+
+/** What a build directory without a record turns out to hold. */
+type Recovery =
+  | { kind: "record"; record: BuildRecord }
+  /** An intent whose wrapper may still be on its way. */
+  | { kind: "launching" }
+  /** An intent nothing ever came of: the build never ran. */
+  | { kind: "unlaunched" }
+  /** No intent: this Mac never got the request. */
+  | { kind: "none" };
 
 /** What one worker call lends the long-lived watcher it may start. */
 export interface WorkerHooks {
@@ -281,7 +341,7 @@ export class HostBuilds {
   private async startOnce(request: StartRequest, hooks: WorkerHooks): Promise<StartBuildResult> {
     const { buildId } = request;
     await this.adoptAll(hooks);
-    const existing = await this.loadRecord(buildId);
+    const existing = await this.recordFor(buildId, hooks);
     if (existing) return { ok: true, buildId, ...startedOf(existing) };
     const checked = await this.validate(request);
     if (!checked.ok) return checked;
@@ -309,35 +369,52 @@ export class HostBuilds {
     workingDir: string,
     hooks: WorkerHooks,
   ): Promise<StartBuildResult> {
-    const checked = { workingDir };
     const dir = this.dirFor(buildId);
     await mkdir(dir, { recursive: true });
-    const paths = {
-      bundlePath: join(dir, "result.xcresult"),
-      streamPath: join(dir, "stream.ndjson"),
+    const bundlePath = join(dir, "result.xcresult");
+    const streamPath = join(dir, "stream.ndjson");
+    const injected = injectStreamFlags(request.argv, bundlePath, streamPath);
+    const intent: LaunchIntent = {
+      version: 1,
+      buildId,
+      marker: `bb-xcode-build:${buildId}`,
+      root: request.root,
+      workingDir,
+      argv: injected.argv,
+      bundlePath,
+      streamPath,
       exitPath: join(dir, "exit"),
       pidPath: join(dir, "xcodebuild.pid"),
       stderrPath: join(dir, "stderr.log"),
+      wrapperPidPath: join(dir, "wrapper.pid"),
+      readyPath: join(dir, "ready"),
+      unlaunchedPath: join(dir, "unlaunched"),
+      requestedAt: this.now(),
     };
     // xcodebuild refuses a stream path that does not already exist.
-    await writeFile(paths.streamPath, "");
-    const injected = injectStreamFlags(request.argv, paths.bundlePath, paths.streamPath);
-    const marker = `bb-xcode-build:${buildId}`;
+    await writeFile(streamPath, "");
+    // Durable before anything runs: from here on, any worker can find this
+    // build again, whatever happens to this one.
+    await writeJsonAtomic(join(dir, LAUNCH_FILE), intent);
     const runArgv = [this.deps.xcodebuildBinary ?? XCODEBUILD, ...injected.argv.slice(1)];
 
-    const stderrFd = openSync(paths.stderrPath, "a");
+    const stderrFd = openSync(intent.stderrPath, "a");
     let pid: number | undefined;
     try {
-      const child = this.spawn("/bin/sh", ["-c", WRAPPER_SCRIPT, marker, ...runArgv], {
-        cwd: checked.workingDir,
+      const child = this.spawn("/bin/sh", ["-c", WRAPPER_SCRIPT, intent.marker, ...runArgv], {
+        cwd: workingDir,
         // Its own process group: `stop` can then signal the whole tree, and
         // nothing that signals the daemon's group takes the build with it.
         detached: true,
         stdio: ["ignore", "ignore", stderrFd],
         env: {
           ...curatedChildEnv(process.env),
-          XCODE_TRACK_PID: paths.pidPath,
-          XCODE_TRACK_EXIT: paths.exitPath,
+          XCODE_TRACK_PID: intent.pidPath,
+          XCODE_TRACK_EXIT: intent.exitPath,
+          XCODE_TRACK_WRAPPER: intent.wrapperPidPath,
+          XCODE_TRACK_READY: intent.readyPath,
+          XCODE_TRACK_UNLAUNCHED: intent.unlaunchedPath,
+          XCODE_TRACK_DIR: dir,
         },
       });
       child.on("error", () => undefined);
@@ -351,22 +428,61 @@ export class HostBuilds {
       return { ok: false, message: "Could not start the build wrapper (/bin/sh)." };
     }
 
-    const startedAt = await this.startTimeOf(pid, marker);
     const record: BuildRecord = {
-      version: 1,
-      buildId,
-      marker,
+      ...intent,
       pid,
-      startedAt,
-      root: request.root,
-      workingDir: checked.workingDir,
-      argv: injected.argv,
-      ...paths,
+      startedAt: await this.startTimeOf(pid, intent.marker),
     };
     await writeJsonAtomic(join(dir, RECORD_FILE), record);
+    // Only now may xcodebuild run.
+    await openGate(record);
     this.watch(record, hooks);
-    this.deps.log?.(`started build ${buildId} (pid ${pid}) in ${checked.workingDir}`);
+    this.deps.log?.(`started build ${buildId} (pid ${pid}) in ${workingDir}`);
     return { ok: true, buildId, ...startedOf(record) };
+  }
+
+  /**
+   * Make a record for a build directory that has none.
+   *
+   * Only a launch the worker did not finish leaves one: its intent is on
+   * disk, and its wrapper (if it got that far) has written its pid and is
+   * waiting at the gate. Adopting it means writing the record this worker
+   * would have written, then opening the gate.
+   */
+  private async recover(buildId: string): Promise<Recovery> {
+    const intent = await readIntent(join(this.dirFor(buildId), LAUNCH_FILE), buildId);
+    if (intent === null) return { kind: "none" };
+    const wrapperPid = await readPid(intent.wrapperPidPath);
+    if (wrapperPid !== null) {
+      const identity = await this.readIdentity(wrapperPid);
+      const alive =
+        identity?.startedAt != null && identity.command?.includes(intent.marker) === true;
+      const exited = await this.readExit({ exitPath: intent.exitPath });
+      if (alive || exited) {
+        const record: BuildRecord = {
+          ...intent,
+          pid: wrapperPid,
+          startedAt: alive ? identity!.startedAt! : intent.requestedAt,
+        };
+        await writeJsonAtomic(join(this.dirFor(buildId), RECORD_FILE), record);
+        if (alive) await openGate(record);
+        this.deps.log?.(`recovered build ${buildId} from its launch intent`);
+        return { kind: "record", record };
+      }
+    }
+    return this.now() - intent.requestedAt < LAUNCH_SETTLE_MS
+      ? { kind: "launching" }
+      : { kind: "unlaunched" };
+  }
+
+  /** The build's record, recovering one from a launch intent when needed. */
+  private async recordFor(buildId: string, hooks: WorkerHooks | null): Promise<BuildRecord | null> {
+    const record = await this.loadRecord(buildId);
+    if (record) return record;
+    const recovered = await this.recover(buildId);
+    if (recovered.kind !== "record") return null;
+    if (hooks && !(await this.readExit(recovered.record))) this.watch(recovered.record, hooks);
+    return recovered.record;
   }
 
   /**
@@ -399,8 +515,23 @@ export class HostBuilds {
   private async stateOf(buildId: string, hooks: WorkerHooks | null): Promise<BuildState> {
     const cached = this.settled.get(buildId);
     if (cached) return cached;
-    const record = await this.loadRecord(buildId);
-    if (record === null) return unknownState(buildId);
+    let record = await this.loadRecord(buildId);
+    if (record === null) {
+      const recovered = await this.recover(buildId);
+      switch (recovered.kind) {
+        case "record":
+          record = recovered.record;
+          break;
+        case "launching":
+          // The Mac has it and is starting it: not yet a build to report on.
+          return { ...unknownState(buildId), status: "running" };
+        case "unlaunched":
+          // It arrived, and nothing ever ran: an answer, unlike "unknown".
+          return { ...unknownState(buildId), status: "lost" };
+        case "none":
+          return unknownState(buildId);
+      }
+    }
 
     const exited = await this.readExit(record);
     if (exited) return this.settle(record, exited);
@@ -429,10 +560,13 @@ export class HostBuilds {
     record: BuildRecord,
     exit: { status: number; endedAt: number } | null,
   ): Promise<BuildState> {
-    const decoded = exit ? decodeExitStatus(exit.status) : { exitCode: null, signal: null };
+    // A wrapper whose gate timed out ran nothing; its 125 is not a build's.
+    const unlaunched = exit !== null && (await exists(record.unlaunchedPath));
+    const decoded =
+      exit && !unlaunched ? decodeExitStatus(exit.status) : { exitCode: null, signal: null };
     const state: BuildState = {
       buildId: record.buildId,
-      status: exit ? "exited" : "lost",
+      status: exit && !unlaunched ? "exited" : "lost",
       exitCode: decoded.exitCode,
       signal: decoded.signal,
       endedAt: exit?.endedAt ?? null,
@@ -467,7 +601,7 @@ export class HostBuilds {
   }
 
   private async readExit(
-    record: BuildRecord,
+    record: Pick<BuildRecord, "exitPath">,
   ): Promise<{ status: number; endedAt: number } | null> {
     try {
       const [text, info] = await Promise.all([
@@ -593,7 +727,7 @@ export class HostBuilds {
   // ------------------------------------------------------------------ stop
 
   async stop(buildId: string, graceMs?: number): Promise<{ stopped: boolean; message: string }> {
-    const record = await this.loadRecord(buildId);
+    const record = await this.recordFor(buildId, null);
     if (record === null) return { stopped: false, message: "No such build on this Mac." };
     if (await this.readExit(record)) {
       return { stopped: false, message: `Build ${buildId} has already finished.` };
@@ -636,6 +770,8 @@ export class HostBuilds {
    * `LAUNCH_WAIT_MS` the signal goes anyway.
    */
   private async launched(record: BuildRecord): Promise<void> {
+    // Still at its gate: the wrapper's trap is set and nothing has forked.
+    if (!(await exists(record.readyPath))) return;
     const deadline = this.now() + LAUNCH_WAIT_MS;
     while (this.now() < deadline) {
       const childPid = await readPid(record.pidPath);
@@ -675,7 +811,7 @@ export class HostBuilds {
   // ------------------------------------------------------------- summarize
 
   async summarize(buildId: string): Promise<SummarizeResult> {
-    const record = await this.loadRecord(buildId);
+    const record = await this.recordFor(buildId, null);
     if (record === null) return { status: "unavailable", reason: "No such build on this Mac." };
     const exited = (await this.readExit(record)) !== null;
     const finalized = await stat(join(record.bundlePath, "Info.plist"))
@@ -762,6 +898,26 @@ export class HostBuilds {
     result.bytesRetained = held;
     // What the server needs to know whether this Mac still owes a cleanup.
     result.remaining = records.length - result.removed;
+
+    // Directories with no record even after recovery: a launch that never
+    // ran, or a request that died before its intent was written. Nothing
+    // there is a build, but they are still this plugin's files.
+    const recorded = new Set(records.map((record) => record.buildId));
+    for (const name of await this.listDirs()) {
+      if (recorded.has(name) || this.pendingStarts.has(name)) continue;
+      const dir = this.dirFor(name);
+      const recovered = await this.recover(name);
+      const modifiedAt = await stat(dir).then((info) => info.mtimeMs).catch(() => now);
+      const age = now - modifiedAt;
+      if (recovered.kind === "launching" || age < Math.max(retention.maxAgeMs, LAUNCH_SETTLE_MS)) {
+        result.remaining += 1;
+        continue;
+      }
+      const size = await treeSize(dir);
+      await rm(dir, { recursive: true, force: true });
+      result.removed += 1;
+      result.bytesFreed += size;
+    }
     return result;
   }
 
@@ -800,16 +956,19 @@ export class HostBuilds {
     }
   }
 
-  private async listRecords(): Promise<BuildRecord[]> {
-    let names: string[];
+  private async listDirs(): Promise<string[]> {
     try {
-      names = await readdir(this.buildsDir);
+      return await readdir(this.buildsDir);
     } catch {
       return [];
     }
+  }
+
+  private async listRecords(): Promise<BuildRecord[]> {
+    const names = await this.listDirs();
     const out: BuildRecord[] = [];
     for (const name of names) {
-      const record = await this.loadRecord(name);
+      const record = await this.recordFor(name, null);
       if (record) out.push(record);
     }
     return out;
@@ -849,6 +1008,45 @@ class StreamReader {
     await this.handle?.close().catch(() => undefined);
     this.handle = null;
   }
+}
+
+/** Let a gated wrapper run xcodebuild. Idempotent. */
+async function openGate(record: Pick<LaunchIntent, "readyPath">): Promise<void> {
+  await writeFile(record.readyPath, "");
+}
+
+async function exists(path: string): Promise<boolean> {
+  return stat(path).then(
+    () => true,
+    () => false,
+  );
+}
+
+async function readIntent(path: string, buildId: string): Promise<LaunchIntent | null> {
+  try {
+    const raw = JSON.parse(await readFile(path, "utf8")) as Partial<LaunchIntent>;
+    return isIntent(raw) && raw.buildId === buildId ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function isIntent(raw: Partial<LaunchIntent>): raw is LaunchIntent {
+  return (
+    raw.version === 1 &&
+    typeof raw.buildId === "string" &&
+    typeof raw.marker === "string" &&
+    typeof raw.bundlePath === "string" &&
+    typeof raw.streamPath === "string" &&
+    typeof raw.exitPath === "string" &&
+    typeof raw.pidPath === "string" &&
+    typeof raw.stderrPath === "string" &&
+    typeof raw.wrapperPidPath === "string" &&
+    typeof raw.readyPath === "string" &&
+    typeof raw.unlaunchedPath === "string" &&
+    typeof raw.requestedAt === "number" &&
+    Array.isArray(raw.argv)
+  );
 }
 
 async function readPid(path: string): Promise<number | null> {
@@ -1026,19 +1224,8 @@ function clipTest(test: TestRow): TestRow {
 }
 
 function isRecord(raw: Partial<BuildRecord>): raw is BuildRecord {
-  return (
-    raw.version === 1 &&
-    typeof raw.buildId === "string" &&
-    typeof raw.marker === "string" &&
-    typeof raw.pid === "number" &&
-    typeof raw.startedAt === "number" &&
-    typeof raw.bundlePath === "string" &&
-    typeof raw.streamPath === "string" &&
-    typeof raw.exitPath === "string" &&
-    typeof raw.pidPath === "string" &&
-    typeof raw.stderrPath === "string" &&
-    Array.isArray(raw.argv)
-  );
+  const fields = raw as Partial<BuildRecord>;
+  return isIntent(raw) && typeof fields.pid === "number" && typeof fields.startedAt === "number";
 }
 
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {

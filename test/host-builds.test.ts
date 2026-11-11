@@ -10,7 +10,7 @@
  * are the genuine article.
  */
 
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
@@ -20,6 +20,7 @@ import { createHostEntry } from "../host";
 import { FAKE_XCODEBUILD } from "./support/fake-xcodebuild";
 import {
   HostBuilds,
+  LAUNCH_SETTLE_MS,
   LOST_AFTER_MISSES,
   SUMMARY_BUDGET_BYTES,
   boundSummary,
@@ -430,8 +431,13 @@ describe("re-adoption by pid and start time", () => {
       exitPath: join(dir, "exit"),
       pidPath: join(dir, "xcodebuild.pid"),
       stderrPath: join(dir, "stderr.log"),
+      wrapperPidPath: join(dir, "wrapper.pid"),
+      readyPath: join(dir, "ready"),
+      unlaunchedPath: join(dir, "unlaunched"),
+      requestedAt: startedAt,
     };
     writeFileSync(join(dir, "record.json"), JSON.stringify(record));
+    writeFileSync(record.readyPath, "");
     return record;
   }
 
@@ -675,5 +681,93 @@ describe("the summary reply's size", () => {
       [],
     );
     expect(reply.build?.issues.map((issue) => issue.message)).toEqual(["e", "w"]);
+  });
+});
+
+describe("a launch the worker did not finish", () => {
+  /** A worker that hangs right after the spawn, before the record. */
+  const hanging = { readIdentity: () => new Promise<null>(() => undefined) };
+
+  it("is adopted by the next worker, can be stopped, and is cleaned up", async () => {
+    const ws = workspace();
+    const first = harnessFor(ws, hanging);
+    const buildId = mintBuildId(Date.now());
+    void first
+      .experimental_call("startBuild", {
+        buildId,
+        argv: ["/usr/bin/xcodebuild", "-scheme", "slow", "build"],
+        root: ws.checkout,
+      })
+      .catch(() => undefined);
+    const dir = join(ws.dataDir, "builds", buildId);
+    await until(() => existsSync(join(dir, "wrapper.pid")));
+    await first.experimental_dispose();
+    expect(existsSync(join(dir, "record.json"))).toBe(false);
+
+    const second = harnessFor(ws);
+    const { states } = await second.experimental_call("buildStates", { buildIds: [buildId] });
+    expect(states[0]).toMatchObject({ status: "running", started: { bundlePath: join(dir, "result.xcresult") } });
+    expect(existsSync(join(dir, "record.json"))).toBe(true);
+    // The gate is open now, and xcodebuild runs.
+    await until(() => readFileSync(join(dir, "stream.ndjson"), "utf8").includes("Compile App"));
+
+    expect((await second.experimental_call("stop", { buildId })).stopped).toBe(true);
+    const exited = await until(() => exitedSignal(second, buildId));
+    expect(exited).toMatchObject({ status: "exited", signal: "SIGTERM" });
+
+    await second.experimental_call("prune", { maxAgeMs: 0, maxTotalBytes: 0 });
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it("leaves no wrapper waiting at a gate whose directory is gone", async () => {
+    const ws = workspace();
+    const first = harnessFor(ws, hanging);
+    const buildId = mintBuildId(Date.now());
+    void first
+      .experimental_call("startBuild", {
+        buildId,
+        argv: ["/usr/bin/xcodebuild", "-scheme", "pass", "build"],
+        root: ws.checkout,
+      })
+      .catch(() => undefined);
+    const dir = join(ws.dataDir, "builds", buildId);
+    await until(() => existsSync(join(dir, "wrapper.pid")));
+    const pid = Number(readFileSync(join(dir, "wrapper.pid"), "utf8"));
+    rmSync(dir, { recursive: true, force: true });
+    const { readProcessIdentity } = await import("../src/host/identity");
+    await until(async () => !(await readProcessIdentity(pid))?.command?.includes(buildId), 3_000);
+  });
+
+  it("says a launch that never ran is lost, which an unknown id is not", async () => {
+    const ws = workspace();
+    let now = Date.now();
+    const buildId = mintBuildId(now);
+    // A worker that dies after writing the intent, before any wrapper ran.
+    const fakeSpawn = (() => ({ pid: 999_999, on: () => undefined, unref: () => undefined })) as never;
+    const first = new HostBuilds({ dataDir: ws.dataDir, spawn: fakeSpawn, readIdentity: hanging.readIdentity });
+    void first.start(
+      { buildId, argv: ["/usr/bin/xcodebuild", "build"], root: ws.checkout },
+      { emitProgress: async () => undefined, emitExited: async () => undefined, retainWorker: () => ({ dispose: async () => undefined }) },
+    );
+    const dir = join(ws.dataDir, "builds", buildId);
+    await until(() => existsSync(join(dir, "launch.json")));
+
+    const second = new HostBuilds({ dataDir: ws.dataDir, now: () => now, readIdentity: async () => null });
+    const hooks: WorkerHooks = {
+      emitProgress: async () => undefined,
+      emitExited: async () => undefined,
+      retainWorker: () => ({ dispose: async () => undefined }),
+    };
+    // Still within the window a launch takes: not an answer yet.
+    expect((await second.states([buildId], hooks))[0]?.status).toBe("running");
+    now += LAUNCH_SETTLE_MS + 1_000;
+    expect((await second.states([buildId], hooks))[0]).toMatchObject({ status: "lost", started: null });
+    expect((await second.states(["zz9-0123456789ab"], hooks))[0]?.status).toBe("unknown");
+
+    // Its partial directory is still this plugin's to clean.
+    now += 3 * 86_400_000;
+    const pruned = await second.prune({ maxAgeMs: 86_400_000, maxTotalBytes: 5 * 1024 ** 3 });
+    expect(pruned).toMatchObject({ removed: 1, remaining: 0 });
+    expect(existsSync(dir)).toBe(false);
   });
 });
