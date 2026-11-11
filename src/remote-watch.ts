@@ -30,7 +30,7 @@ import type {
 } from "./machine";
 import type { HostCaller } from "./remote";
 import type { Store } from "./store";
-import type { LiveActivity } from "./types";
+import type { LiveActivity, ServicePresence } from "./types";
 
 /** Call budgets. A bundle summary can be three 60s-class xcresulttool runs. */
 const PROBE_TIMEOUT_MS = 20_000;
@@ -67,10 +67,22 @@ export class RemoteMachine implements MachineIO {
     return { hostId: this.hostId, timeoutMs, ...(this.signal ? { signal: this.signal } : {}) };
   }
 
+  /**
+   * The build services the Mac last said were alive. Kept through a failed
+   * call: the last thing known of a process is that it was there, and a Mac
+   * out of reach is no evidence that it has gone.
+   */
+  private present: ServicePresence[] | null = null;
+
   /** Transport failures throw: no answer is never taken for "no builds". */
   async snapshot(): Promise<LiveActivity[] | null> {
     const reply = await this.host.call("probe", {}, this.options(PROBE_TIMEOUT_MS));
+    this.present = reply.services ? reply.services.map((service) => ({ ...service })) : null;
     return reply.activities.map((activity) => ({ ...activity }));
+  }
+
+  services(): readonly ServicePresence[] | null {
+    return this.present;
   }
 
   async discoverRoots(request: { projectPaths: readonly string[] }): Promise<DiscoveredRoot[]> {
@@ -306,7 +318,8 @@ export class RemoteWatch {
     while (!signal.aborted && !this.deps.isDisposed()) {
       const settings = this.deps.settings();
       collector.updateSettings({ scanProjects: settings.scanProjects, extraRoots: [] });
-      const startedAt = this.now();
+      // Real time spent, not the plugin's clock: this paces `setTimeout`.
+      const startedAt = Date.now();
       try {
         await this.pass(hostId, state, signal);
         if (failures > 0) this.deps.log.info(`${hostId} is answering again`);
@@ -318,7 +331,7 @@ export class RemoteWatch {
         const log = failures === 1 ? this.deps.log.info : this.deps.log.debug;
         log(`could not watch builds on ${hostId}: ${String(error)}`);
       }
-      const elapsed = this.now() - startedAt;
+      const elapsed = Date.now() - startedAt;
       const cooldown =
         failures > 0
           ? Math.min(

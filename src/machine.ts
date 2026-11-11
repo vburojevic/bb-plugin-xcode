@@ -23,7 +23,14 @@ import { xcresultJson } from "./exec";
 import { LOG_DOMAINS, parseManifest } from "./manifest";
 import { ProcessObserver, readRootWorkspace } from "./observe";
 import { listShimBundles } from "./shim";
-import type { BuildResults, LiveActivity, RunStatus, TestResults, TestRow } from "./types";
+import type {
+  BuildResults,
+  LiveActivity,
+  RunStatus,
+  ServicePresence,
+  TestResults,
+  TestRow,
+} from "./types";
 import { parseBuildResults, parseTestNodes, parseTestSummary } from "./xcresult";
 
 /** Xcode's plist is normally KB; this prevents a corrupt root from exhausting memory. */
@@ -85,6 +92,11 @@ export type ParsedBundle =
 export interface MachineIO {
   /** The Xcode builds running there now; null when there is no answer. */
   snapshot(now: number, signal?: AbortSignal): Promise<LiveActivity[] | null>;
+  /**
+   * The build services the last answered snapshot saw alive, reported or
+   * not; null when that is not known.
+   */
+  services?(): readonly ServicePresence[] | null;
   discoverRoots(request: {
     projectPaths: readonly string[];
     extraRoots: readonly string[];
@@ -120,6 +132,10 @@ export class LocalMachine implements MachineIO {
 
   snapshot(now: number, signal?: AbortSignal): Promise<LiveActivity[] | null> {
     return this.observer.snapshot(now, signal);
+  }
+
+  services(): readonly ServicePresence[] | null {
+    return this.observer.services();
   }
 
   async discoverRoots(request: {

@@ -304,7 +304,16 @@ export const hostContract = defineRpcContract({
   probe: {
     experimental_retryable: true,
     input: z.object({}).strict(),
-    output: z.object({ activities: z.array(activitySchema).max(64) }).strict(),
+    output: z
+      .object({
+        activities: z.array(activitySchema).max(64),
+        /** Every build service alive on this Mac, reported or not. */
+        services: z
+          .array(z.object({ pid: z.number().int(), startedAt: z.number().nullable() }).strict())
+          .max(64)
+          .optional(),
+      })
+      .strict(),
   },
   /**
    * DerivedData roots on this Mac: Xcode's shared location in this user's

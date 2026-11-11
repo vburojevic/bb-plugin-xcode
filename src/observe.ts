@@ -18,7 +18,7 @@ import { processCwd, psSnapshot } from "./exec";
 import { gitInfoFor, type GitInfo } from "./git";
 import { isRecord, parsePlist } from "./plist";
 import { buildServices, findRootActivities, parsePsOutput, quietServiceActivity, xcodeAppOf } from "./proc";
-import type { LiveActivity } from "./types";
+import type { LiveActivity, ServicePresence } from "./types";
 import { DerivedDataActions, type XcodeAction, type XcodeActionSource } from "./xcode-actions";
 
 /** `info.plist` in a DerivedData root is a few hundred bytes. */
@@ -38,6 +38,8 @@ const SERVICE_START_SLACK_MS = 60_000;
  * reopened. The slack covers `ps etime`'s whole seconds only.
  */
 const SESSION_START_SLACK_MS = 2_000;
+/** `ps etime` wobble for one process's start between two snapshots. */
+const SAME_START_SLACK_MS = 10_000;
 
 /**
  * The workspace or project a DerivedData root belongs to.
@@ -88,6 +90,16 @@ export class ProcessObserver {
   private readonly gitCache = new Map<string, { branch: string | null; worktree: string | null }>();
   /** A root's workspace never changes: its directory name is a hash of it. */
   private readonly workspaceCache = new Map<string, string | null>();
+  /** The build services the last answered snapshot saw; null before one. */
+  private present: ServicePresence[] | null = null;
+  /**
+   * The actions each build service's own children were seen working on, by
+   * pid, with the service's start (a reused pid is another process), while
+   * those actions are still in progress. Seen work makes an action a
+   * service's; a quiet stretch afterwards — the whole of a test run — does
+   * not unmake it.
+   */
+  private readonly claims = new Map<number, { startedAt: number | null; actions: Set<string> }>();
 
   constructor(deps: ObserverDeps = {}) {
     this.ps = deps.ps ?? psSnapshot;
@@ -108,6 +120,7 @@ export class ProcessObserver {
 
     const procs = parsePsOutput(stdout, now);
     const activities = findRootActivities(procs);
+    this.present = buildServices(procs).map((proc) => ({ pid: proc.pid, startedAt: proc.startedAt }));
     // Each build's directory first: it is what says which workspace a
     // terminal build owns, before Xcode.app's service is given an action.
     for (const activity of activities) {
@@ -129,6 +142,14 @@ export class ProcessObserver {
       if (!activities.some((activity) => activity.pid === pid)) this.cwdCache.delete(pid);
     }
     return activities;
+  }
+
+  /**
+   * Xcode.app's build services the last answered snapshot saw alive, busy
+   * or idle, reported or not; null before any snapshot answered.
+   */
+  services(): readonly ServicePresence[] | null {
+    return this.present;
   }
 
   private async cwdFor(pid: number): Promise<string | null> {
@@ -160,6 +181,10 @@ export class ProcessObserver {
     now: number,
   ): Promise<void> {
     const services = buildServices(procs);
+    for (const [pid, claim] of [...this.claims]) {
+      const service = services.find((entry) => entry.pid === pid);
+      if (!service || !sameStart(service.startedAt, claim.startedAt)) this.claims.delete(pid);
+    }
     if (services.length === 0) return;
     const working = new Map<number, string[]>();
     for (const service of services) {
@@ -184,12 +209,26 @@ export class ProcessObserver {
       const seenRoots = working.get(service.pid)!;
       const mine = actions.filter((action) => action.startedAt >= notBefore);
       // A root the service is visibly working in is its own, whatever else
-      // runs on this Mac.
-      const own = mine.filter((action) => seenRoots.includes(action.root));
+      // runs on this Mac — and so, for as long as it lasts, is an action it
+      // was once seen working on.
+      const claimed = this.claims.get(service.pid)?.actions;
+      const own = mine.filter(
+        (action) => seenRoots.includes(action.root) || claimed?.has(actionKey(action)),
+      );
       if (own.length > 0) {
-        this.credit(activities.find((entry) => entry.pid === service.pid)!, own, mine);
+        this.claims.set(service.pid, {
+          startedAt: this.claims.get(service.pid)?.startedAt ?? service.startedAt,
+          actions: new Set(own.map(actionKey)),
+        });
+        let activity = activities.find((entry) => entry.pid === service.pid);
+        if (!activity) {
+          activity = quietServiceActivity(service, now);
+          activities.push(activity);
+        }
+        this.credit(activity, own, mine);
         continue;
       }
+      this.claims.delete(service.pid);
       // Evidence on disk alone names no service. With one, it is that one's;
       // with several (a stable and a beta Xcode, each with its own), any of
       // them could have left it, and the one whose session would rule it out
@@ -355,4 +394,18 @@ async function sameDirectory(a: string, b: string): Promise<boolean> {
   if (normalize(a) === normalize(b)) return true;
   const [realA, realB] = await Promise.all([realpath(a).catch(() => null), realpath(b).catch(() => null)]);
   return realA !== null && realA === realB;
+}
+
+/**
+ * The same process's start, as `ps` reports it twice: whole seconds of
+ * elapsed time, so it wobbles by one. A pid reused by a new process starts
+ * well after the old one did.
+ */
+function sameStart(a: number | null, b: number | null): boolean {
+  return a === null || b === null || Math.abs(a - b) <= SAME_START_SLACK_MS;
+}
+
+/** One action, as long as it lasts: where, when it began, and its bundle. */
+function actionKey(action: XcodeAction): string {
+  return `${action.root}|${action.startedAt}|${action.bundlePath ?? ""}`;
 }

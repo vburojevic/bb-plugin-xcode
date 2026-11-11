@@ -376,3 +376,216 @@ describe("RunAllTests through Xcode's agent tools, as it was reported", () => {
     expect(store.listRuns({ limit: 10, includeNoise: true }).map((row) => row.id)).toEqual([live.id]);
   });
 });
+
+describe("a test run through a stretch two Xcodes leave unseen", () => {
+  /** Fake time runs 100× real: one probe every ~2 s of it, a sweep every ~5 s. */
+  const SPEED = 100;
+  const STABLE = "/Applications/Xcode.app";
+  const BETA = "/Applications/Xcode-beta.app";
+  const service = (app: string) =>
+    `${app}/Contents/SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/SWBBuildService.bundle/Contents/MacOS/SWBBuildService`;
+  const etime = (ms: number) => {
+    const s = Math.floor(ms / 1000);
+    const two = (n: number) => String(n).padStart(2, "0");
+    const days = Math.floor(s / 86_400);
+    const clock = `${two(Math.floor((s % 86_400) / 3600))}:${two(Math.floor((s % 3600) / 60))}:${two(s % 60)}`;
+    return days > 0 ? `${days}-${clock}` : clock;
+  };
+  const bundleName = (at: number) => {
+    const d = new Date(at);
+    const two = (n: number) => String(n).padStart(2, "0");
+    return `Test-Amion-${d.getUTCFullYear()}.${two(d.getUTCMonth() + 1)}.${two(d.getUTCDate())}_${two(d.getUTCHours())}-${two(d.getUTCMinutes())}-${two(d.getUTCSeconds())}-+0000.xcresult`;
+  };
+
+  function setup() {
+    const realStart = Date.now();
+    const t0 = Math.floor(realStart / 1000) * 1000;
+    const clock = () => t0 + (Date.now() - realStart) * SPEED;
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "xcode-quiet-")));
+    cleanups.push(() => rmSync(base, { recursive: true, force: true }));
+    const derivedData = join(base, "Library/Developer/Xcode/DerivedData");
+    const checkout = join(base, "Development/ios-amion-v2");
+    const workspace = join(checkout, "Amion.xcworkspace");
+    mkdirSync(workspace, { recursive: true });
+    const root = makeDerivedRoot(join(derivedData, "Amion-bkfmqyxwjbnhmfahbwgcrtlvkhzo"), { workspace });
+
+    // Stable has been open two hours, its service one; beta is open, idle.
+    const started = { stable: t0 - 7_200_000, service: t0 - 3_600_000, beta: t0 - 18_000_000 };
+    const state = { busy: false, ended: null as number | null };
+    const ps = () => {
+      const now = clock();
+      const lines = [
+        `    1     0 10-00:00:00 /sbin/launchd`,
+        `  800     1 ${etime(now - started.beta)} ${BETA}/Contents/MacOS/Xcode`,
+        `  901   800 ${etime(now - started.beta + 60_000)} ${service(BETA)}`,
+        `  700     1 ${etime(now - started.stable)} ${STABLE}/Contents/MacOS/Xcode`,
+        `  812   700 ${etime(now - started.service)} ${service(STABLE)}`,
+      ];
+      if (state.busy) {
+        lines.push(
+          ` 9000   812 00:02 ${STABLE}/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend -frontend -c -primary-file /src/App/File.swift -o ${root}/Build/Intermediates.noindex/App.build/Debug-iphonesimulator/App.build/Objects-normal/arm64/File.o`,
+        );
+      }
+      return `${lines.join("\n")}\n`;
+    };
+    const worker = () =>
+      experimental_createHostEntryHarness(
+        createHostEntry({
+          findTool: async () => "/usr/bin/xcresulttool",
+          // The bundle says when the action really ended.
+          xcresult: async (_tool, args) =>
+            args[1] === "build-results" && state.ended !== null
+              ? { status: "succeeded", startTime: t0 / 1000, endTime: state.ended / 1000, errorCount: 0, warningCount: 0 }
+              : null,
+          now: clock,
+          watch: { derivedDataDir: derivedData, observer: { ps: async () => ps(), cwdOf: async () => "/" } },
+        }),
+        { experimental_paths: { dataDir: join(base, "host-data"), tempDir: join(base, "temp") } },
+      );
+    const mac = { worker: worker() };
+    cleanups.push(() => mac.worker.experimental_dispose());
+    /** The worker replaced, as a reload or an idle stop would: what it remembered is gone. */
+    const restartWorker = async () => {
+      await mac.worker.experimental_dispose();
+      mac.worker = worker();
+    };
+
+    const db = new Database(":memory:") as unknown as Db;
+    for (const statement of MIGRATIONS) db.prepare(statement).run();
+    const store = new Store(db);
+    const scopes = new ThreadScopes();
+    const engine = new Engine(store, {
+      projectFor: () => null,
+      threadFor: (signals, hostId) => scopes.threadFor(signals, hostId),
+      log: () => undefined,
+    });
+    const host = {
+      call: async (method: string, input: unknown, options: { hostId: string }) => {
+        if (options.hostId !== MBP.id) throw new Error(`host ${options.hostId} is offline`);
+        return mac.worker.experimental_call(method as never, input as never);
+      },
+    } as unknown as HostCaller;
+    const watch = new RemoteWatch({
+      store,
+      engine,
+      host,
+      scopeHosts: (now) => scopes.watchedHosts(now),
+      scopePaths: (hostId) => scopes.pathsOn(hostId),
+      optInHosts: () => [],
+      serverHostId: () => MINI.id,
+      projects: () => [],
+      settings: () => ({ scanIntervalMs: 20, scanProjects: true, retentionDays: 30 }),
+      publishSoon: () => undefined,
+      log: { debug: () => undefined, info: () => undefined, warn: () => undefined },
+      isDisposed: () => false,
+      now: clock,
+      timing: { sweepPendingMs: 50, sweepIdleMs: 50, failureBaseMs: 20 },
+    });
+    const controller = new AbortController();
+    cleanups.push(async () => {
+      controller.abort();
+      await watch.stop();
+    });
+    scopes.upsert(
+      {
+        threadId: THREAD,
+        projectId: null,
+        environmentId: "env_amion",
+        path: checkout,
+        hostId: MBP.id,
+        branch: null,
+        active: true,
+      },
+      clock(),
+    );
+    watch.reconcile(controller.signal);
+
+    // A test action begins in stable Xcode: its bundle, then its build.
+    const began = t0 - 1_000;
+    const bundle = join(root, "Logs", "Test", bundleName(began));
+    mkdirSync(join(bundle, "Data"), { recursive: true });
+    state.busy = true;
+
+    /** Every status the run passes through, polled. */
+    const seen = new Set<string>();
+    const statuses = () => {
+      const rows = store.listRuns({ limit: 10, includeNoise: true });
+      for (const row of rows) seen.add(row.status);
+      return rows;
+    };
+    /** Let `ms` of fake time pass, watching statuses all the while. */
+    const elapse = async (ms: number) => {
+      const until = clock() + ms;
+      while (clock() < until) {
+        statuses();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+    return { clock, state, store, bundle, began, seen, statuses, elapse, restartWorker };
+  }
+
+  it("stays one running run on its thread, and ends when the bundle says", async () => {
+    const { clock, state, bundle, began, seen, statuses, elapse } = setup();
+    const live = await until(() => statuses().find((row) => row.status === "running" && row.bundlePath === bundle));
+    expect(live).toMatchObject({ pid: 812, threadId: THREAD, startedAt: began });
+
+    // The tests run in the simulator: no compilers under the service for
+    // 40 s, past the 20 s after which an unfinished bundle used to be called
+    // abandoned.
+    state.busy = false;
+    await elapse(40_000);
+    state.busy = true;
+    await elapse(6_000);
+    state.busy = false;
+    await elapse(10_000);
+    expect(statuses().map((row) => [row.id, row.status])).toEqual([[live.id, "running"]]);
+
+    state.ended = Math.floor(clock() / 1000) * 1000;
+    writeFileSync(join(bundle, "Info.plist"), "");
+    const settled = await until(() => statuses().find((row) => row.status === "passed"));
+    expect(settled).toMatchObject({ id: live.id, statusRank: 2, threadId: THREAD });
+    expect(settled.endedAt! - state.ended).toBeGreaterThanOrEqual(0);
+    expect(settled.endedAt! - state.ended).toBeLessThan(10_000);
+    expect([...seen]).not.toContain("cancelled");
+    expect(statuses()).toHaveLength(1);
+  });
+
+  it("with what the Mac remembered lost: no false cancel, running again when seen, the bundle's end", async () => {
+    const { clock, state, bundle, seen, statuses, elapse, restartWorker } = setup();
+    const live = await until(() => statuses().find((row) => row.status === "running" && row.bundlePath === bundle));
+
+    // Quiet, and the worker restarted: nothing now credits the action to
+    // either service, so it goes unseen — 60 s, long enough to have been
+    // called abandoned (20 s) and timed out of finishing (45 s). Its service
+    // is alive and its bundle unwritten: it is waiting on its outcome, which
+    // is neither "cancelled" nor the verdict-less "ended" a waiter would
+    // take for one.
+    state.busy = false;
+    await restartWorker();
+    await elapse(60_000);
+    expect(statuses().map((row) => [row.id, row.status])).toEqual([[live.id, "finishing"]]);
+    expect([...seen]).not.toContain("cancelled");
+    expect([...seen]).not.toContain("ended");
+
+    // Compilers again: the same action, the same run, running again.
+    state.busy = true;
+    const resumed = await until(() => statuses().find((row) => row.id === live.id && row.status === "running"));
+    expect(resumed).toMatchObject({ endedAt: null, threadId: THREAD, bundlePath: bundle });
+    expect(statuses()).toHaveLength(1);
+
+    // Unseen once more until it ends; the gap's guess at its end is replaced
+    // by the bundle's.
+    state.busy = false;
+    await restartWorker();
+    await elapse(30_000);
+    const inferred = statuses()[0]!.endedAt!;
+    state.ended = Math.floor(clock() / 1000) * 1000;
+    writeFileSync(join(bundle, "Info.plist"), "");
+    const settled = await until(() => statuses().find((row) => row.status === "passed"));
+    expect(settled).toMatchObject({ id: live.id, statusRank: 2, endedAt: state.ended });
+    expect(state.ended).toBeGreaterThan(inferred + 20_000);
+    expect([...seen]).not.toContain("cancelled");
+    expect([...seen]).not.toContain("ended");
+    expect(statuses()).toHaveLength(1);
+  });
+});

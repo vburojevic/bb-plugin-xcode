@@ -120,7 +120,12 @@ describe("probe", () => {
   it("says nothing about an idle Xcode", async () => {
     const { machine, call } = setup();
     machine.ps = xcodeAppPs({ servicePid: 812 });
-    expect(await call("probe", {})).toEqual({ activities: [] });
+    // No build — but the service is there, which is what tells a quiet
+    // build from one whose process has gone.
+    expect(await call("probe", {})).toEqual({
+      activities: [],
+      services: [{ pid: 812, startedAt: NOW - 90 * 60_000 }],
+    });
   });
 
   it("leaves out the builds this worker runs itself, and resolves a relative bundle path", async () => {
@@ -373,7 +378,7 @@ describe("Xcode.app's actions found on disk", () => {
     mkdirSync(join(outside, "Data"), { recursive: true });
     const link = join(root, "Logs/Test", bundleName(NOW - 60_000));
     symlinkSync(outside, link);
-    expect(await call("probe", {})).toEqual({ activities: [] });
+    expect(await call("probe", {})).toMatchObject({ activities: [] });
     writeFileSync(join(outside, "Info.plist"), "");
     expect(await call("summarizeBundle", { path: link })).toMatchObject({ status: "refused" });
     await restartWorker();
@@ -412,7 +417,7 @@ describe("Xcode.app's actions found on disk", () => {
       ].join("\n"),
     });
     machine.cwds.set(901, checkout);
-    expect(await call("probe", {})).toEqual({ activities: [] });
+    expect(await call("probe", {})).toMatchObject({ activities: [] });
 
     // Or names it relative to its own directory, before its compilers do.
     machine.ps = xcodeAppPs({
@@ -422,7 +427,7 @@ describe("Xcode.app's actions found on disk", () => {
         `  901   900 00:30 /usr/bin/xcodebuild -workspace Amion.xcworkspace -scheme Amion -derivedDataPath ../../Library/Developer/Xcode/DerivedData/${root.split("/").pop()} build -resultBundlePath ${tracked}`,
       ].join("\n"),
     });
-    expect(await call("probe", {})).toEqual({ activities: [] });
+    expect(await call("probe", {})).toMatchObject({ activities: [] });
 
     // Once it names the root, the same.
     machine.ps = xcodeAppPs({
@@ -433,6 +438,6 @@ describe("Xcode.app's actions found on disk", () => {
         ` 9100   901 00:02 /usr/bin/clang -c /src/App/main.m -o ${root}/Build/Intermediates.noindex/App.build/main.o`,
       ].join("\n"),
     });
-    expect(await call("probe", {})).toEqual({ activities: [] });
+    expect(await call("probe", {})).toMatchObject({ activities: [] });
   });
 });

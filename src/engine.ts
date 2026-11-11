@@ -21,11 +21,11 @@ import {
   statusTransitionAllowed,
 } from "./model";
 import { isHostBuildRun, type Store } from "./store";
-import type { LiveActivity } from "./types";
+import type { LiveActivity, ServicePresence } from "./types";
 import type { BuildResults, TestResults } from "./types";
 import type { BackgroundCommandOutcome } from "./thread-outcome";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
-import { parseTestBundleName } from "./xcode-actions";
+import { MAX_ACTION_AGE_MS, parseTestBundleName } from "./xcode-actions";
 
 /**
  * Consecutive probe misses before a running process is considered gone.
@@ -118,6 +118,12 @@ const ACTION_SLACK_MS = 5_000;
  * this plugin must never present is a build that has been "running" for a day.
  */
 export const RUNNING_MAX_AGE_MS = 12 * 3_600_000;
+
+/**
+ * How recently a sweep must have found a run's bundle still being written for
+ * the run to be held out of `ended`: a few sweeps' worth.
+ */
+const AWAITING_FRESH_MS = 90_000;
 
 interface LiveEntry {
   runId: string;
@@ -230,6 +236,16 @@ function sameProcess(activity: LiveActivity, expectedStartedAt: number): boolean
 export class Engine {
   /** Keyed by `liveKey` — the probe's identity for a live activity. */
   private readonly live = new Map<string, LiveEntry>();
+  /**
+   * The build services each machine's last answered snapshot saw alive (key:
+   * host id, "" for this one); a machine missing or null is not known.
+   */
+  private readonly presence = new Map<string, readonly ServicePresence[] | null>();
+  /**
+   * Runs whose bundle the last sweeps found still being written while their
+   * service lived, with when that was last seen.
+   */
+  private readonly awaiting = new Map<string, number>();
 
   constructor(
     private readonly store: Store,
@@ -275,6 +291,56 @@ export class Engine {
         });
       }
     }
+  }
+
+  /**
+   * What one machine's last answered snapshot saw of its build services.
+   * Kept until the next answer: a machine out of reach is no evidence that
+   * a process there has gone.
+   */
+  notePresence(hostId: string | null, services: readonly ServicePresence[] | null): void {
+    this.presence.set(hostId ?? "", services);
+  }
+
+  /**
+   * Is the build service that ran this run still alive on its machine, by
+   * the last snapshot there? False when that is not known, or the pid now
+   * belongs to a process started after the run began.
+   */
+  producerAlive(run: Pick<Run, "hostId" | "pid" | "startedAt">): boolean {
+    const present = this.presence.get(run.hostId ?? "") ?? null;
+    if (present === null || run.pid === null) return false;
+    return present.some(
+      (service) =>
+        service.pid === run.pid &&
+        (service.startedAt === null || service.startedAt <= run.startedAt + ADOPTION_SLACK_MS),
+    );
+  }
+
+  /**
+   * The bundle sweep found this run's bundle still being written, and the
+   * service that writes it alive. See `awaitingBundle`.
+   */
+  noteAwaitingBundle(runId: string, now: number): void {
+    this.awaiting.set(runId, now);
+  }
+
+  /**
+   * An Xcode.app action left `running` because it could not be seen, whose
+   * bundle the sweeps keep finding unfinished while its service lives: still
+   * going, as far as anything can tell, so not yet `ended`. Lapses as soon as
+   * the sweeps stop saying so — the bundle was finalized (it is read, or
+   * cannot be here), or the service went — and is bounded by how long an
+   * action can be believed to last.
+   */
+  private awaitingBundle(run: Run, now: number): boolean {
+    const at = this.awaiting.get(run.id);
+    if (at === undefined) return false;
+    if (now - at > AWAITING_FRESH_MS || now - run.startedAt >= MAX_ACTION_AGE_MS) {
+      this.awaiting.delete(run.id);
+      return false;
+    }
+    return this.producerAlive(run);
   }
 
   /**
@@ -400,8 +466,16 @@ export class Engine {
       const startedAt = activity.isDaemon
         ? (activity.actionStartedAt ?? Math.max(now, activity.startedAt))
         : activity.startedAt;
+      const id = observedRunId(hostId, activity.pid, startedAt);
+      // The same process — or the same Xcode action — as a run already
+      // stored: it is that run seen again, not a new one.
+      const known = this.store.getRun(id);
+      if (known) {
+        if (this.resume(known, key, activity, now, hostId)) changed = true;
+        continue;
+      }
       const run: Run = {
-        id: observedRunId(hostId, activity.pid, startedAt),
+        id,
         status: "running",
         statusRank: RANK.observed,
         kind: activity.kind,
@@ -475,6 +549,54 @@ export class Engine {
       if (this.retire(entry, now)) changed = true;
     }
 
+    return changed;
+  }
+
+  /**
+   * A stored run's process or action, showing again after it was taken out
+   * of `running`.
+   *
+   * Leaving `running` is only ever inferred: a process missing from three
+   * snapshots. For Xcode.app's service that is often a stretch in which its
+   * build could not be seen, not one in which it stopped — and when it is
+   * seen again, with the same identity, it is the same run, back to
+   * `running`. Only an outcome stated by evidence (a log entry, a bundle)
+   * closes a run for good; such a run is not followed again.
+   */
+  private resume(
+    run: Run,
+    key: string,
+    activity: LiveActivity,
+    now: number,
+    hostId: string | null,
+  ): boolean {
+    if (run.statusRank > RANK.observed) return false;
+    // Retired for running longer than can be believed: not brought back to
+    // be retired again on the next tick.
+    if (now - run.startedAt >= RUNNING_MAX_AGE_MS) return false;
+    let changed = false;
+    if (run.status !== "running") {
+      this.hooks.log(`run resumed: ${run.id} (was ${run.status})`);
+      run.status = "running";
+      run.endedAt = null;
+      this.store.updateRun(run);
+      changed = true;
+    }
+    const entry: LiveEntry = {
+      runId: run.id,
+      hostId,
+      pid: activity.pid,
+      root: run.root,
+      container: run.container,
+      actionStartedAt: activity.actionStartedAt ?? null,
+      bundlePath: run.bundlePath,
+      runStartedAt: run.startedAt,
+      misses: 0,
+      lastSeenAt: now,
+      sawWork: true,
+    };
+    this.live.set(key, entry);
+    if (this.learn(entry, activity, hostId)) changed = true;
     return changed;
   }
 
@@ -577,6 +699,9 @@ export class Engine {
       if (run.status !== "finishing") continue;
       const since = run.endedAt ?? run.startedAt;
       if (now - since < FINISHING_TIMEOUT_MS) continue;
+      // Not "ended" — which a waiter takes as the outcome — while its
+      // outcome is still on its way.
+      if (this.awaitingBundle(run, now)) continue;
       run.status = "ended";
       run.statusRank = RANK.observed;
       this.store.updateRun(run);
@@ -923,9 +1048,9 @@ export class Engine {
           { status: verdict, rank: RANK.logged },
         )
       ) {
+        target.endedAt = settledEnd(target, entry.endedAt, now);
         target.status = verdict;
         target.statusRank = RANK.logged;
-        target.endedAt ??= entry.endedAt ?? now;
         this.dropLive(target.id);
         this.hooks.log(`verdict from manifest: ${verdict} (${target.id})`);
       }
@@ -1131,9 +1256,9 @@ export class Engine {
           { status: verdict, rank: RANK.verified },
         ))
     ) {
+      target.endedAt = settledEnd(target, tests?.endedAt ?? build?.endedAt ?? null, now);
       target.status = verdict;
       target.statusRank = RANK.verified;
-      target.endedAt ??= tests?.endedAt ?? build?.endedAt ?? now;
       this.dropLive(target.id);
     }
 
@@ -1181,6 +1306,23 @@ export function ownedBy(
   // an artifact that does.
   if (run.cwd !== null && isAbsolute(run.cwd)) return resolve(run.cwd) === dirname(workspace);
   return false;
+}
+
+/**
+ * A run's end once an outcome is stated: the end it has, unless that was
+ * only inferred — the last snapshot it was seen in, before a stretch it could
+ * not be seen through — and the evidence says it went on later.
+ */
+function settledEnd(
+  run: Pick<Run, "endedAt" | "statusRank">,
+  stated: number | null,
+  now: number,
+): number {
+  if (run.endedAt === null) return stated ?? now;
+  if (run.statusRank === RANK.observed && stated !== null && stated > run.endedAt) {
+    return Math.min(stated, now);
+  }
+  return run.endedAt;
 }
 
 /** Is this the command line of Xcode.app's resident build service? */

@@ -9,11 +9,15 @@
  */
 
 import Database from "better-sqlite3";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { Collector } from "../src/collector";
 import { Engine, MISSES_BEFORE_FINISHING, observedRunId } from "../src/engine";
-import type { MachineIO } from "../src/machine";
+import { LocalMachine, type MachineIO } from "../src/machine";
+import { ProcessObserver } from "../src/observe";
 import { RANK, type Run } from "../src/model";
 import { selectHostsToWatch } from "../src/remote-watch";
 import { ScopeSync } from "../src/scope-sync";
@@ -26,6 +30,7 @@ import {
   type Db,
 } from "../src/store";
 import type { LiveActivity } from "../src/types";
+import { DerivedDataActions, MAX_ACTION_AGE_MS } from "../src/xcode-actions";
 
 const NOW = 1_800_000_000_000;
 const MBP = "host_mbp";
@@ -887,5 +892,205 @@ describe("a worktree nested inside another checkout", () => {
     });
     expect(other.getRun("m:MAIN-ENTRY")).toBeNull();
     expect(other.hasSeen("manifest:MAIN-ENTRY")).toBe(true);
+  });
+});
+
+describe("an Xcode.app run around a stretch it could not be seen through", () => {
+  const SERVICE =
+    "/Applications/Xcode.app/Contents/SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/SWBBuildService.bundle/Contents/MacOS/SWBBuildService";
+  const BUNDLE = "/Users/me/Library/Developer/Xcode/DerivedData/App-abc/Logs/Test/Test-App.xcresult";
+  const ide = (overrides: Partial<Run> = {}) =>
+    run(observedRunId(MBP, 812, NOW), {
+      status: "finishing",
+      kind: "test",
+      pid: 812,
+      cmdline: SERVICE,
+      hostId: MBP,
+      bundlePath: BUNDLE,
+      endedAt: NOW + 10_000,
+      ...overrides,
+    });
+  const service = (overrides: Partial<LiveActivity> = {}) =>
+    activity({
+      pid: 812,
+      comm: "SWBBuildService",
+      args: SERVICE,
+      startedAt: NOW - 3_600_000,
+      isDaemon: true,
+      kind: "test",
+      actionStartedAt: NOW,
+      resultBundlePath: BUNDLE,
+      ...overrides,
+    });
+
+  describe("its unfinished bundle", () => {
+    async function sweep(services: MachineIO["services"]) {
+      const store = migrated();
+      const engine = engineWith(store);
+      store.insertRun(ide());
+      const io: MachineIO = {
+        snapshot: async () => [],
+        ...(services ? { services } : {}),
+        discoverRoots: async () => [],
+        readManifests: async () => [],
+        listBundles: async () => ({ candidates: [BUNDLE], finalized: new Set() }),
+        parseBundle: async () => ({ status: "empty" }),
+      };
+      const collector = new Collector(
+        { store, engine, listProjects: async () => [], log: { debug: () => undefined, warn: () => undefined }, dataDir: "", io, hostId: MBP },
+        { scanProjects: false, extraRoots: [] },
+      );
+      // As the loop runs them: probes every few seconds, sweeps between.
+      await collector.probeTick(NOW + 20_000);
+      await collector.sweepBundles(NOW + 30_000);
+      await collector.probeTick(NOW + 60_000);
+      await collector.sweepBundles(NOW + 60_000);
+      return store.getRun(ide().id)?.status;
+    }
+
+    it("is a test still going while its service is alive, never a cancel", async () => {
+      expect(await sweep(() => [{ pid: 812, startedAt: NOW - 3_600_000 }])).toBe("finishing");
+    });
+
+    it("is abandoned once the service has gone, or its pid is another process's", async () => {
+      expect(await sweep(() => [])).toBe("cancelled");
+      expect(await sweep(() => [{ pid: 812, startedAt: NOW + 30_000 }])).toBe("cancelled");
+      // Not known (an older worker): as before.
+      expect(await sweep(undefined)).toBe("cancelled");
+    });
+  });
+
+  describe("unseen past the finishing timeout", () => {
+    /** `writingAt`: when a sweep last found its bundle unfinished; null: never. */
+    function expire(services: { pid: number; startedAt: number }[], at: number, writingAt: number | null) {
+      const store = migrated();
+      const engine = engineWith(store);
+      store.insertRun(ide());
+      engine.notePresence(MBP, services);
+      if (writingAt !== null) engine.noteAwaitingBundle(ide().id, writingAt);
+      engine.expireFinishing(at);
+      return store.getRun(ide().id)?.status;
+    }
+    const alive = [{ pid: 812, startedAt: NOW - 3_600_000 }];
+
+    it("is not called ended while its service lives and its bundle is still being written", () => {
+      expect(expire(alive, NOW + 120_000, NOW + 116_000)).toBe("finishing");
+    });
+
+    it("is, once the service has gone, the sweeps stop finding the bundle unfinished, or it has run past belief", () => {
+      expect(expire([], NOW + 120_000, NOW + 116_000)).toBe("ended");
+      // Finalized — read, or with no xcresulttool on that Mac to read it.
+      expect(expire(alive, NOW + 120_000, null)).toBe("ended");
+      expect(expire(alive, NOW + 300_000, NOW + 116_000)).toBe("ended");
+      expect(expire(alive, NOW + MAX_ACTION_AGE_MS + 1, NOW + MAX_ACTION_AGE_MS)).toBe("ended");
+    });
+  });
+
+  it("on the server Mac too, by its own process table", async () => {
+    const store = migrated();
+    const engine = engineWith(store);
+    const dir = mkdtempSync(join(tmpdir(), "xcode-gap-"));
+    const bundle = join(dir, "Logs/Test/Test-App.xcresult");
+    mkdirSync(join(bundle, "Data"), { recursive: true });
+    const local = ide({ id: observedRunId(null, 812, NOW), hostId: null, bundlePath: bundle });
+    store.insertRun(local);
+    const io = new LocalMachine({
+      dataDir: "",
+      resolveTool: async () => null,
+      observer: new ProcessObserver({
+        ps: async () => `    1     0 10-00:00:00 /sbin/launchd\n  812     1 02:00:00 ${SERVICE}\n`,
+        cwdOf: async () => "/",
+        gitOf: async () => null,
+        actions: new DerivedDataActions("/nonexistent/DerivedData"),
+      }),
+    });
+    const collector = new Collector(
+      { store, engine, listProjects: async () => [], log: { debug: () => undefined, warn: () => undefined }, dataDir: "", io },
+      { scanProjects: false, extraRoots: [] },
+    );
+    await collector.probeTick(NOW + 30_000);
+    await collector.sweepBundles(NOW + 40_000);
+    await collector.probeTick(NOW + 120_000);
+    expect(engine.producerAlive(local)).toBe(true);
+    expect(store.getRun(local.id)?.status).toBe("finishing");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  describe("seen again", () => {
+    it("is the same run, running again, whatever the gap made of it", () => {
+      for (const status of ["finishing", "ended", "cancelled"] as const) {
+        const store = migrated();
+        const engine = engineWith(store);
+        store.insertRun(ide({ status }));
+        engine.foldSnapshot([service()], NOW + 40_000, MBP);
+        expect(store.listRuns({ limit: 10, includeNoise: true })).toMatchObject([
+          { id: ide().id, status: "running", endedAt: null },
+        ]);
+        // And ends again only by being missed again.
+        for (let tick = 1; tick <= MISSES_BEFORE_FINISHING; tick += 1) {
+          engine.foldSnapshot([], NOW + 40_000 + tick * 2_000, MBP);
+        }
+        expect(store.getRun(ide().id)).toMatchObject({ status: "finishing", endedAt: NOW + 40_000 });
+      }
+    });
+
+    it("is not brought back once retired for running past belief", () => {
+      const store = migrated();
+      const engine = engineWith(store);
+      const old = run("r:4242:1800000000", { status: "ended", endedAt: NOW + 13 * 3_600_000 });
+      store.insertRun(old);
+      for (let tick = 0; tick < 3; tick += 1) {
+        expect(engine.foldSnapshot([activity()], NOW + 13 * 3_600_000 + tick * 2_000)).toBe(false);
+        engine.expireFinishing(NOW + 13 * 3_600_000 + tick * 2_000);
+      }
+      expect(store.getRun(old.id)).toMatchObject({ status: "ended", endedAt: NOW + 13 * 3_600_000 });
+    });
+
+    it("is not reopened once evidence has settled it", () => {
+      const store = migrated();
+      const engine = engineWith(store);
+      store.insertRun(ide({ status: "passed", statusRank: RANK.verified, endedAt: NOW + 30_000 }));
+      engine.foldSnapshot([service()], NOW + 40_000, MBP);
+      engine.foldSnapshot([], NOW + 42_000, MBP);
+      expect(store.listRuns({ limit: 10, includeNoise: true })).toMatchObject([
+        { id: ide().id, status: "passed", endedAt: NOW + 30_000 },
+      ]);
+    });
+  });
+
+  describe("its end", () => {
+    const build = (endedAt: number) => ({
+      status: "passed" as const,
+      startedAt: NOW,
+      endedAt,
+      errorCount: 0,
+      warningCount: 0,
+      analyzerCount: 0,
+      actionTitle: null,
+      destination: null,
+      issues: [],
+    });
+    const settle = (inferred: Run, stated: number) => {
+      const store = migrated();
+      const engine = engineWith(store);
+      store.insertRun(inferred);
+      engine.foldBundle(BUNDLE, build(stated), null, [], NOW + 300_000, MBP);
+      return store.getRun(inferred.id);
+    };
+
+    it("is the bundle's, when the gap's guess was earlier", () => {
+      expect(settle(ide({ endedAt: NOW + 10_000 }), NOW + 120_000)).toMatchObject({
+        status: "passed",
+        endedAt: NOW + 120_000,
+      });
+    });
+
+    it("is never cut short by it, nor moved once evidence stated one", () => {
+      expect(settle(ide({ endedAt: NOW + 61_000 }), NOW + 60_000)?.endedAt).toBe(NOW + 61_000);
+      expect(
+        settle(ide({ status: "failed", statusRank: RANK.logged, endedAt: NOW + 30_000 }), NOW + 120_000)
+          ?.endedAt,
+      ).toBe(NOW + 30_000);
+    });
   });
 });

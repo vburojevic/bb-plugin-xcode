@@ -34,7 +34,7 @@ import { isFinalized, MAX_LOG_MANIFEST_BYTES, parseBundleWith } from "../machine
 import { LOG_DOMAINS, parseManifest } from "../manifest";
 import { ProcessObserver, readRootWorkspace, type ObserverDeps } from "../observe";
 import { shimPaths } from "../shim";
-import type { LiveActivity } from "../types";
+import type { LiveActivity, ServicePresence } from "../types";
 import { DerivedDataActions } from "../xcode-actions";
 import { boundSummary } from "./builds";
 import type {
@@ -94,7 +94,7 @@ export class HostWatch {
    * printed nothing (it timed out under load) or a list over the reply cap
    * must be no answer, never "no builds".
    */
-  async probe(now: number): Promise<{ activities: WireActivity[] }> {
+  async probe(now: number): Promise<{ activities: WireActivity[]; services: ServicePresence[] }> {
     const snapshot = await this.observer.snapshot(now);
     if (snapshot === null) throw new Error("ps gave no process list on this Mac");
     const activities: WireActivity[] = [];
@@ -111,7 +111,7 @@ export class HostWatch {
     if (activities.length > MAX_ACTIVITIES) {
       throw new Error(`${activities.length} Xcode builds on this Mac, more than one reply can list`);
     }
-    return { activities };
+    return { activities, services: (this.observer.services() ?? []).slice(0, MAX_ACTIVITIES) };
   }
 
   // -------------------------------------------------------------- discovery

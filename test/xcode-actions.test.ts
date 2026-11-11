@@ -836,3 +836,75 @@ describe("review of 85c41cd: a stable and a beta Xcode, each with its own servic
     });
   }
 });
+
+describe("review of 5914826: an action a service was seen working on, then quiet", () => {
+  const NOW = Date.UTC(2026, 10, 11, 18, 44, 16);
+  const STABLE = "/Applications/Xcode.app";
+  const BETA = "/Applications/Xcode-beta.app";
+  const service = (app: string) =>
+    `${app}/Contents/SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/SWBBuildService.bundle/Contents/MacOS/SWBBuildService`;
+  /** Beta idle; stable's service up `serviceEtime`, compiling into `root` when busy. */
+  const table = (root: string, busy: boolean, serviceEtime = "01:00:00") =>
+    [
+      `    1     0 10-00:00:00 /sbin/launchd`,
+      `  800     1 05:00:00 ${BETA}/Contents/MacOS/Xcode`,
+      `13000   800 04:00:00 ${service(BETA)}`,
+      `  700     1 02:00:00 ${STABLE}/Contents/MacOS/Xcode`,
+      `12000   700 ${serviceEtime} ${service(STABLE)}`,
+      ...(busy
+        ? [
+            ` 9000 12000 00:02 ${STABLE}/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend -frontend -c -primary-file /src/App/File.swift -o ${root}/Build/Intermediates.noindex/App.build/File.o`,
+          ]
+        : []),
+      "",
+    ].join("\n");
+
+  it("stays that service's while it is in progress, and only while that process lives", async () => {
+    const { dir, root } = derivedData();
+    const bundle = testBundle(root, "Test-Amion-2026.11.11_08-43-16--1000.xcresult", false);
+    let ps = table(root, true);
+    const watch = new ProcessObserver({
+      ps: async () => ps,
+      cwdOf: async () => "/",
+      gitOf: async () => null,
+      actions: new DerivedDataActions(dir),
+    });
+    const credited = async (at: number) =>
+      ((await watch.snapshot(at)) ?? []).map((activity) => [activity.pid, activity.resultBundlePath]);
+
+    expect(await credited(NOW)).toEqual([[12000, bundle]]);
+    // The tests run in the simulator: no compilers, and beta is there too.
+    ps = table(root, false);
+    expect(await credited(NOW + 2_000)).toEqual([[12000, bundle]]);
+    // Two minutes on, the same process: its elapsed time has grown with it.
+    ps = table(root, false, "01:02:00");
+    expect(await credited(NOW + 120_000)).toEqual([[12000, bundle]]);
+    expect(watch.services()).toEqual([
+      { pid: 13000, startedAt: NOW + 120_000 - 4 * 3_600_000 },
+      { pid: 12000, startedAt: NOW - 3_600_000 },
+    ]);
+
+    // The pid now belongs to a service started since: not the one seen working.
+    ps = table(root, false, "00:30");
+    expect(await credited(NOW + 124_000)).toEqual([]);
+  });
+
+  it("is let go when the action ends", async () => {
+    const { dir, root } = derivedData();
+    const bundle = testBundle(root, "Test-Amion-2026.11.11_08-43-16--1000.xcresult", false);
+    let ps = table(root, true);
+    const watch = new ProcessObserver({
+      ps: async () => ps,
+      cwdOf: async () => "/",
+      gitOf: async () => null,
+      actions: new DerivedDataActions(dir),
+    });
+    await watch.snapshot(NOW);
+    ps = table(root, false);
+    writeFileSync(join(bundle, "Info.plist"), "");
+    expect(await watch.snapshot(NOW + 2_000)).toEqual([]);
+    // Nor taken up again by a later bundle in that root it was not seen on.
+    testBundle(root, "Test-Amion-2026.11.11_08-44-20--1000.xcresult", false);
+    expect(await watch.snapshot(NOW + 6_000)).toEqual([]);
+  });
+});

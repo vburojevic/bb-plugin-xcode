@@ -305,6 +305,7 @@ export class Collector {
       );
     }
 
+    this.deps.engine.notePresence(this.hostId, this.io.services?.() ?? null);
     let changed = this.deps.engine.foldSnapshot(activities, now, this.hostId);
     if (this.deps.engine.expireFinishing(now)) changed = true;
     return changed;
@@ -504,6 +505,16 @@ export class Collector {
       // was killed or crashed — resolve it to "cancelled" instead of letting
       // it expire into the verdict-less "ended".
       if (!finalized && claimer) {
+        // Xcode.app's service outlives every action it serves, and a run of
+        // it leaves `running` whenever its build cannot be seen — a stretch
+        // with no children it cannot be credited for. While that service is
+        // still alive, an unfinished bundle is an action still going, not
+        // one that was killed: it settles from the bundle when Xcode
+        // finalizes it, or ends verdict-less, never "cancelled" on a guess.
+        if (this.deps.engine.producerAlive(claimer)) {
+          if (claimer.status !== "running") this.deps.engine.noteAwaitingBundle(claimer.id, now);
+          continue;
+        }
         if (claimer.status === "finishing" || claimer.status === "ended") {
           const since = claimer.endedAt ?? claimer.startedAt;
           if (now - since > 20_000) {

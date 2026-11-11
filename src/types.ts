@@ -85,6 +85,16 @@ export type BuildPhase =
   | "signing"
   | "testing";
 
+/**
+ * An Xcode.app build service process seen alive in a snapshot, busy or not.
+ * Whether its build is reported is another matter; this says only that the
+ * process that would finish it has not gone.
+ */
+export interface ServicePresence {
+  pid: number;
+  startedAt: number | null;
+}
+
 export interface LiveActivity extends ActivityAttribution {
   pid: number;
   comm: string;
