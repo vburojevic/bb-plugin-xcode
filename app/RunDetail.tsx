@@ -85,6 +85,7 @@ export function RunDetail({
         {run.projectName ? <Fact label="Project" value={run.projectName} /> : null}
         {run.branch ? <Fact label="Branch" value={run.branch} mono /> : null}
         {run.worktree ? <Fact label="Checkout" value={run.worktree} /> : null}
+        {run.hostName ? <Fact label="Machine" value={run.hostName} /> : null}
         <Fact
           label="Started"
           value={`${formatClock(run.startedAt)}${live ? "" : ` · ${formatDuration(run.durationMs)}`}`}

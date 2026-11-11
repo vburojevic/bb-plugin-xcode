@@ -55,6 +55,12 @@ export interface PresentOptions {
   phaseFor?(run: Run): BuildPhase | null;
   /** Injected so a fixture can pin "now" when formatting a live run. */
   now?: number;
+  /**
+   * Display name of the enrolled Mac a remote run is on. Optional: a run on
+   * this machine names none, and a name nobody can resolve falls back to the
+   * host id rather than to silence.
+   */
+  machineName?(hostId: string): string | null;
 }
 
 /** One run as a fixed-width line, as `bb xcode runs` prints them. */
@@ -68,7 +74,9 @@ export function describeRun(run: Run, options: PresentOptions = {}): string {
   if (run.warningCount) counts.push(`${run.warningCount}W`);
   if (run.testFailed) counts.push(`${run.testFailed} failed`);
   const suffix = counts.length ? `  [${counts.join(" ")}]` : "";
-  const at = run.branch ? ` @${run.branch}` : "";
+  const machine =
+    run.hostId !== null ? ` on ${options.machineName?.(run.hostId) ?? run.hostId}` : "";
+  const at = `${run.branch ? ` @${run.branch}` : ""}${machine}`;
   const live = run.status === "running";
   const doing = live ? phaseText(options.phaseFor?.(run)) : null;
   const time = live

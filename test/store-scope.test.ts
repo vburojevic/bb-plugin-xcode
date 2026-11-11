@@ -22,7 +22,11 @@ const SCOPE = {
   threadId: "th_app",
   path: "/Users/me/.bb/worktrees/env_q29t/App",
   branch: "feature/login",
+  hostId: null as string | null,
 };
+
+/** The same checkout path and branch, on another Mac. */
+const REMOTE_SCOPE = { ...SCOPE, threadId: "th_mbp", hostId: "host_mbp" as string | null };
 
 function makeStore(): Store {
   const db = new Database(":memory:") as unknown as Db;
@@ -58,6 +62,7 @@ function run(id: string, overrides: Partial<Run> = {}): Run {
     branch: null,
     worktree: null,
     threadId: null,
+    hostId: null,
     ...overrides,
   };
 }
@@ -116,6 +121,45 @@ const CASES: Array<{ why: string; run: Run; inScope: boolean }> = [
     }),
     inScope: false,
   },
+  {
+    why: "the same checkout path on another Mac",
+    run: run("r:other-mac-path", { cwd: SCOPE.path, hostId: "host_mbp", threadId: "th_mbp" }),
+    inScope: false,
+  },
+  {
+    why: "the same checkout name and branch on another Mac",
+    run: run("r:other-mac-name", { worktree: "App", branch: "feature/login", hostId: "host_mbp" }),
+    inScope: false,
+  },
+];
+
+/** The same fixtures seen from the thread on the other Mac. */
+const REMOTE_CASES: Array<{ why: string; run: Run; inScope: boolean }> = [
+  {
+    why: "this machine's build at the very same path",
+    run: run("r:cwd-exact", { cwd: SCOPE.path }),
+    inScope: false,
+  },
+  {
+    why: "this machine's build with the same name and branch",
+    run: run("r:weak", { worktree: "App", branch: "feature/login" }),
+    inScope: false,
+  },
+  {
+    why: "its own Mac's build at that path, before attribution",
+    run: run("w:own-path", { cwd: SCOPE.path, hostId: "host_mbp" }),
+    inScope: true,
+  },
+  {
+    why: "attributed to it, wherever it ran",
+    run: run("w:own-thread", { threadId: "th_mbp", hostId: "host_mbp" }),
+    inScope: true,
+  },
+  {
+    why: "a third Mac's build at the same path",
+    run: run("w:third-mac", { cwd: SCOPE.path, hostId: "host_air" }),
+    inScope: false,
+  },
 ];
 
 describe("scope filtering agrees in SQL and in memory", () => {
@@ -139,6 +183,20 @@ describe("scope filtering agrees in SQL and in memory", () => {
         runMatchesScope(entry.run, SCOPE),
         `${entry.run.id}: ${entry.why}`,
       ).toBe(entry.inScope);
+    }
+  });
+
+  it("keeps a checkout on another Mac to its own Mac's runs, in both", () => {
+    const store = makeStore();
+    for (const entry of REMOTE_CASES) store.insertRun(entry.run);
+    const selected = store.listRuns({ limit: 500, scope: REMOTE_SCOPE }).map((row) => row.id);
+    expect(selected.sort()).toEqual(
+      REMOTE_CASES.filter((entry) => entry.inScope).map((entry) => entry.run.id).sort(),
+    );
+    for (const entry of REMOTE_CASES) {
+      expect(runMatchesScope(entry.run, REMOTE_SCOPE), `${entry.run.id}: ${entry.why}`).toBe(
+        entry.inScope,
+      );
     }
   });
 

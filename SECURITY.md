@@ -9,6 +9,8 @@ The focused security regression suites are:
 
 - `test/build-security.test.ts`
 - `test/agent-scope-security.test.ts`
+- `test/host-builds.test.ts`
+- `test/remote-builds.test.ts`
 - `test/bounded-file.test.ts`
 - `test/stream.test.ts`
 - `test/sim/sim-host-security.test.ts`
@@ -38,6 +40,43 @@ plugin, or test can execute with the bb server user's filesystem, keychain, and
 network access. The current plugin SDK has no host execution primitive that
 attaches a thread's filesystem or network permission sandbox. Do not use the
 tracked runner for an untrusted checkout on a privileged host.
+
+### Builds on another Mac
+
+When a thread's checkout lives on an enrolled Mac, the build runs there, in the
+plugin's `bb.host` worker, as that Mac's bb user. Everything above applies
+unchanged, and is enforced **on that Mac**: the working directory and every
+path argument are resolved with real paths on the disk the build will use,
+never lexically on the server, where the checkout does not exist. The worker
+checks the request before the person is asked to confirm, and again when it
+starts the build.
+
+The worker runs `/usr/bin/xcodebuild` under a fixed `/bin/sh` wrapper that
+records the exit status. The validated arguments reach xcodebuild as positional
+parameters and the wrapper's file paths through the environment, so nothing
+from the request is interpolated into the script. Each Mac allows four tracked
+builds at once, counting builds still starting.
+
+Builds are addressed by an id the server mints and records before it asks for
+the start, so a start whose reply is lost is still accounted for; the id's
+format admits no path characters, and starting an id the worker already
+recorded returns that build rather than starting another. xcodebuild does not
+run until the worker's record of it is on disk: the wrapper waits at a gate the
+worker opens only after writing it, so no build runs that the plugin cannot
+find, stop or clean up. The worker acts only
+on builds it recorded in its own data dir. A server request cannot name a
+bundle to parse, a directory to delete, or a process to signal. Before
+`stop` signals anything, the worker proves that the recorded pid is still the
+same build: the process's command line must carry the build's marker, and its
+start time must match the record within two seconds. A recycled pid is never
+signalled. Signals reach the build's own process group, never the daemon's.
+Run rows are updated only by the Mac that ran them; a host signal carries
+bb's authenticated host id.
+
+Thread scoping compares machines as well as paths. Two Macs can hold the same
+checkout path on the same branch, so a path or checkout-name match only counts
+for a run on the scope's own machine; a thread can never read, wait on or stop
+a build on another Mac through such a match.
 
 ## Simulator capture host
 

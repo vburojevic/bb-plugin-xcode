@@ -11,7 +11,7 @@
 import { z } from "zod";
 
 import type { Collector } from "./collector";
-import { confinedBuildCwd, validateBuildArguments } from "./build-security";
+import type { BuildLauncher } from "./launcher";
 import { describeRun, verdictSentence, type PresentOptions } from "./present";
 import type { Run } from "./model";
 import { scopeFilter, type ThreadScope } from "./scopes";
@@ -19,10 +19,9 @@ import type { Store } from "./store";
 import type { BuildPhase } from "./types";
 import {
   resolveBuildArgv,
-  startWrappedBuild,
   verdictFromOutcome,
   waitForVerdict,
-  type WrappedDeps,
+  type WrappedOutcome,
 } from "./wrapped";
 
 /** Findings and failed tests returned to a tool call. */
@@ -35,6 +34,14 @@ const MAX_BUILD_TIMEOUT_S = 3_600;
 /** Grace after the process exits for a verdict to land in the store. */
 const VERDICT_GRACE_MS = 25_000;
 
+/**
+ * How long a stopped build may take to report its exit before the tool stops
+ * waiting. A local build always reports within the runner's SIGKILL grace; a
+ * build on another Mac reports only if that Mac is still reachable, and one
+ * that dropped off the network must not hold the tool call forever.
+ */
+const STOPPED_REPORT_GRACE_MS = 30_000;
+
 export const AGENT_INSTRUCTIONS =
   "When an Xcode build or test is needed, prefer the `xcode_build` tool — it runs xcodebuild, waits, and returns a real pass/fail verdict with the errors and failed tests. " +
   "If you start a build another way, `bb xcode run -- xcodebuild …` tracks it and `bb xcode wait <run-id>` blocks for its verdict; never write your own poll loop. " +
@@ -45,15 +52,16 @@ export interface ToolDeps {
   store: Store;
   collector: Collector;
   dataDir: string;
-  wrapped: WrappedDeps;
+  /** Starts tracked builds on whichever Mac holds the thread's checkout. */
+  launcher: BuildLauncher;
+  /** Display name of an enrolled Mac, when known. */
+  machineName(hostId: string): string | null;
   refreshProjectNames(): void;
   projectName(id: string): string | null;
   /** What a live run is doing right now; null for anything settled. */
   phaseFor(run: Run): BuildPhase | null;
   /** Cached scope, or one bounded resolve. Never blocks on a slow SDK call. */
   scopeFor(threadId: string): Promise<ThreadScope | null>;
-  /** Refusal sentence when the checkout is on another machine, else null. */
-  checkoutElsewhere(scope: ThreadScope): Promise<string | null>;
   showRun(id: string): { stdout?: string; stderr?: string };
 }
 
@@ -61,6 +69,7 @@ export function createTools(deps: ToolDeps) {
   const present: PresentOptions = {
     projectName: (id: string) => deps.projectName(id),
     phaseFor: (run: Run) => deps.phaseFor(run),
+    machineName: (hostId: string) => deps.machineName(hostId),
   };
 
   const status = {
@@ -91,8 +100,9 @@ export function createTools(deps: ToolDeps) {
       const recent = scope
         ? deps.store.listRuns({ limit: limit ?? 5, scope })
         : [];
+      const machine = scope?.hostId ? deps.machineName(scope.hostId) : null;
       const header = scope
-        ? `Scope: this thread's checkout ${scope.path}${scope.branch ? ` @${scope.branch}` : ""}.`
+        ? `Scope: this thread's checkout ${scope.path}${scope.branch ? ` @${scope.branch}` : ""}${machine ? ` on ${machine}` : ""}.`
         : "Scope: this thread has no resolvable checkout yet, so nothing is attributed to it.";
       const parts: string[] = [
         header,
@@ -194,18 +204,20 @@ export function createTools(deps: ToolDeps) {
       if (scope === null) {
         return "This thread has no resolvable checkout, so xcodebuild was not started.";
       }
-      // Before any node:fs work: this thread's checkout may live on another
-      // enrolled Mac, where every path below resolves to nothing.
-      const elsewhere = await deps.checkoutElsewhere(scope);
-      if (elsewhere !== null) return elsewhere;
+      // `xcodebuild` is implied, and stripping a leading one the model
+      // added anyway is kinder than erroring on it.
+      let argv: string[];
       let workingDir: string;
+      // The thread's environment decides the machine. A checkout on another
+      // enrolled Mac is validated there, on the disk the build will use.
+      const target = await deps.launcher.targetFor(scope);
       try {
-        workingDir = await confinedBuildCwd(scope.path, cwd);
-        await validateBuildArguments(
-          args[0] === "xcodebuild" ? args : ["xcodebuild", ...args],
-          scope.path,
-          workingDir,
-        );
+        argv = resolveBuildArgv(args[0] === "xcodebuild" ? args : ["xcodebuild", ...args]);
+        workingDir = await deps.launcher.prepare(target, {
+          argv,
+          root: scope.path,
+          ...(cwd !== undefined ? { cwd } : {}),
+        });
       } catch (error) {
         return error instanceof Error ? error.message : String(error);
       }
@@ -220,20 +232,23 @@ export function createTools(deps: ToolDeps) {
       signal.addEventListener("abort", onAbort, { once: true });
 
       try {
-        const started = await startWrappedBuild(deps.wrapped, {
-          // `xcodebuild` is implied, and stripping a leading one the model
-          // added anyway is kinder than erroring on it.
-          argv: resolveBuildArgv(
-            args[0] === "xcodebuild" ? args : ["xcodebuild", ...args],
-          ),
-          cwd: workingDir,
-          killSignal: killer.signal,
-        });
-        if (!started) {
-          return "Failed to start xcodebuild. Check the arguments and the working directory.";
+        const started = await deps.launcher.start(
+          target,
+          { argv, root: scope.path, workingDir, ...(cwd !== undefined ? { cwd } : {}) },
+          scope,
+          killer.signal,
+        );
+        if (typeof started === "string") {
+          return target.kind === "local"
+            ? "Failed to start xcodebuild. Check the arguments and the working directory."
+            : started;
         }
 
-        const outcome = await started.completed;
+        const outcome = await completedOrGiveUp(
+          started.completed,
+          killer.signal,
+          started.bundlePath,
+        );
         const settled = await waitForVerdict(
           deps.store,
           { bundlePath: started.bundlePath },
@@ -260,7 +275,7 @@ export function createTools(deps: ToolDeps) {
             header,
             `xcodebuild exited ${outcome.exitCode ?? `on ${outcome.signal ?? "an unknown signal"}`}.`,
             `${outcome.errors} error(s), ${outcome.warnings} warning(s) seen on the live stream.`,
-            `result bundle: ${started.bundlePath}`,
+            `result bundle${target.kind === "remote" ? ` (on ${target.machineName})` : ""}: ${started.bundlePath}`,
           ].join("\n");
         }
 
@@ -275,9 +290,39 @@ export function createTools(deps: ToolDeps) {
   return { status, lastFailure, build };
 }
 
+/**
+ * The build's own report, or — once it has been told to stop and has not
+ * answered within `STOPPED_REPORT_GRACE_MS` — an honest non-answer.
+ */
+function completedOrGiveUp(
+  completed: Promise<WrappedOutcome>,
+  stopped: AbortSignal,
+  bundlePath: string,
+): Promise<WrappedOutcome> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let onStop: (() => void) | null = null;
+  const giveUp = new Promise<WrappedOutcome>((resolve) => {
+    onStop = (): void => {
+      timer = setTimeout(
+        () =>
+          resolve({ exitCode: null, signal: null, bundlePath, errors: 0, warnings: 0, failed: true }),
+        STOPPED_REPORT_GRACE_MS,
+      );
+    };
+    if (stopped.aborted) onStop();
+    else stopped.addEventListener("abort", onStop, { once: true });
+  });
+  return Promise.race([completed, giveUp]).finally(() => {
+    if (timer) clearTimeout(timer);
+    if (onStop) stopped.removeEventListener("abort", onStop);
+  });
+}
+
 /** Everything a model needs about a settled run, and nothing it does not. */
 function detailFor(deps: ToolDeps, run: Run): string {
-  const lines = [describeRun(run, { projectName: deps.projectName })];
+  const lines = [
+    describeRun(run, { projectName: deps.projectName, machineName: deps.machineName }),
+  ];
 
   const findings = deps.store
     .listFindings(run.id)
@@ -316,6 +361,9 @@ function detailFor(deps: ToolDeps, run: Run): string {
     );
   }
 
-  if (run.bundlePath) lines.push("", `result bundle: ${run.bundlePath}`);
+  if (run.bundlePath) {
+    const machine = run.hostId !== null ? (deps.machineName(run.hostId) ?? run.hostId) : null;
+    lines.push("", `result bundle${machine ? ` (on ${machine})` : ""}: ${run.bundlePath}`);
+  }
   return lines.join("\n");
 }

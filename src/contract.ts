@@ -63,6 +63,10 @@ const runSchema = z.object({
   worktree: z.string().nullable(),
   /** bb thread whose environment this build ran in, when attributable. */
   threadId: z.string().nullable(),
+  /** The enrolled Mac a remote build ran on; null for this machine. */
+  hostId: z.string().nullable(),
+  /** That Mac's name, when bb knows it. */
+  hostName: z.string().nullable(),
   /** Friendly destination ("iPhone 16 · iOS 26.0"), raw spec preserved above. */
   destinationLabel: z.string().nullable(),
   /** Live compiler processes right now; null unless running. */

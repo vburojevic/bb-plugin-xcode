@@ -41,6 +41,10 @@ export interface RunDto {
   branch: string | null;
   worktree: string | null;
   threadId: string | null;
+  /** The enrolled Mac a remote build ran on; null for this machine. */
+  hostId: string | null;
+  /** That Mac's name, when bb knows it. */
+  hostName: string | null;
   destinationLabel: string | null;
   workerCount: number | null;
   // The union lives in `types.ts` and nowhere else. Spelling it out here meant
@@ -72,6 +76,7 @@ export class DtoMapper {
     private readonly store: Store,
     private readonly engine: Engine,
     private readonly collector: Collector,
+    private readonly machineName: (hostId: string) => string | null = () => null,
   ) {}
 
   /** Re-read the collector's project list. Cheap; call before a batch. */
@@ -138,6 +143,8 @@ export class DtoMapper {
       branch: run.branch,
       worktree: run.worktree,
       threadId: run.threadId,
+      hostId: run.hostId,
+      hostName: run.hostId !== null ? (this.machineName(run.hostId) ?? run.hostId) : null,
       destinationLabel: destinationLabel(
         run.destination,
         this.collector.getSimulators(),

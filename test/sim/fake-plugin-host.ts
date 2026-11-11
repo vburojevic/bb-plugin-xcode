@@ -21,6 +21,9 @@
  * - background services started on demand and aborted on dispose
  * - CLI `run(argv, ctx)` with argv excluding the command name
  * - `bb.sdk` calls recorded, with an unstubbed path throwing and naming itself
+ * - `bb.hosts.experimental_client`: calls need an explicit `hostId`, input
+ *   and output are validated against the contract with a JSON round-trip in
+ *   between, and signals are validated against their declared payload
  */
 import BetterSqlite3 from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -64,10 +67,21 @@ function assertStrictJson(value: unknown, path = "result"): void {
   }
 }
 
+export interface HostRpcCall {
+  method: string;
+  input: unknown;
+  hostId: string;
+  timeoutMs?: number;
+}
+
 export interface FakeHostOptions {
   pluginId?: string;
   settings?: Record<string, string | boolean>;
   sdk?: Record<string, unknown>;
+  /** Answers `bb.hosts.experimental_client(...).call`, as a host worker would. */
+  hostRpc?: (call: HostRpcCall) => Promise<unknown>;
+  /** Answers `bb.ui.requestInput`; the default cancels, like nobody answering. */
+  requestInput?: (request: unknown) => Promise<unknown>;
 }
 
 export interface Harness {
@@ -83,6 +97,11 @@ export interface Harness {
   callAgentTool(name: string, args: unknown, context?: Record<string, unknown>): Promise<unknown>;
   /** Drive one of the six thread lifecycle events, as the host would. */
   emitThreadEvent(event: string, payload: unknown): void;
+  /** Deliver a host worker's signal, validated against its declared payload. */
+  emitHostSignal(hostId: string, signal: string, payload: unknown): Promise<void>;
+  /** Report an unexpected worker exit on one host. */
+  emitHostWorkerExit(hostId: string): Promise<void>;
+  hostRpcCalls: HostRpcCall[];
   dispose(): Promise<void>;
   cleanup(): void;
 
@@ -137,6 +156,13 @@ export function createFakePluginHost(options: FakeHostOptions = {}): { bb: unkno
   const agentTools = new Map<string, { parameters?: unknown; execute: (args: unknown, context: unknown) => unknown }>();
   let cli: { name: string; run: (argv: string[], ctx: unknown) => Promise<unknown> } | null = null;
   const threadEventListeners = new Map<string, Array<(payload: unknown) => void>>();
+  const hostRpcCalls: HostRpcCall[] = [];
+  const hostSignalHandlers: Array<{
+    signal: string;
+    schema: unknown;
+    handler: (event: { hostId: string; payload: unknown }) => unknown;
+  }> = [];
+  const workerExitHandlers: Array<(event: { hostId: string }) => unknown> = [];
   let migrationsApplied = 0;
 
   /** Every `bb.sdk` path is recorded; an unstubbed one throws naming itself. */
@@ -257,6 +283,51 @@ export function createFakePluginHost(options: FakeHostOptions = {}): { bb: unkno
     },
 
     hosts: {
+      experimental_client(args: {
+        contract: Record<string, { input: unknown; output: unknown }>;
+        experimental_signals?: Record<string, { payload: unknown }>;
+      }) {
+        assertLive("hosts.experimental_client");
+        return {
+          async call(method: string, input: unknown, callOptions: { hostId: string; timeoutMs?: number }) {
+            assertLive("hosts.call");
+            const contract = args.contract[method];
+            if (contract === undefined) throw new Error(`unknown host method "${method}"`);
+            if (!callOptions?.hostId) throw new Error(`host rpc method "${method}" requires a host id`);
+            const validated = validate(contract.input, input, `${method} host input`);
+            const call: HostRpcCall = {
+              method,
+              input: JSON.parse(JSON.stringify(validated)) as unknown,
+              hostId: callOptions.hostId,
+              ...(callOptions.timeoutMs === undefined ? {} : { timeoutMs: callOptions.timeoutMs }),
+            };
+            hostRpcCalls.push(call);
+            if (options.hostRpc === undefined) throw new Error(`no hostRpc stub for "${method}"`);
+            const output = await options.hostRpc(call);
+            assertStrictJson(output);
+            return validate(contract.output, JSON.parse(JSON.stringify(output)), `${method} host output`);
+          },
+          experimental_onSignal(signal: string, handler: (event: { hostId: string; payload: unknown }) => unknown) {
+            assertLive("hosts.onSignal");
+            const descriptor = args.experimental_signals?.[signal];
+            if (descriptor === undefined) throw new Error(`unknown host signal "${signal}"`);
+            const record = { signal, schema: descriptor.payload, handler };
+            hostSignalHandlers.push(record);
+            return () => {
+              const index = hostSignalHandlers.indexOf(record);
+              if (index >= 0) hostSignalHandlers.splice(index, 1);
+            };
+          },
+          experimental_onWorkerExit(handler: (event: { hostId: string }) => unknown) {
+            assertLive("hosts.onWorkerExit");
+            workerExitHandlers.push(handler);
+            return () => {
+              const index = workerExitHandlers.indexOf(handler);
+              if (index >= 0) workerExitHandlers.splice(index, 1);
+            };
+          },
+        };
+      },
       async ensureSharedPortTunnel() {
         hostCalls.push("ensureSharedPortTunnel");
         return { label: "test-host", baseDomain: "example.invalid" };
@@ -356,7 +427,10 @@ export function createFakePluginHost(options: FakeHostOptions = {}): { bb: unkno
     },
 
     ui: {
-      requestInput: async () => ({ outcome: "cancelled", reason: "no test responder" }),
+      requestInput: async (request: unknown) =>
+        options.requestInput
+          ? options.requestInput(request)
+          : { outcome: "cancelled", reason: "no test responder" },
       registerMentionProvider: () => {},
     },
 
@@ -381,6 +455,16 @@ export function createFakePluginHost(options: FakeHostOptions = {}): { bb: unkno
     needsConfiguration,
     sdkCalls,
     hostCalls,
+    hostRpcCalls,
+    async emitHostSignal(hostId, signal, payload) {
+      for (const record of hostSignalHandlers.filter((entry) => entry.signal === signal)) {
+        const parsed = validate(record.schema, JSON.parse(JSON.stringify(payload)), `${signal} signal`);
+        await record.handler({ hostId, payload: parsed });
+      }
+    },
+    async emitHostWorkerExit(hostId) {
+      for (const handler of [...workerExitHandlers]) await handler({ hostId });
+    },
     get registrations() {
       return {
         rpcMethods: Object.keys(rpcSchemas),
