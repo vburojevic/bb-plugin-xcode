@@ -763,3 +763,129 @@ describe("an Xcode.app test bundle on a Mac with two checkouts", () => {
     expect(store.hasSeen(bundleScannedKey(MBP, bundle))).toBe(true);
   });
 });
+
+describe("a worktree nested inside another checkout", () => {
+  const MAIN = "/w/App";
+  const FEATURE = "/w/App/.worktrees/feature";
+  const MAIN_WORKSPACE = "/w/App/App.xcworkspace";
+  const BUNDLE = "/dd/App-main/Logs/Test/Main-Tests.xcresult";
+  const failing = {
+    status: "failed" as const,
+    startedAt: NOW + 1_000,
+    endedAt: NOW + 20_000,
+    errorCount: 1,
+    warningCount: 0,
+    analyzerCount: 0,
+    actionTitle: null,
+    destination: null,
+    issues: [
+      {
+        severity: "error" as const,
+        message: "main is broken",
+        filePath: "/w/App/Main.swift",
+        line: 3,
+        column: null,
+        target: null,
+      },
+    ],
+  };
+
+  /** Default DerivedData, no -workspace/-project: only the cwd says where. */
+  const cwdOnly = (id: string, cwd: string, threadId: string, startedAt: number) =>
+    run(id, {
+      hostId: MBP,
+      pid: Number(id.split(":")[2] ?? 1),
+      root: null,
+      container: null,
+      cwd,
+      threadId,
+      startedAt,
+      status: "finishing",
+      endedAt: NOW + 25_000,
+    });
+
+  function sweep(store: Store, engine: Engine) {
+    const io: MachineIO = {
+      snapshot: async () => [],
+      discoverRoots: async () => [],
+      readManifests: async () => [{ root: "/dd/App-main", workspace: MAIN_WORKSPACE, domains: [] }],
+      listBundles: async () => ({ candidates: [BUNDLE], finalized: new Set([BUNDLE]) }),
+      parseBundle: async () => ({ status: "ok", build: failing, summary: null, tests: [] }),
+    };
+    const collector = new Collector(
+      { store, engine, listProjects: async () => [], log: { debug: () => undefined, warn: () => undefined }, dataDir: "", io, hostId: MBP },
+      { scanProjects: false, extraRoots: [] },
+    );
+    return (async () => {
+      await collector.sweepManifests(NOW + 60_000);
+      await collector.sweepBundles(NOW + 60_000);
+    })();
+  }
+
+  it("never hands the parent checkout's bundle to the nested worktree's run", async () => {
+    const store = migrated();
+    const engine = engineWith(store);
+    store.upsertRoot("/dd/App-main", null, "process", NOW, MBP);
+    const feature = observedRunId(MBP, 2, NOW + 2_000);
+    store.insertRun(cwdOnly(feature, FEATURE, "thr_feature", NOW + 2_000));
+    await sweep(store, engine);
+    expect(store.getRun(feature)).toMatchObject({ status: "finishing", detailed: false, errorCount: 0 });
+    expect(store.listFindings(feature)).toEqual([]);
+  });
+
+  it("gives it to the run that built in the workspace's own directory", async () => {
+    const store = migrated();
+    const engine = engineWith(store);
+    store.upsertRoot("/dd/App-main", null, "process", NOW, MBP);
+    const main = observedRunId(MBP, 1, NOW);
+    const feature = observedRunId(MBP, 2, NOW + 2_000);
+    store.insertRun(cwdOnly(main, MAIN, "thr_main", NOW));
+    store.insertRun(cwdOnly(feature, FEATURE, "thr_feature", NOW + 2_000));
+    await sweep(store, engine);
+    expect(store.getRun(main)).toMatchObject({ status: "failed", errorCount: 1, threadId: "thr_main" });
+    expect(store.listFindings(main).map((finding) => finding.message)).toEqual(["main is broken"]);
+    expect(store.getRun(feature)).toMatchObject({ status: "finishing", detailed: false });
+  });
+
+  it("never absorbs the parent checkout's log entry as the nested tracked build's own", () => {
+    const store = migrated();
+    const engine = engineWith(store);
+    const tracked = (cwd: string) =>
+      run("w:abc-0123456789ab", {
+        hostId: MBP,
+        scheme: "App",
+        root: null,
+        container: null,
+        cwd,
+        status: "passed",
+        statusRank: RANK.verified,
+        endedAt: NOW + 30_000,
+      });
+    const entry = {
+      uniqueIdentifier: "MAIN-ENTRY",
+      title: "Building workspace App with scheme App",
+      scheme: "App",
+      startedAt: NOW,
+      endedAt: NOW + 30_000,
+      status: "failed" as const,
+      errorCount: 1,
+      warningCount: 0,
+      analyzerCount: 0,
+      testFailureCount: 0,
+    };
+    store.insertRun(tracked(FEATURE));
+    engine.foldManifestEntry("/dd/App-main", "build", entry, NOW, { hostId: MBP, container: MAIN_WORKSPACE });
+    expect(store.getRun("m:MAIN-ENTRY")).toMatchObject({ status: "failed", container: MAIN_WORKSPACE });
+    expect(store.getRun("w:abc-0123456789ab")?.status).toBe("passed");
+
+    // The same tracked build in the parent checkout itself does own it.
+    const other = migrated();
+    other.insertRun(tracked(MAIN));
+    engineWith(other).foldManifestEntry("/dd/App-main", "build", entry, NOW, {
+      hostId: MBP,
+      container: MAIN_WORKSPACE,
+    });
+    expect(other.getRun("m:MAIN-ENTRY")).toBeNull();
+    expect(other.hasSeen("manifest:MAIN-ENTRY")).toBe(true);
+  });
+});

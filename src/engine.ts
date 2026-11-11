@@ -1067,9 +1067,10 @@ export interface ArtifactOwner {
  *
  * Time overlap alone is not enough once two checkouts on one Mac build at
  * once — two worktrees of one repo routinely share a scheme too. A known root
- * decides; otherwise the workspace, against the run's container or working
- * directory. Only when neither side says anything is it left to time, as it
- * always was.
+ * decides; otherwise the workspace, against the run's container or the
+ * directory it built in. Only when the artifact names no workspace is it left
+ * to time, as it always was; when it does and the run cannot be shown to own
+ * it, the artifact stays unmatched.
  */
 export function ownedBy(
   run: Pick<Run, "root" | "container" | "cwd">,
@@ -1083,15 +1084,13 @@ export function ownedBy(
       ? resolve(run.cwd, run.container)
       : run.container;
   if (container !== null && isAbsolute(container)) return container === workspace;
-  if (run.cwd !== null && isAbsolute(run.cwd)) {
-    return isUnder(workspace, run.cwd) || isUnder(run.cwd, dirname(workspace));
-  }
-  return true;
-}
-
-function isUnder(path: string, base: string): boolean {
-  const root = base.endsWith("/") ? base.slice(0, -1) : base;
-  return path === root || path.startsWith(`${root}/`);
+  // No workspace named: xcodebuild builds the one in its working directory,
+  // so that directory must be the workspace's own. Ancestry proves nothing —
+  // a worktree nested in a checkout (`/w/App/.worktrees/feature`) is another
+  // checkout — and a run that says nothing about where it built cannot claim
+  // an artifact that does.
+  if (run.cwd !== null && isAbsolute(run.cwd)) return resolve(run.cwd) === dirname(workspace);
+  return false;
 }
 
 /** Is this the command line of Xcode.app's resident build service? */
