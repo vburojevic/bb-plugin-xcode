@@ -203,6 +203,8 @@ These commands require a bb thread with a resolvable checkout, must be run from 
 
 `run` detaches on purpose: a build's lifetime belongs to the build, not to the command that asked for it. `--wait` and `wait` only change who is *watching*. If the request disconnects or the wait times out, the build carries on and `bb xcode status` still finds it. Both exit non-zero on a failed build, so they compose with `&&`.
 
+**Threads on another Mac.** When a thread's checkout lives on an enrolled Mac rather than on the machine running bb, `xcode_build`, `bb xcode run`, `wait` and `stop` run the build *on that Mac*, through the plugin's `bb.host` worker, which bb's daemon already runs there. The Mac needs Xcode and nothing else. The checkout boundary is checked on that Mac's disk, the confirmation sheet names the Mac, and the run shows up in the live row, `xcode_status` and `bb xcode show` with the machine's name. The build survives a plugin reload or the worker's idle stop: the worker keeps a record of each build in its data dir on that Mac and re-adopts it by pid and start time. Builds started any other way on that Mac (Xcode.app, a terminal) are not seen yet, and the Simulators tabs still drive the simulators of the machine running bb.
+
 </details>
 
 <details>
@@ -238,6 +240,8 @@ Two separate budgets, because they are two very different things.
 | Keep history for | 30 days | Run rows, issues, per-test results (kilobytes) |
 | Keep result bundles for | 2 days | `.xcresult` directory trees (hundreds of MB each) |
 | Result bundle disk budget | 5 GB | Hard ceiling; oldest bundles evicted first |
+
+Bundle retention applies on every Mac separately: a build that ran on another Mac keeps its bundle in the plugin's data dir there, and the daily prune asks that Mac to apply the same age and budget.
 
 Everything the tracker needs is extracted from a bundle on the first sweep, so a bundle only has to outlive the gap between the build finishing and the sweep reading it. Pointing a month of *history* retention at *bundles*, which is what a single shared setting did, meant following the shim instructions above could quietly cost tens of gigabytes. Age alone is not enough either: an afternoon of snapshot-test runs passes any sane budget well inside two days, which is what the disk ceiling is for.
 
@@ -297,7 +301,9 @@ The simulator capture host binds only to an ephemeral `127.0.0.1` port. The plug
 <details>
 <summary><b>Known limits</b></summary>
 
-- **Live process observation is server-host-local.** The plugin SDK has no general remote-exec primitive, so Tiers 0 and 3 cover the machine running the bb server. Tiers 1 and 2 are file-based and can read other hosts via `bb.sdk.files`.
+- **Untracked builds are seen only on the machine running bb.** The process probe and the DerivedData sweep read that machine. On another enrolled Mac, only builds started through `xcode_build` or `bb xcode run` are tracked (they run on that Mac through the host worker); a build started there from Xcode.app or a terminal is not.
+- **Simulators and Stills drive the machine running bb.** Stills refuses a thread whose checkout is on another Mac and says so.
+- **Removing the plugin does not stop builds on other Macs.** bb gives a plugin no uninstall hook, so a build in flight finishes on its own, and the plugin's data dir on that Mac stays behind, as bb leaves every plugin's host data.
 - **Xcode.app (IDE) builds are not fully validated.** Everything here was verified against `xcodebuild`; IDE attribution is designed to flow through child compiler args, then the DerivedData root, then the project, but was not exercised against a live Xcode.app session. The `SWBBuildService` rename above was the concrete reason they could not work at all on Xcode 26; that is fixed and unit-tested, but still not confirmed against a real IDE build.
 - Builds shorter than the scan interval are missed by the probe, then picked up by the manifest sweep. They appear in history but never in the live strip.
 
@@ -314,7 +320,7 @@ npm run check     # both, as CI runs them
 bb plugin dev     # rebuild + reload on save
 ```
 
-The suite runs on Linux in CI. That is a constraint, not a convenience: every `ps`, `xcrun` and `xcresulttool` call is injected as fixture text, so the whole reconciliation layer is testable without a Mac, and a Linux runner is what keeps it honest.
+The suite runs on Linux in CI. That is a constraint, not a convenience: every `ps`, `xcrun` and `xcresulttool` call is injected as fixture text, so the whole reconciliation layer is testable without a Mac, and a Linux runner is what keeps it honest. The one exception is the host worker's suite (`test/host-builds.test.ts`, `test/remote-builds.test.ts`): it runs the worker's real `/bin/sh` wrapper and `ps` identity checks over a fake `xcodebuild` script, through the SDK's own host-entry harness, because the exit-status file and the process group are what it is testing. Both exist on the Linux runner.
 
 Architecture (v2): **one run, one identity, monotonic enrichment.** A run is born from a process observation; every other source (log store, result bundle) may only *enrich* it, carrying a confidence rank (observed < logged < verified) that can never go backward. The lifecycle is explicit: running, then finishing, then passed, warnings, failed or cancelled, or a timeout to the honest terminal `ended`.
 
@@ -325,6 +331,9 @@ Architecture (v2): **one run, one identity, monotonic enrichment.** A run is bor
 | `src/store.ts` | Every read and write, with the SQL scope filter |
 | `src/collector.ts` | All I/O: `ps`, manifests, `xcresulttool`, discovery |
 | `src/wrapped.ts` | Launching a build we can speak for |
+| `src/launcher.ts` | Which machine a thread's build runs on |
+| `src/remote.ts` | Run rows for builds on other Macs, fed by the host worker |
+| `host.ts`, `src/host/` | The `bb.host` worker: validate, spawn, watch, stop and summarize builds on its Mac |
 | `src/cli.ts`, `src/tools.ts` | The two agent-facing surfaces |
 | `src/rpc.ts`, `src/dto.ts` | The two frontend-facing ones |
 | `src/scope-sync.ts`, `src/thread-sync.ts` | Talking to bb about threads |
