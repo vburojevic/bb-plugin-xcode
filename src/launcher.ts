@@ -132,7 +132,12 @@ export function createLauncher(deps: LauncherDeps): BuildLauncher {
       // and the disk may have changed since the person approved it.
       const started = await deps.remote.start(
         target,
-        { argv: request.argv, root: request.root, ...(request.cwd ? { cwd: request.cwd } : {}) },
+        {
+          argv: request.argv,
+          root: request.root,
+          workingDir: request.workingDir,
+          ...(request.cwd ? { cwd: request.cwd } : {}),
+        },
         scope,
         killSignal,
       );

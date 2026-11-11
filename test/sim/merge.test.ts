@@ -32,6 +32,8 @@ describe("the two halves share one plugin", () => {
     expect(SIMULATOR_MIGRATIONS).toHaveLength(9);
     expect(V3_MIGRATIONS_START).toBe(39);
     expect(MIGRATIONS[39]).toBe("ALTER TABLE run ADD COLUMN host_id TEXT");
+    expect(MIGRATIONS[41]).toContain("CREATE TABLE IF NOT EXISTS remote_host");
+    expect(MIGRATIONS).toHaveLength(42);
   });
 
   it("keeps every migration to a single statement", () => {

@@ -6,10 +6,13 @@
  * build there. Everything crossing it is validated on both sides by bb; keep
  * it plugin-local and import-light, because `host.ts` bundles it.
  *
- * Calls are addressed by `buildId`, which the worker mints. The server never
- * hands the worker a path to act on other than the checkout it validates, so a
- * confused server cannot make the worker parse, signal or delete anything the
- * worker did not create itself.
+ * Calls are addressed by `buildId`. The server mints it and records the run
+ * BEFORE asking for the start, so a start whose reply is lost is still known
+ * and can be recovered by asking about that id; the worker treats a repeated
+ * start of a recorded id as the same build. The id's format admits no path
+ * characters, and the server never hands the worker a path to act on other
+ * than the checkout it validates, so a confused server cannot make the worker
+ * parse, signal or delete anything the worker did not create itself.
  */
 
 import { defineRpcContract } from "@get-bb/plugin-sdk";
@@ -25,7 +28,7 @@ const runStatus = z.enum([
   "ended",
 ]);
 
-/** A worker-minted id: base36 time, a dash, random hex. Never a path. */
+/** A build id: base36 time, a dash, random hex. Never a path. */
 export const buildIdSchema = z.string().regex(/^[a-z0-9]{1,16}-[a-f0-9]{8,32}$/);
 
 const argvSchema = z.array(z.string().max(8192)).min(1).max(520);
@@ -37,6 +40,27 @@ const buildRequest = z
     root: z.string().min(1).max(4096),
     /** Requested working directory; defaults to the checkout. */
     cwd: z.string().max(4096).optional(),
+  })
+  .strict();
+
+const startRequest = z
+  .object({
+    buildId: buildIdSchema,
+    argv: argvSchema,
+    root: z.string().min(1).max(4096),
+    cwd: z.string().max(4096).optional(),
+  })
+  .strict();
+
+/** What the worker recorded at start; enough to adopt a run whose reply was lost. */
+const startedSchema = z
+  .object({
+    bundlePath: z.string(),
+    workingDir: z.string(),
+    /** The full argv xcodebuild was started with, flags injected. */
+    argv: argvSchema,
+    pid: z.number().int().positive(),
+    startedAt: z.number(),
   })
   .strict();
 
@@ -68,6 +92,8 @@ const buildStateSchema = z
     progress: progressSchema,
     /** The last few KB xcodebuild wrote to stderr, once it has exited. */
     stderrTail: z.string().max(8192).nullable(),
+    /** The worker's record of the start; null when it has none. */
+    started: startedSchema.nullable(),
   })
   .strict();
 
@@ -137,25 +163,17 @@ export const hostContract = defineRpcContract({
         z.object({ ok: z.literal(false), message: z.string().max(4000) }).strict(),
       ]),
   },
-  /** Validate again, then spawn xcodebuild detached and return at once. */
+  /**
+   * Validate again, then spawn xcodebuild detached and return at once.
+   * Idempotent per `buildId`: a build already recorded under it is returned,
+   * never started twice.
+   */
   startBuild: {
-    input: buildRequest,
-    output: z
-      .discriminatedUnion("ok", [
-        z
-          .object({
-            ok: z.literal(true),
-            buildId: buildIdSchema,
-            bundlePath: z.string(),
-            workingDir: z.string(),
-            /** The full argv xcodebuild was started with, flags injected. */
-            argv: argvSchema,
-            pid: z.number().int().positive(),
-            startedAt: z.number(),
-          })
-          .strict(),
-        z.object({ ok: z.literal(false), message: z.string().max(4000) }).strict(),
-      ]),
+    input: startRequest,
+    output: z.discriminatedUnion("ok", [
+      startedSchema.extend({ ok: z.literal(true), buildId: buildIdSchema }).strict(),
+      z.object({ ok: z.literal(false), message: z.string().max(4000) }).strict(),
+    ]),
   },
   /**
    * Current state of some builds. Also how a fresh worker re-adopts builds it
@@ -214,6 +232,8 @@ export const hostContract = defineRpcContract({
         removed: z.number().int().nonnegative(),
         bytesFreed: z.number().nonnegative(),
         bytesRetained: z.number().nonnegative(),
+        /** Builds still on this Mac afterwards, running or retained. */
+        remaining: z.number().int().nonnegative(),
       })
       .strict(),
   },
@@ -235,5 +255,7 @@ export type HostSignals = typeof hostSignals;
 export type BuildState = z.infer<typeof buildStateSchema>;
 export type BuildProgress = z.infer<typeof progressSchema>;
 export type BuildRequest = z.infer<typeof buildRequest>;
+export type StartRequest = z.infer<typeof startRequest>;
+export type BuildStarted = z.infer<typeof startedSchema>;
 export type SummarizeResult = z.output<(typeof hostContract)["summarize"]["output"]>;
 export type StartBuildResult = z.output<(typeof hostContract)["startBuild"]["output"]>;

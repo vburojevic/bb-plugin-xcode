@@ -25,7 +25,6 @@
  */
 
 import { spawn as nodeSpawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
 import {
   mkdir,
@@ -51,13 +50,15 @@ import {
   splitLines,
   type StreamProgress,
 } from "../stream";
-import type { IssueRow, TestRow } from "../types";
+import type { BuildResults, IssueRow, TestResults, TestRow } from "../types";
 import { parseBuildResults, parseTestNodes, parseTestSummary } from "../xcresult";
 import type {
   BuildProgress,
   BuildRequest,
+  BuildStarted,
   BuildState,
   StartBuildResult,
+  StartRequest,
   SummarizeResult,
 } from "./contract";
 import {
@@ -78,8 +79,12 @@ const STREAM_READ_BYTES = 64 * 1024;
 const MAX_STREAM_BYTES = 64 * 1024 * 1024;
 const MAX_STREAM_LINE_BYTES = 1024 * 1024;
 const STDERR_TAIL_BYTES = 4096;
-/** Upper bound on the summary reply, well under the 8 MiB host-RPC cap. */
-const SUMMARY_BUDGET_BYTES = 6 * 1024 * 1024;
+/**
+ * Upper bound on the whole serialized summary reply, in UTF-8 bytes — the
+ * unit the host-RPC cap (8 MiB) is measured in — with room left for the
+ * transport's own envelope.
+ */
+export const SUMMARY_BUDGET_BYTES = 7 * 1024 * 1024;
 const MAX_TESTS = 10_000;
 const MAX_ISSUES = 2_000;
 /**
@@ -203,6 +208,14 @@ export class HostBuilds {
   /** Consecutive failed liveness reads, per build. See `LOST_AFTER_MISSES`. */
   private readonly misses = new Map<string, number>();
   private lease: { dispose(): Promise<void> } | null = null;
+  /** Starts in flight, by build id: a repeated start joins the first. */
+  private readonly pendingStarts = new Map<string, Promise<StartBuildResult>>();
+  /**
+   * Slots held by starts that passed admission and have not become watches
+   * yet. Counted with the watches, so concurrent starts cannot all pass a
+   * check that none of them has been counted in.
+   */
+  private reserved = 0;
   private adopted: Promise<void> | null = null;
   private tool: Promise<string | null> | null = null;
   private disposed = false;
@@ -250,18 +263,53 @@ export class HostBuilds {
 
   // ----------------------------------------------------------------- start
 
-  async start(request: BuildRequest, hooks: WorkerHooks): Promise<StartBuildResult> {
+  /**
+   * Start a build under the server's id, or return the one already started
+   * under it. The server records the run before it asks, so a start whose
+   * reply was lost is recovered by id rather than started again.
+   */
+  start(request: StartRequest, hooks: WorkerHooks): Promise<StartBuildResult> {
+    const pending = this.pendingStarts.get(request.buildId);
+    if (pending) return pending;
+    const attempt = this.startOnce(request, hooks).finally(() => {
+      this.pendingStarts.delete(request.buildId);
+    });
+    this.pendingStarts.set(request.buildId, attempt);
+    return attempt;
+  }
+
+  private async startOnce(request: StartRequest, hooks: WorkerHooks): Promise<StartBuildResult> {
+    const { buildId } = request;
+    await this.adoptAll(hooks);
+    const existing = await this.loadRecord(buildId);
+    if (existing) return { ok: true, buildId, ...startedOf(existing) };
     const checked = await this.validate(request);
     if (!checked.ok) return checked;
-    await this.adoptAll(hooks);
-    if (this.watches.size >= MAX_LIVE_BUILDS) {
+
+    // Admission. Nothing may await between the count and the reservation,
+    // or concurrent starts all pass it.
+    if (this.watches.size + this.reserved >= MAX_LIVE_BUILDS) {
       return {
         ok: false,
         message: `${MAX_LIVE_BUILDS} tracked builds are already running on this Mac.`,
       };
     }
+    this.reserved += 1;
+    try {
+      return await this.spawnBuild(buildId, request, checked.workingDir, hooks);
+    } finally {
+      // A started build is a watch by now; a failed one gives the slot back.
+      this.reserved -= 1;
+    }
+  }
 
-    const buildId = `${this.now().toString(36)}-${randomBytes(6).toString("hex")}`;
+  private async spawnBuild(
+    buildId: string,
+    request: BuildRequest,
+    workingDir: string,
+    hooks: WorkerHooks,
+  ): Promise<StartBuildResult> {
+    const checked = { workingDir };
     const dir = this.dirFor(buildId);
     await mkdir(dir, { recursive: true });
     const paths = {
@@ -318,15 +366,7 @@ export class HostBuilds {
     await writeJsonAtomic(join(dir, RECORD_FILE), record);
     this.watch(record, hooks);
     this.deps.log?.(`started build ${buildId} (pid ${pid}) in ${checked.workingDir}`);
-    return {
-      ok: true,
-      buildId,
-      bundlePath: paths.bundlePath,
-      workingDir: checked.workingDir,
-      argv: injected.argv,
-      pid,
-      startedAt,
-    };
+    return { ok: true, buildId, ...startedOf(record) };
   }
 
   /**
@@ -375,6 +415,7 @@ export class HostBuilds {
         endedAt: null,
         progress: toWire(this.watches.get(buildId)?.progress ?? (await readProgress(record.streamPath))),
         stderrTail: null,
+        started: startedOf(record),
       };
     }
     // The wrapper may have written its status between the two reads.
@@ -397,6 +438,7 @@ export class HostBuilds {
       endedAt: exit?.endedAt ?? null,
       progress: toWire(await readProgress(record.streamPath)),
       stderrTail: await readTail(record.stderrPath, STDERR_TAIL_BYTES),
+      started: startedOf(record),
     };
     this.misses.delete(record.buildId);
     if (exit) {
@@ -668,20 +710,7 @@ export class HostBuilds {
             await query(tool, ["get", "test-results", "tests", "--path", record.bundlePath]),
           )
         : [];
-    return {
-      status: "ok",
-      bundlePath: record.bundlePath,
-      build: build
-        ? {
-            ...build,
-            actionTitle: clip(build.actionTitle, 2000),
-            destination: clip(build.destination, 2000),
-            issues: boundIssues(build.issues),
-          }
-        : null,
-      summary: summary ? { ...summary, destination: clip(summary.destination, 2000) } : null,
-      tests: boundTests(tests),
-    };
+    return boundSummary(record.bundlePath, build, summary, tests);
   }
 
   // ----------------------------------------------------------------- prune
@@ -693,11 +722,12 @@ export class HostBuilds {
    */
   async prune(
     retention: { maxAgeMs: number; maxTotalBytes: number },
-  ): Promise<{ removed: number; bytesFreed: number; bytesRetained: number }> {
+  ): Promise<{ removed: number; bytesFreed: number; bytesRetained: number; remaining: number }> {
     const now = this.now();
-    const result = { removed: 0, bytesFreed: 0, bytesRetained: 0 };
+    const result = { removed: 0, bytesFreed: 0, bytesRetained: 0, remaining: 0 };
     const surviving: Array<{ dir: string; settledAt: number; size: number }> = [];
-    for (const record of await this.listRecords()) {
+    const records = await this.listRecords();
+    for (const record of records) {
       if (this.watches.has(record.buildId)) continue;
       const exit = await this.readExit(record);
       const dir = this.dirFor(record.buildId);
@@ -730,6 +760,8 @@ export class HostBuilds {
       result.bytesFreed += entry.size;
     }
     result.bytesRetained = held;
+    // What the server needs to know whether this Mac still owes a cleanup.
+    result.remaining = records.length - result.removed;
     return result;
   }
 
@@ -885,6 +917,17 @@ function unknownState(buildId: string): BuildState {
     endedAt: null,
     progress: toWire(emptyProgress()),
     stderrTail: null,
+    started: null,
+  };
+}
+
+function startedOf(record: BuildRecord): BuildStarted {
+  return {
+    bundlePath: record.bundlePath,
+    workingDir: record.workingDir,
+    argv: record.argv,
+    pid: record.pid,
+    startedAt: record.startedAt,
   };
 }
 
@@ -894,48 +937,92 @@ function clip(value: string | null, max: number): string | null {
   return value === null || value.length <= max ? value : `${value.slice(0, max - 1)}…`;
 }
 
-function boundIssues(issues: readonly IssueRow[]): IssueRow[] {
-  // Errors first: if anything has to be dropped, it is the long tail of notes.
-  const rank = { error: 0, warning: 1, analyzer: 2, note: 3 } as const;
-  return [...issues]
-    .sort((a, b) => rank[a.severity] - rank[b.severity])
-    .slice(0, MAX_ISSUES)
-    .map((issue) => ({
-      ...issue,
-      message: clip(issue.message, 4000),
-      filePath: clip(issue.filePath, 4096),
-      target: clip(issue.target, 1000),
-    }));
-}
+type SummaryOk = Extract<SummarizeResult, { status: "ok" }>;
 
 /**
- * Failed tests first, then the rest, until the reply budget is spent.
+ * The summary reply, held to `budget` UTF-8 bytes as a whole.
  *
- * The full list feeds history and flakiness; the failures are what a person
- * or an agent is waiting for, so they are the last thing to be dropped.
+ * Per-field clipping alone does not bound it: 1,200 long diagnostics and
+ * 1,600 long failures serialize to over 11 MB, and multibyte text gets there
+ * with fewer, and the host RPC then rejects the reply outright — the build
+ * loses all of its diagnostics instead of some. So every row is measured as
+ * the bytes it adds to the serialized reply, and rows are admitted in the
+ * order someone waiting on the build needs them: errors, failed tests, the
+ * other issues, the other tests. The counts in `build` and `summary` stay
+ * exact either way.
  */
-function boundTests(tests: readonly TestRow[]): TestRow[] {
-  const ordered = [
-    ...tests.filter((test) => test.status === "failed"),
-    ...tests.filter((test) => test.status !== "failed"),
+export function boundSummary(
+  bundlePath: string,
+  build: BuildResults | null,
+  summary: Omit<TestResults, "tests"> | null,
+  tests: readonly TestRow[],
+  budget = SUMMARY_BUDGET_BYTES,
+): SummaryOk {
+  const reply: SummaryOk = {
+    status: "ok",
+    bundlePath,
+    build: build
+      ? {
+          ...build,
+          actionTitle: clip(build.actionTitle, 2000),
+          destination: clip(build.destination, 2000),
+          issues: [],
+        }
+      : null,
+    summary: summary ? { ...summary, destination: clip(summary.destination, 2000) } : null,
+    tests: [],
+  };
+  let used = utf8Bytes(reply);
+
+  const issues = (build?.issues ?? []).map(clipIssue);
+  const rows = tests.map(clipTest);
+  const queue: Array<{ issue: IssueRow } | { test: TestRow }> = [
+    ...issues.filter((issue) => issue.severity === "error").map((issue) => ({ issue })),
+    ...rows.filter((test) => test.status === "failed").map((test) => ({ test })),
+    ...issues
+      .filter((issue) => issue.severity !== "error")
+      .sort((a, b) => ISSUE_RANK[a.severity] - ISSUE_RANK[b.severity])
+      .map((issue) => ({ issue })),
+    ...rows.filter((test) => test.status !== "failed").map((test) => ({ test })),
   ];
-  const out: TestRow[] = [];
-  let bytes = 0;
-  for (const test of ordered) {
-    if (out.length >= MAX_TESTS) break;
-    const row: TestRow = {
-      ...test,
-      suite: clip(test.suite, 2000),
-      name: clip(test.name, 2000),
-      identifier: clip(test.identifier, 4000),
-      failureMessage: clip(test.failureMessage, 4000),
-      target: clip(test.target, 1000),
-    };
-    bytes += JSON.stringify(row).length;
-    if (bytes > SUMMARY_BUDGET_BYTES) break;
-    out.push(row);
+  for (const entry of queue) {
+    const isIssue = "issue" in entry;
+    const target = isIssue ? reply.build?.issues : reply.tests;
+    if (!target || target.length >= (isIssue ? MAX_ISSUES : MAX_TESTS)) continue;
+    // The row itself plus the comma that separates it from the previous one.
+    const cost = utf8Bytes(isIssue ? entry.issue : entry.test) + 1;
+    if (used + cost > budget) continue;
+    used += cost;
+    if (isIssue) reply.build!.issues.push(entry.issue);
+    else reply.tests.push(entry.test);
   }
-  return out;
+  return reply;
+}
+
+const ISSUE_RANK = { error: 0, warning: 1, analyzer: 2, note: 3 } as const;
+
+function utf8Bytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function clipIssue(issue: IssueRow): IssueRow {
+  return {
+    ...issue,
+    message: clip(issue.message, 4000),
+    filePath: clip(issue.filePath, 4096),
+    target: clip(issue.target, 1000),
+  };
+}
+
+function clipTest(test: TestRow): TestRow {
+  return {
+    ...test,
+    suite: clip(test.suite, 2000),
+    name: clip(test.name, 2000),
+    identifier: clip(test.identifier, 4000),
+    failureMessage: clip(test.failureMessage, 4000),
+    target: clip(test.target, 1000),
+  };
 }
 
 function isRecord(raw: Partial<BuildRecord>): raw is BuildRecord {

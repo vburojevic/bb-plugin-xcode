@@ -142,7 +142,7 @@ describe("local discovery cannot see a remote run", () => {
     const { store } = migrated();
     store.insertRun(run("w:a-0123456789ab", { hostId: "host_mbp" }));
     expect(store.hasUnresolved()).toBe(false);
-    expect(store.listOpenRemoteRuns().map((entry) => entry.id)).toEqual(["w:a-0123456789ab"]);
+    expect(store.listRemoteRunsAwaitingHost().map((entry) => entry.id)).toEqual(["w:a-0123456789ab"]);
     expect(store.listRemoteHostIds()).toEqual(["host_mbp"]);
   });
 });

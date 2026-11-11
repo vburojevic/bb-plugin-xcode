@@ -495,7 +495,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     hostClient.experimental_onSignal("exited", (event) => remote.onExited(event)),
     // A crashed worker dropped whatever it was about to signal. Ask again.
     hostClient.experimental_onWorkerExit(({ hostId }) => {
-      if (!disposed) reconcileRemote(hostId);
+      if (disposed) return;
+      remote.onWorkerExit(hostId);
+      reconcileRemote(hostId);
     }),
   ];
 

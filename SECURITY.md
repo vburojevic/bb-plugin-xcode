@@ -55,17 +55,25 @@ The worker runs `/usr/bin/xcodebuild` under a fixed `/bin/sh` wrapper that
 records the exit status. The validated arguments reach xcodebuild as positional
 parameters and the wrapper's file paths through the environment, so nothing
 from the request is interpolated into the script. Each Mac allows four tracked
-builds at once.
+builds at once, counting builds still starting.
 
-The server addresses builds only by the ids the worker minted, and the worker
-acts only on builds it recorded in its own data dir. A server request cannot
-name a bundle to parse, a directory to delete, or a process to signal. Before
+Builds are addressed by an id the server mints and records before it asks for
+the start, so a start whose reply is lost is still accounted for; the id's
+format admits no path characters, and starting an id the worker already
+recorded returns that build rather than starting another. The worker acts only
+on builds it recorded in its own data dir. A server request cannot name a
+bundle to parse, a directory to delete, or a process to signal. Before
 `stop` signals anything, the worker proves that the recorded pid is still the
 same build: the process's command line must carry the build's marker, and its
 start time must match the record within two seconds. A recycled pid is never
 signalled. Signals reach the build's own process group, never the daemon's.
 Run rows are updated only by the Mac that ran them; a host signal carries
 bb's authenticated host id.
+
+Thread scoping compares machines as well as paths. Two Macs can hold the same
+checkout path on the same branch, so a path or checkout-name match only counts
+for a run on the scope's own machine; a thread can never read, wait on or stop
+a build on another Mac through such a match.
 
 ## Simulator capture host
 

@@ -19,64 +19,15 @@ import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createHostEntry } from "../host";
+import { FAKE_XCODEBUILD, fakeXcresult } from "./support/fake-xcodebuild";
 import plugin from "../server";
 import { createFakePluginHost, type Harness } from "./sim/fake-plugin-host";
 
-const FAKE_XCODEBUILD = `#!/bin/sh
-bundle=""; stream=""; scheme=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -resultBundlePath) bundle="$2"; shift ;;
-    -resultStreamPath) stream="$2"; shift ;;
-    -scheme) scheme="$2"; shift ;;
-  esac
-  shift
-done
-printf '%s\\n' '{"name":"logSectionCreated","structuredPayload":{"section":{"title":"Compile App"}}}' >> "$stream"
-case "$scheme" in
-  slow) sleep 30 ;;
-  gated) while [ ! -f "$PWD/go" ]; do sleep 0.05; done ;;
-esac
-mkdir -p "$bundle"; touch "$bundle/Info.plist"
-case "$scheme" in fail) touch "$bundle/failed"; exit 65 ;; esac
-exit 0
-`;
 
 const MINI = { id: "host_mini", name: "MacMini" };
 const MBP = { id: "host_mbp", name: "MacBook Pro" };
 const THREAD = "thr_remote";
 const PROJECT = "proj_app";
-
-/**
- * What the worker's xcresulttool reports: a failing compile for a bundle the
- * fake `fail` build marked, a clean one otherwise.
- */
-async function fakeXcresult(_tool: string, args: readonly string[]): Promise<unknown> {
-  const bundle = args[args.indexOf("--path") + 1]!;
-  const now = Date.now() / 1000;
-  if (args[1] === "build-results" && !existsSync(join(bundle, "failed"))) {
-    return { status: "succeeded", startTime: now - 1, endTime: now, errorCount: 0, warningCount: 0 };
-  }
-  if (args[1] === "build-results") {
-    return {
-      status: "failed",
-      startTime: now - 1,
-      endTime: now,
-      errorCount: 1,
-      warningCount: 0,
-      analyzerCount: 0,
-      errors: [
-        {
-          issueType: "Swift Compiler Error",
-          message: "cannot find 'frobnicate' in scope",
-          // 0-based, as Xcode writes it: line 41 to a person.
-          sourceURL: "file:///w/App/Sources/App.swift#StartingLineNumber=40",
-        },
-      ],
-    };
-  }
-  return null;
-}
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {

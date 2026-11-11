@@ -183,10 +183,20 @@ export const MIGRATIONS: readonly string[] = [
    */
   `ALTER TABLE run ADD COLUMN host_id TEXT`,
   `CREATE INDEX IF NOT EXISTS run_host_idx ON run (host_id) WHERE host_id IS NOT NULL`,
+  /**
+   * Macs that may still hold build directories this plugin left there. Not
+   * derived from `run`: history retention deletes the last run of a Mac that
+   * stayed offline, and its bundles would then never be cleaned. A row goes
+   * only once that Mac reports nothing left.
+   */
+  `CREATE TABLE IF NOT EXISTS remote_host (
+     host_id  TEXT PRIMARY KEY,
+     added_at INTEGER NOT NULL
+   )`,
 ];
 
 /** Where the tracker's v3 statements start; asserted by the merge test. */
-export const V3_MIGRATIONS_START = MIGRATIONS.length - 2;
+export const V3_MIGRATIONS_START = MIGRATIONS.length - 3;
 
 /**
  * Escape a value for use as a LIKE prefix pattern.
@@ -433,23 +443,94 @@ export class Store {
     }));
   }
 
-  /** Remote runs still waiting on their Mac to say how they ended. */
-  listOpenRemoteRuns(): Run[] {
+  /**
+   * Remote runs still waiting on their Mac to say how they ended.
+   *
+   * Running ones, and also ones the engine's age cap ended without any word
+   * from their Mac (status `ended` at the observed rank, never settled by a
+   * host answer). That is a laptop asleep overnight: when it wakes, its exit
+   * file and finished bundle are still there to be read, and the rank lattice
+   * lets the real verdict replace the silence.
+   */
+  listRemoteRunsAwaitingHost(): Run[] {
     const rows = this.sql(
       `SELECT * FROM run WHERE host_id IS NOT NULL
-          AND status IN ('running','finishing')
+          AND (status IN ('running','finishing')
+               OR (status = 'ended' AND status_rank = 0))
+          AND NOT EXISTS (SELECT 1 FROM seen_artifact s
+                           WHERE s.key = 'remote-settled:' || run.id)
         ORDER BY started_at DESC`,
     ).all() as RunRowRaw[];
     return rows.map(toRun);
   }
 
-  /** Every Mac this store holds a remote run for, for retention. */
+  /** Record that a remote run's Mac gave a definitive answer about it. */
+  markRemoteSettled(runId: string, now: number): void {
+    this.markSeen(`remote-settled:${runId}`, now);
+  }
+
+  /** Every Mac this store holds a remote run for. */
   listRemoteHostIds(): string[] {
     return (
       this.sql(
         `SELECT DISTINCT host_id FROM run WHERE host_id IS NOT NULL`,
       ).all() as Array<{ host_id: string }>
     ).map((row) => row.host_id);
+  }
+
+  countRunsOnHost(hostId: string): number {
+    const row = this.sql(`SELECT COUNT(*) AS n FROM run WHERE host_id = ?`).get(hostId) as
+      | { n: number }
+      | undefined;
+    return row?.n ?? 0;
+  }
+
+  /** Remember a Mac that may hold build directories. Idempotent. */
+  addCleanupHost(hostId: string, now: number): void {
+    this.sql(
+      `INSERT INTO remote_host (host_id, added_at) VALUES (?, ?)
+       ON CONFLICT(host_id) DO NOTHING`,
+    ).run(hostId, now);
+  }
+
+  listCleanupHosts(): string[] {
+    return (
+      this.sql(`SELECT host_id FROM remote_host ORDER BY added_at`).all() as Array<{
+        host_id: string;
+      }>
+    ).map((row) => row.host_id);
+  }
+
+  removeCleanupHost(hostId: string): void {
+    this.sql(`DELETE FROM remote_host WHERE host_id = ?`).run(hostId);
+  }
+
+  /** Drop a run that never existed: a start its Mac refused outright. */
+  deleteRun(id: string): void {
+    this.sql(`DELETE FROM run WHERE id = ?`).run(id);
+  }
+
+  /**
+   * Fill in what only the Mac knows about a start: the bundle it writes, the
+   * pid, the real working directory and argv, its clock's start time. Only
+   * for a run whose start was not confirmed yet (`bundle_path` still NULL).
+   */
+  adoptRemoteStart(
+    id: string,
+    started: { bundlePath: string; pid: number; cwd: string; cmdline: string; startedAt: number },
+  ): boolean {
+    const result = this.sql(
+      `UPDATE run SET bundle_path = ?, pid = ?, cwd = ?, cmdline = ?, started_at = ?
+        WHERE id = ? AND host_id IS NOT NULL AND bundle_path IS NULL`,
+    ).run(
+      started.bundlePath,
+      started.pid,
+      started.cwd,
+      started.cmdline,
+      started.startedAt,
+      id,
+    ) as { changes?: number };
+    return (result?.changes ?? 0) > 0;
   }
 
   updateRun(run: Run): void {

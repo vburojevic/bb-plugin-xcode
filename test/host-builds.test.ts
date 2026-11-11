@@ -17,43 +17,20 @@ import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createHostEntry } from "../host";
+import { FAKE_XCODEBUILD } from "./support/fake-xcodebuild";
 import {
   HostBuilds,
   LOST_AFTER_MISSES,
+  SUMMARY_BUDGET_BYTES,
+  boundSummary,
   decodeExitStatus,
   type BuildRecord,
   type WorkerHooks,
 } from "../src/host/builds";
 import type { BuildState } from "../src/host/contract";
 import { isSameProcess, parseElapsedSeconds, parseIdentity } from "../src/host/identity";
+import { mintBuildId } from "../src/remote";
 
-const FAKE_XCODEBUILD = `#!/bin/sh
-bundle=""; stream=""; scheme=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -resultBundlePath) bundle="$2"; shift ;;
-    -resultStreamPath) stream="$2"; shift ;;
-    -scheme) scheme="$2"; shift ;;
-  esac
-  shift
-done
-printf '%s\\n' '{"name":"invocationStarted","structuredPayload":{}}' >> "$stream"
-printf '%s\\n' '{"name":"logSectionCreated","structuredPayload":{"section":{"title":"Compile App"}}}' >> "$stream"
-case "$scheme" in
-  slow) sleep 30 ;;
-  gated) while [ ! -f "$PWD/go" ]; do sleep 0.05; done ;;
-esac
-case "$scheme" in
-  fail) printf '%s\\n' '{"name":"issueEmitted","structuredPayload":{"severity":"error"}}' >> "$stream" ;;
-esac
-echo "fake xcodebuild done" >&2
-mkdir -p "$bundle"
-touch "$bundle/Info.plist"
-case "$scheme" in
-  fail) exit 65 ;;
-esac
-exit 0
-`;
 
 const dirs: string[] = [];
 const harnesses: Array<{ experimental_dispose(): Promise<void> }> = [];
@@ -113,6 +90,7 @@ function exitedSignal(harness: Harness, buildId: string): BuildState | undefined
 
 async function start(harness: Harness, checkout: string, scheme: string) {
   const started = await harness.experimental_call("startBuild", {
+    buildId: mintBuildId(Date.now()),
     argv: ["/usr/bin/xcodebuild", "-scheme", scheme, "build"],
     root: checkout,
   });
@@ -146,6 +124,7 @@ describe("the host worker's checkout boundary", () => {
     expect(outside.ok).toBe(false);
 
     const mutating = await harness.experimental_call("startBuild", {
+      buildId: mintBuildId(Date.now()),
       argv: ["/usr/bin/xcodebuild", "-allowProvisioningUpdates", "build"],
       root: ws.checkout,
     });
@@ -155,6 +134,7 @@ describe("the host worker's checkout boundary", () => {
     });
 
     const notXcode = await harness.experimental_call("startBuild", {
+      buildId: mintBuildId(Date.now()),
       argv: ["/bin/rm", "-rf", "/"],
       root: ws.checkout,
     });
@@ -522,5 +502,178 @@ describe("re-adoption by pid and start time", () => {
     const [state] = await builds.states([record.buildId], hooks());
     expect(state).toMatchObject({ status: "exited", exitCode: 65 });
     expect(builds.watching).toBe(0);
+  });
+});
+
+describe("admission under concurrent starts", () => {
+  it("lets exactly four through at once, and a refused start holds no slot", async () => {
+    const ws = workspace();
+    const harness = harnessFor(ws);
+    const request = () => ({
+      buildId: mintBuildId(Date.now()),
+      argv: ["/usr/bin/xcodebuild", "-scheme", "gated", "build"],
+      root: ws.checkout,
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 6 }, () => harness.experimental_call("startBuild", request())),
+    );
+    expect(results.filter((result) => result.ok)).toHaveLength(4);
+    expect(results.filter((result) => !result.ok)).toEqual([
+      { ok: false, message: "4 tracked builds are already running on this Mac." },
+      { ok: false, message: "4 tracked builds are already running on this Mac." },
+    ]);
+
+    // A start that fails validation while the Mac is full releases nothing
+    // it did not hold, and one refused for capacity left no directory.
+    const started = results.filter((result) => result.ok).map((result) => result.buildId);
+    const { readdirSync } = await import("node:fs");
+    expect(readdirSync(join(ws.dataDir, "builds")).sort()).toEqual([...started].sort());
+
+    writeFileSync(join(ws.checkout, "go"), "");
+    for (const buildId of started) await until(() => exitedSignal(harness, buildId));
+    rmSync(join(ws.checkout, "go"));
+
+    // Capacity is back, and failed starts along the way never ate a slot.
+    const refused = await harness.experimental_call("startBuild", {
+      ...request(),
+      argv: ["/usr/bin/xcodebuild", "-allowProvisioningUpdates"],
+    });
+    expect(refused.ok).toBe(false);
+    const again = await Promise.all(
+      Array.from({ length: 4 }, () => harness.experimental_call("startBuild", request())),
+    );
+    expect(again.every((result) => result.ok)).toBe(true);
+    writeFileSync(join(ws.checkout, "go"), "");
+    for (const result of again) {
+      if (result.ok) await until(() => exitedSignal(harness, result.buildId));
+    }
+  });
+});
+
+describe("a start the server asks for twice", () => {
+  it("is the same build, never a second one", async () => {
+    const ws = workspace();
+    const harness = harnessFor(ws);
+    const request = {
+      buildId: mintBuildId(Date.now()),
+      argv: ["/usr/bin/xcodebuild", "-scheme", "gated", "build"],
+      root: ws.checkout,
+    };
+    // Concurrently (a duplicate delivery) and then again (a retry).
+    const [first, second] = await Promise.all([
+      harness.experimental_call("startBuild", request),
+      harness.experimental_call("startBuild", request),
+    ]);
+    const third = await harness.experimental_call("startBuild", request);
+    if (!first.ok || !second.ok || !third.ok) throw new Error("expected starts");
+    expect(second).toEqual(first);
+    expect(third).toEqual(first);
+
+    // And the record is what a server that lost the reply adopts from.
+    const { states } = await harness.experimental_call("buildStates", { buildIds: [request.buildId] });
+    expect(states[0]?.started).toEqual({
+      bundlePath: first.bundlePath,
+      workingDir: first.workingDir,
+      argv: first.argv,
+      pid: first.pid,
+      startedAt: first.startedAt,
+    });
+
+    writeFileSync(join(ws.checkout, "go"), "");
+    await until(() => exitedSignal(harness, request.buildId));
+    expect(harness.experimental_getSignals().filter((signal) => signal.signal === "exited")).toHaveLength(1);
+  });
+});
+
+describe("the summary reply's size", () => {
+  it("fits the whole reply under one UTF-8 budget, errors and failures first", async () => {
+    const ws = workspace();
+    // Multibyte, so a character count would undercount the bytes threefold.
+    const long = (tag: string) => `${tag} ${"€漢".repeat(1_999)}`;
+    const xcresult = async (_tool: string, args: readonly string[]) => {
+      if (args[1] === "build-results") {
+        return {
+          status: "failed",
+          startTime: 1,
+          endTime: 2,
+          errorCount: 600,
+          warningCount: 600,
+          analyzerCount: 0,
+          errors: Array.from({ length: 600 }, (_, i) => ({ message: long(`error ${i}`) })),
+          warnings: Array.from({ length: 600 }, (_, i) => ({ message: long(`warning ${i}`) })),
+        };
+      }
+      if (args[2] === "summary") {
+        return { result: "Failed", totalTestCount: 2_000, passedTests: 400, failedTests: 1_600 };
+      }
+      return {
+        testNodes: [
+          ...Array.from({ length: 400 }, (_, i) => ({
+            nodeType: "Test Case",
+            name: `testPasses${i}()`,
+            result: "Passed",
+          })),
+          ...Array.from({ length: 1_600 }, (_, i) => ({
+            nodeType: "Test Case",
+            name: `testFails${i}()`,
+            result: "Failed",
+            children: [{ nodeType: "Failure Message", name: long(`failure ${i}`) }],
+          })),
+        ],
+      };
+    };
+    const harness = harnessFor(ws, { findTool: async () => "/usr/bin/xcresulttool", xcresult });
+    const started = await start(harness, ws.checkout, "pass");
+    await until(() => exitedSignal(harness, started.buildId));
+
+    // The harness enforces the daemon's 8 MiB output cap, so this call
+    // failing outright was the bug.
+    const result = await harness.experimental_call("summarize", { buildId: started.buildId });
+    if (result.status !== "ok") throw new Error(`expected ok, got ${result.status}`);
+    const bytes = Buffer.byteLength(JSON.stringify(result), "utf8");
+    expect(bytes).toBeLessThanOrEqual(SUMMARY_BUDGET_BYTES);
+    expect(bytes).toBeGreaterThan(SUMMARY_BUDGET_BYTES - 64 * 1024);
+
+    const issues = result.build!.issues;
+    // Every error made it, then failures took the rest; warnings and passing
+    // tests are what had to give.
+    expect(issues.filter((issue) => issue.severity === "error")).toHaveLength(600);
+    expect(issues.some((issue) => issue.severity === "warning")).toBe(false);
+    // Failures first and in order, until they no longer fit; only then do
+    // the short passing rows use what space is left.
+    const failed = result.tests.filter((test) => test.status === "failed");
+    expect(failed.length).toBeGreaterThan(0);
+    expect(failed.length).toBeLessThan(1_600);
+    expect(failed.map((test) => test.name)).toEqual(
+      Array.from({ length: failed.length }, (_, i) => `testFails${i}()`),
+    );
+    expect(result.tests.slice(0, failed.length)).toEqual(failed);
+    // The counts stay exact even where the rows could not all be sent.
+    expect(result.build).toMatchObject({ errorCount: 600, warningCount: 600 });
+    expect(result.summary).toMatchObject({ total: 2_000, failed: 1_600 });
+  });
+
+  it("sends everything when it fits", () => {
+    const reply = boundSummary(
+      "/b",
+      {
+        status: "failed",
+        startedAt: 1,
+        endedAt: 2,
+        errorCount: 1,
+        warningCount: 1,
+        analyzerCount: 0,
+        actionTitle: null,
+        destination: null,
+        issues: [
+          { severity: "warning", message: "w", filePath: null, line: null, column: null, target: null },
+          { severity: "error", message: "e", filePath: null, line: null, column: null, target: null },
+        ],
+      },
+      null,
+      [],
+    );
+    expect(reply.build?.issues.map((issue) => issue.message)).toEqual(["e", "w"]);
   });
 });
