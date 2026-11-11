@@ -401,6 +401,18 @@ describe("process identity", () => {
     expect(isSameProcess({ command: expected.marker, startedAt: null }, expected)).toBe(false);
   });
 
+  it("reads a missing pid as gone and a live one as itself, from the real ps", async () => {
+    const { readProcessIdentity } = await import("../src/host/identity");
+    // "No such process" is an answer (null); only a failure to look rejects.
+    const { spawn } = await import("node:child_process");
+    const done = spawn("/bin/sh", ["-c", "exit 0"]);
+    await new Promise((resolve) => done.on("exit", resolve));
+    await expect(readProcessIdentity(done.pid!)).resolves.toBeNull();
+    const self = await readProcessIdentity(process.pid);
+    expect(self?.command).toContain("node");
+    expect(self?.startedAt).toEqual(expect.any(Number));
+  });
+
   it("decodes the wrapper's status, signals included", () => {
     expect(decodeExitStatus(0)).toEqual({ exitCode: 0, signal: null });
     expect(decodeExitStatus(65)).toEqual({ exitCode: 65, signal: null });
@@ -717,6 +729,43 @@ describe("a launch the worker did not finish", () => {
 
     await second.experimental_call("prune", { maxAgeMs: 0, maxTotalBytes: 0 });
     expect(existsSync(dir)).toBe(false);
+  });
+
+  it("opens the gate of a build recorded just before its worker died", async () => {
+    const ws = workspace();
+    const first = harnessFor(ws, hanging);
+    const buildId = mintBuildId(Date.now());
+    void first
+      .experimental_call("startBuild", {
+        buildId,
+        argv: ["/usr/bin/xcodebuild", "-scheme", "pass", "build"],
+        root: ws.checkout,
+      })
+      .catch(() => undefined);
+    const dir = join(ws.dataDir, "builds", buildId);
+    await until(() => existsSync(join(dir, "wrapper.pid")));
+    await first.experimental_dispose();
+    // What the dead worker had got to: the record is durable, the gate is not
+    // open yet.
+    const { readProcessIdentity } = await import("../src/host/identity");
+    const pid = Number(readFileSync(join(dir, "wrapper.pid"), "utf8"));
+    const identity = await readProcessIdentity(pid);
+    const intent = JSON.parse(readFileSync(join(dir, "launch.json"), "utf8")) as Record<string, unknown>;
+    writeFileSync(join(dir, "record.json"), JSON.stringify({ ...intent, pid, startedAt: identity!.startedAt }));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(existsSync(join(dir, "ready"))).toBe(false);
+    expect(readFileSync(join(dir, "stream.ndjson"), "utf8")).toBe("");
+
+    const second = harnessFor(ws);
+    const { states } = await second.experimental_call("buildStates", { buildIds: [buildId] });
+    expect(states[0]?.status).toBe("running");
+    const exited = await until(() => exitedSignal(second, buildId));
+    expect(exited).toMatchObject({ status: "exited", exitCode: 0 });
+    // Ran exactly once.
+    const events = readFileSync(join(dir, "stream.ndjson"), "utf8").match(/invocationStarted/g);
+    expect(events).toHaveLength(1);
+    await second.experimental_call("buildStates", { buildIds: [buildId] });
+    expect(second.experimental_getSignals().filter((signal) => signal.signal === "exited")).toHaveLength(1);
   });
 
   it("leaves no wrapper waiting at a gate whose directory is gone", async () => {

@@ -26,7 +26,16 @@ export interface ProcessIdentity {
   startedAt: number | null;
 }
 
+/**
+ * `null`: no such process — `ps` said so. A rejection with
+ * `ProcessInspectionError`: nobody knows (`ps` timed out, failed to run). The
+ * difference matters: only the first is evidence a build is gone.
+ */
 export type ReadIdentity = (pid: number) => Promise<ProcessIdentity | null>;
+
+export class ProcessInspectionError extends Error {
+  override readonly name = "ProcessInspectionError";
+}
 
 /**
  * How far a re-read start time may sit from the recorded one.
@@ -40,7 +49,7 @@ export type ReadIdentity = (pid: number) => Promise<ProcessIdentity | null>;
 export const START_TIME_TOLERANCE_MS = 2_000;
 
 export const readProcessIdentity: ReadIdentity = (pid) =>
-  new Promise((resolve) => {
+  new Promise((resolve, reject) => {
     if (!Number.isSafeInteger(pid) || pid <= 0) {
       resolve(null);
       return;
@@ -55,7 +64,12 @@ export const readProcessIdentity: ReadIdentity = (pid) =>
       (error, stdout) => {
         if (error) {
           // `ps -p` exits 1 for a pid that does not exist; that is an answer.
-          resolve(null);
+          // Anything else — killed by the timeout on a loaded Mac, failed to
+          // start — is not, and must not read as "gone".
+          const code = (error as { code?: unknown }).code;
+          const killed = (error as { killed?: boolean }).killed === true;
+          if (code === 1 && !killed && stdout.trim() === "") resolve(null);
+          else reject(new ProcessInspectionError(`ps -p ${pid} failed: ${error.message}`));
           return;
         }
         resolve(parseIdentity(stdout, Date.now()));

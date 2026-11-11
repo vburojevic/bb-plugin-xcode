@@ -67,6 +67,7 @@ import type {
 import {
   isSameProcess,
   readProcessIdentity,
+  type ProcessIdentity,
   START_TIME_TOLERANCE_MS,
   type ReadIdentity,
 } from "./identity";
@@ -454,10 +455,12 @@ export class HostBuilds {
     if (intent === null) return { kind: "none" };
     const wrapperPid = await readPid(intent.wrapperPidPath);
     if (wrapperPid !== null) {
-      const identity = await this.readIdentity(wrapperPid);
+      const exited = await this.readExit({ exitPath: intent.exitPath });
+      const identity = exited ? null : await this.probe(wrapperPid);
+      // Could not look: the wrapper may well be there. Never call that lost.
+      if (identity === undefined) return { kind: "launching" };
       const alive =
         identity?.startedAt != null && identity.command?.includes(intent.marker) === true;
-      const exited = await this.readExit({ exitPath: intent.exitPath });
       if (alive || exited) {
         const record: BuildRecord = {
           ...intent,
@@ -470,15 +473,35 @@ export class HostBuilds {
         return { kind: "record", record };
       }
     }
+    // Proof of a launch that never ran: no wrapper ever wrote its pid, or
+    // `ps` says the one that did is gone without an exit. (A wrapper whose
+    // gate times out writes its own exit, and is recovered as such above.)
     return this.now() - intent.requestedAt < LAUNCH_SETTLE_MS
       ? { kind: "launching" }
       : { kind: "unlaunched" };
   }
 
+  /**
+   * Open the gate of a recorded build whose worker died between writing the
+   * record and opening it. Only for a wrapper proven alive and not exited;
+   * opening an open gate is a no-op, so every path that loads a record runs
+   * this rather than guessing which ones a crash could have interrupted.
+   */
+  private async resumeGate(record: BuildRecord): Promise<void> {
+    if (await exists(record.readyPath)) return;
+    if (await this.readExit(record)) return;
+    if ((await this.liveness(record)) !== "alive") return;
+    await openGate(record);
+    this.deps.log?.(`opened the gate of recorded build ${record.buildId}`);
+  }
+
   /** The build's record, recovering one from a launch intent when needed. */
   private async recordFor(buildId: string, hooks: WorkerHooks | null): Promise<BuildRecord | null> {
     const record = await this.loadRecord(buildId);
-    if (record) return record;
+    if (record) {
+      await this.resumeGate(record);
+      return record;
+    }
     const recovered = await this.recover(buildId);
     if (recovered.kind !== "record") return null;
     if (hooks && !(await this.readExit(recovered.record))) this.watch(recovered.record, hooks);
@@ -494,7 +517,7 @@ export class HostBuilds {
    */
   private async startTimeOf(pid: number, marker: string): Promise<number> {
     for (let attempt = 0; attempt < 10; attempt += 1) {
-      const identity = await this.readIdentity(pid);
+      const identity = await this.probe(pid);
       if (identity?.startedAt != null && identity.command?.includes(marker)) {
         return identity.startedAt;
       }
@@ -516,6 +539,7 @@ export class HostBuilds {
     const cached = this.settled.get(buildId);
     if (cached) return cached;
     let record = await this.loadRecord(buildId);
+    if (record !== null) await this.resumeGate(record);
     if (record === null) {
       const recovered = await this.recover(buildId);
       switch (recovered.kind) {
@@ -582,8 +606,24 @@ export class HostBuilds {
     return state;
   }
 
-  private async isAlive(record: BuildRecord): Promise<boolean> {
-    return isSameProcess(await this.readIdentity(record.pid), record);
+  /**
+   * `unknown` when the process table could not be read: neither proof of
+   * life nor of death, and every caller treats it as such.
+   */
+  private async liveness(record: BuildRecord): Promise<"alive" | "gone" | "unknown"> {
+    const identity = await this.probe(record.pid);
+    if (identity === undefined) return "unknown";
+    return isSameProcess(identity, record) ? "alive" : "gone";
+  }
+
+  /** An identity, `null` for no such process, `undefined` for could-not-look. */
+  private async probe(pid: number): Promise<ProcessIdentity | null | undefined> {
+    try {
+      return await this.readIdentity(pid);
+    } catch (error) {
+      this.deps.log?.(`could not inspect pid ${pid}: ${messageOf(error)}`);
+      return undefined;
+    }
   }
 
   /**
@@ -591,10 +631,13 @@ export class HostBuilds {
    * row; any successful read resets the count.
    */
   private async confirmLost(record: BuildRecord): Promise<boolean> {
-    if (await this.isAlive(record)) {
+    const live = await this.liveness(record);
+    if (live === "alive") {
       this.misses.delete(record.buildId);
       return false;
     }
+    // Could not look: not a miss, and not a sighting either.
+    if (live === "unknown") return false;
     const misses = (this.misses.get(record.buildId) ?? 0) + 1;
     this.misses.set(record.buildId, misses);
     return misses >= LOST_AFTER_MISSES;
@@ -630,7 +673,7 @@ export class HostBuilds {
       for (const record of await this.listRecords()) {
         if (this.watches.has(record.buildId)) continue;
         if (await this.readExit(record)) continue;
-        if (await this.isAlive(record)) this.watch(record, hooks);
+        if ((await this.liveness(record)) !== "gone") this.watch(record, hooks);
       }
     })().catch((error: unknown) => {
       this.deps.log?.(`re-adopting builds failed: ${messageOf(error)}`);
@@ -734,7 +777,11 @@ export class HostBuilds {
     }
     // The one place a stale pid would do real harm: never signal a process
     // that does not prove it is the wrapper this record describes.
-    if (!(await this.isAlive(record))) {
+    const live = await this.liveness(record);
+    if (live === "unknown") {
+      return { stopped: false, message: `Could not inspect build ${buildId}'s process; try again.` };
+    }
+    if (live === "gone") {
       return { stopped: false, message: `Build ${buildId} is no longer running.` };
     }
     await this.launched(record);
@@ -776,8 +823,8 @@ export class HostBuilds {
     while (this.now() < deadline) {
       const childPid = await readPid(record.pidPath);
       if (childPid !== null) {
-        const identity = await this.readIdentity(childPid);
-        if (identity === null || !identity.command?.includes(record.marker)) return;
+        const identity = await this.probe(childPid);
+        if (identity === null || (identity && !identity.command?.includes(record.marker))) return;
       }
       if (await this.readExit(record)) return;
       await delay(25);
@@ -793,9 +840,10 @@ export class HostBuilds {
     if (await this.readExit(record)) return;
     const childPid = await readPid(record.pidPath);
     if (childPid === null) return;
-    const identity = await this.readIdentity(childPid);
+    const identity = await this.probe(childPid);
     if (
-      identity?.command?.includes("xcodebuild") !== true ||
+      !identity ||
+      identity.command?.includes("xcodebuild") !== true ||
       identity.startedAt === null ||
       identity.startedAt < record.startedAt - START_TIME_TOLERANCE_MS
     ) {
@@ -818,7 +866,7 @@ export class HostBuilds {
       .then((info) => info.isFile())
       .catch(() => false);
     if (!finalized) {
-      if (!exited && (await this.isAlive(record))) return { status: "pending" };
+      if (!exited && (await this.liveness(record)) !== "gone") return { status: "pending" };
       // xcodebuild finalizes on every normal exit, failures included; a
       // bundle that is still unfinalized after the wrapper reported is one
       // a killed build left behind. Give the exit a moment to have flushed.
@@ -874,7 +922,7 @@ export class HostBuilds {
       // `ps` read is not enough to delete a running build's bundle.
       if (!exit) {
         if (now - settledAt < UNSETTLED_PRUNE_AFTER_MS) continue;
-        if (await this.isAlive(record)) continue;
+        if ((await this.liveness(record)) !== "gone") continue;
       }
       const size = await treeSize(dir);
       if (now - settledAt > retention.maxAgeMs) {

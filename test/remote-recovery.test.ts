@@ -34,7 +34,12 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function setup(options: { firstWorker?: Parameters<typeof createHostEntry>[0] } = {}) {
+type WorkerOptions = NonNullable<Parameters<typeof createHostEntry>[0]>;
+
+function setup(
+  options: { firstWorker?: WorkerOptions | ((clock: { now: number }) => WorkerOptions) } = {},
+) {
+  const clock = { now: Date.now() };
   const ws = makeWorkspace("xcode-recovery-");
   cleanups.push(() => ws.cleanup());
   const worker = (extra: Parameters<typeof createHostEntry>[0] = {}) =>
@@ -51,10 +56,12 @@ function setup(options: { firstWorker?: Parameters<typeof createHostEntry>[0] } 
       { experimental_paths: { dataDir: ws.dataDir, tempDir: join(ws.base, "temp") } },
     );
   // `let`: a test may replace the Mac's worker, as a reload or crash would.
-  let mbp = worker(options.firstWorker);
-  const replaceWorker = async () => {
+  let mbp = worker(
+    typeof options.firstWorker === "function" ? options.firstWorker(clock) : options.firstWorker,
+  );
+  const replaceWorker = async (extra: WorkerOptions = {}) => {
     await mbp.experimental_dispose();
-    mbp = worker();
+    mbp = worker(extra);
   };
   cleanups.push(async () => {
     // Never leave a gated build behind.
@@ -71,7 +78,6 @@ function setup(options: { firstWorker?: Parameters<typeof createHostEntry>[0] } 
     log: () => undefined,
   });
 
-  const clock = { now: Date.now() };
   const net = {
     offline: false,
     dropStartRequest: false,
@@ -298,6 +304,51 @@ describe("a worker replaced between spawning a build and recording it", () => {
       return t.store.getRun(runId)?.status === "passed";
     });
     expect(t.buildDirs()).toEqual([runId.slice(2)]);
+  });
+});
+
+describe("a process table that cannot be read", () => {
+  it("is not taken as a launch that never ran, however long it lasts", async () => {
+    // The worker hangs after the spawn, before the record (on the shared clock).
+    const t = setup({
+      firstWorker: (clock) => ({
+        readIdentity: () => new Promise(() => undefined),
+        now: () => clock.now,
+      }),
+    });
+    t.net.startTimeoutMs = 300;
+    const remote = t.server();
+    const started = await remote.start(MBP, t.request("pass"), t.scope);
+    if (started.ok) throw new Error("expected the start to time out");
+    const runId = runIdIn(started.message);
+    await until(() => existsSync(join(t.ws.dataDir, "builds", runId.slice(2), "wrapper.pid")));
+
+    // The replacement worker's `ps` times out, past the launch window and
+    // past the server's grace for a start that never arrived.
+    const probe = { broken: true };
+    const { readProcessIdentity, ProcessInspectionError } = await import("../src/host/identity");
+    await t.replaceWorker({
+      now: () => t.clock.now,
+      readIdentity: async (pid) => {
+        if (probe.broken) throw new ProcessInspectionError("ps timed out");
+        return readProcessIdentity(pid);
+      },
+    });
+    t.net.startTimeoutMs = null;
+    for (let tick = 0; tick < 5; tick += 1) {
+      t.clock.now += UNCONFIRMED_START_GRACE_MS;
+      await remote.reconcile();
+      expect(t.store.getRun(runId)?.status).toBe("running");
+    }
+    expect(remote.hasWork()).toBe(true);
+    expect(t.store.hasSeen(`remote-settled:${runId}`)).toBe(false);
+
+    // `ps` answers again; the server's own reconcile carries on from there.
+    probe.broken = false;
+    await until(async () => {
+      await remote.reconcile();
+      return t.store.getRun(runId)?.status === "passed";
+    });
   });
 });
 
