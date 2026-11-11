@@ -414,6 +414,16 @@ describe("Xcode.app's actions found on disk", () => {
     machine.cwds.set(901, checkout);
     expect(await call("probe", {})).toEqual({ activities: [] });
 
+    // Or names it relative to its own directory, before its compilers do.
+    machine.ps = xcodeAppPs({
+      servicePid: 812,
+      extra: [
+        `  900     1 00:30 /bin/sh -c wrapper`,
+        `  901   900 00:30 /usr/bin/xcodebuild -workspace Amion.xcworkspace -scheme Amion -derivedDataPath ../../Library/Developer/Xcode/DerivedData/${root.split("/").pop()} build -resultBundlePath ${tracked}`,
+      ].join("\n"),
+    });
+    expect(await call("probe", {})).toEqual({ activities: [] });
+
     // Once it names the root, the same.
     machine.ps = xcodeAppPs({
       servicePid: 812,

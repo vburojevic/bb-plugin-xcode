@@ -17,6 +17,9 @@ import type {
   RunKind,
 } from "./types";
 
+/** `…/Xcode.app/Contents/MacOS/Xcode`, under whatever name the app has. */
+const XCODE_APP_RE = /\.app\/Contents\/MacOS\/Xcode$/;
+
 /** The `ps` invocation this module's parser expects. */
 export const PS_ARGS = ["-Aww", "-o", "pid=,ppid=,etime=,args="] as const;
 
@@ -301,7 +304,8 @@ export function parsePsOutput(
  * Executable paths may contain spaces (`/Applications/Xcode 26.app/...`), so a
  * naive split on whitespace is wrong. Xcode's own toolchain paths never do, but
  * a user-renamed Xcode.app does — prefer the longest prefix that looks like a
- * path to a known toolchain binary, else fall back to the first token.
+ * path to a known toolchain binary or to Xcode.app itself, else fall back to
+ * the first token.
  */
 export function argv0(args: string): string {
   const first = args.split(" ")[0] ?? args;
@@ -318,6 +322,8 @@ export function argv0(args: string): string {
   for (let i = candidates.length - 1; i >= 0; i--) {
     const candidate = candidates[i]!;
     if (TOOLCHAIN_BINARIES.has(basename(candidate))) return candidate;
+    // Xcode.app itself — but not an argument naming it (`open …/Xcode`).
+    if (XCODE_APP_RE.test(candidate) && !candidate.includes(" /")) return candidate;
   }
   return first;
 }
@@ -758,12 +764,10 @@ export function quietServiceActivity(proc: ObservedProcess, now: number): LiveAc
   };
 }
 
-/** `…/Xcode.app/Contents/MacOS/Xcode`, under whatever name the app has. */
-const XCODE_APP_RE = /\.app\/Contents\/MacOS\/Xcode$/;
-
 /**
  * The Xcode.app process a build service belongs to: the one above it, else
- * the only one running. Null when that cannot be told.
+ * the only one running. Null when that cannot be told — two open, or the
+ * service under launchd with none above it.
  */
 export function xcodeAppOf(
   procs: readonly ObservedProcess[],

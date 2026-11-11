@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Engine, MISSES_BEFORE_FINISHING, observedRunId } from "../src/engine";
 import { RANK, type Run } from "../src/model";
 import { ProcessObserver } from "../src/observe";
+import { argv0 } from "../src/proc";
 import { MIGRATIONS, Store, type Db } from "../src/store";
 import type { LiveActivity } from "../src/types";
 import { DerivedDataActions, MAX_ACTION_AGE_MS, parseTestBundleName } from "../src/xcode-actions";
@@ -398,9 +399,14 @@ describe("evidence left behind", () => {
     expect(runs.listRuns({ limit: 10, includeNoise: true })).toEqual([]);
   });
 
-  it("while an action named just before its service started is still its own", async () => {
+  it("with no Xcode.app to credit it to, counts only what began under this service", async () => {
     const { dir, root } = derivedData();
-    const bundle = testBundle(root, "Test-Amion-2026.11.11_08-43-50--1000.xcresult", false);
+    // Named 26 s before the service started: a crash's, or this session's —
+    // with no Xcode.app in sight, there is no telling, so it is a gap.
+    testBundle(root, "Test-Amion-2026.11.11_08-43-50--1000.xcresult", false);
+    expect(await observer(dir, "00:00:00").snapshot(NOW)).toEqual([]);
+    // Named after it started: the service's own.
+    const bundle = testBundle(root, "Test-Amion-2026.11.11_08-44-10--1000.xcresult", false);
     expect(await observer(dir, "00:10").snapshot(NOW)).toMatchObject([
       { pid: 12000, roots: [root], resultBundlePath: bundle },
     ]);
@@ -597,6 +603,152 @@ describe("review of 4a750ba", () => {
         const ide = runs.listRuns({ limit: 10, includeNoise: true }).filter((run) => run.pid === 12000);
         expect(ide).toMatchObject([{ status: "running", root, bundlePath: bundle }]);
       }
+    });
+  });
+});
+
+describe("review of eb9291b", () => {
+  const NOW = Date.UTC(2026, 10, 11, 18, 44, 16);
+  const service = (app: string) =>
+    `${app}/Contents/SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/SWBBuildService.bundle/Contents/MacOS/SWBBuildService`;
+  const store = () => {
+    const db = new Database(":memory:") as unknown as Db;
+    for (const statement of MIGRATIONS) db.prepare(statement).run();
+    return new Store(db);
+  };
+
+  /** Idle probes of a process table, folded: what showed, and what runs. */
+  async function idle(dir: string, table: string, cwds: Record<number, string> = {}) {
+    const watch = new ProcessObserver({
+      ps: async () => table,
+      cwdOf: async (pid) => cwds[pid] ?? "/",
+      gitOf: async () => null,
+      actions: new DerivedDataActions(dir),
+    });
+    const runs = store();
+    const engine = new Engine(runs, { projectFor: () => null, threadFor: () => null, log: () => undefined });
+    const seen: number[][] = [];
+    for (let tick = 0; tick <= MISSES_BEFORE_FINISHING; tick += 1) {
+      const snapshot = (await watch.snapshot(NOW + tick * 2_000))!;
+      seen.push(snapshot.map((activity) => activity.pid));
+      engine.foldSnapshot(snapshot, NOW + tick * 2_000, MBP);
+    }
+    return { seen, runs: runs.listRuns({ limit: 10, includeNoise: true }) };
+  }
+
+  function leftovers() {
+    const { base, dir, root } = derivedData();
+    // A test began at 18:43:56Z and its Xcode crashed; the build of another
+    // action had its journal open since 18:43:50Z.
+    testBundle(root, "Test-Amion-2026.11.11_08-43-56--1000.xcresult", false);
+    const data = join(root, "Build/Intermediates.noindex/XCBuildData");
+    mkdirSync(data, { recursive: true });
+    const journal = join(data, "build.db-journal");
+    writeFileSync(journal, "");
+    utimesSync(journal, new Date(NOW - 26_000), new Date(NOW - 26_000));
+    return { base, dir, root };
+  }
+
+  describe("an Xcode session that cannot be told", () => {
+    it("does not make a crash's leftovers live: two Xcodes open, the service under launchd", async () => {
+      const { dir } = leftovers();
+      // Reopened; its new service came up 20 s after the abandoned bundle.
+      const table = [
+        `    1     0 10-00:00:00 /sbin/launchd`,
+        `  700     1 05:00:00 /Applications/Xcode.app/Contents/MacOS/Xcode`,
+        `  710     1 00:05 /Applications/Xcode-beta.app/Contents/MacOS/Xcode`,
+        `12000     1 00:00 ${service("/Applications/Xcode-beta.app")}`,
+        "",
+      ].join("\n");
+      expect(await idle(dir, table)).toEqual({ seen: [[], [], [], []], runs: [] });
+    });
+
+    it("still follows what began under the service itself", async () => {
+      const { dir, root } = derivedData();
+      const bundle = testBundle(root, "Test-Amion-2026.11.11_08-44-10--1000.xcresult", false);
+      const table = [
+        `    1     0 10-00:00:00 /sbin/launchd`,
+        `  700     1 05:00:00 /Applications/Xcode.app/Contents/MacOS/Xcode`,
+        `  710     1 01:00 /Applications/Xcode-beta.app/Contents/MacOS/Xcode`,
+        `12000     1 00:30 ${service("/Applications/Xcode-beta.app")}`,
+        "",
+      ].join("\n");
+      const { seen, runs } = await idle(dir, table);
+      expect(seen).toEqual([[12000], [12000], [12000], [12000]]);
+      expect(runs).toMatchObject([{ status: "running", bundlePath: bundle }]);
+    });
+  });
+
+  describe("an Xcode whose path has a space in it", () => {
+    const APP = "/Applications/Xcode 27.app";
+
+    it("is read as the whole path", () => {
+      expect(argv0(`${APP}/Contents/MacOS/Xcode -NSDocumentRevisionsDebugMode YES`)).toBe(
+        `${APP}/Contents/MacOS/Xcode`,
+      );
+      expect(argv0(`/usr/bin/open ${APP}/Contents/MacOS/Xcode`)).toBe("/usr/bin/open");
+    });
+
+    it("is the session its service's actions are credited to, so a crash's leftovers are not", async () => {
+      const { dir } = leftovers();
+      const table = [
+        `    1     0 10-00:00:00 /sbin/launchd`,
+        `  700     1 00:10 ${APP}/Contents/MacOS/Xcode`,
+        // Started after its Xcode, but within the service's allowance of
+        // the abandoned bundle: only the session tells them apart.
+        `12000   700 00:00 ${service(APP)}`,
+        "",
+      ].join("\n");
+      expect(await idle(dir, table)).toEqual({ seen: [[], [], [], []], runs: [] });
+    });
+
+    it("while an action of that session, named before its service started, is one", async () => {
+      const { dir, root } = derivedData();
+      const bundle = testBundle(root, "Test-Amion-2026.11.11_08-43-56--1000.xcresult", false);
+      const table = [
+        `    1     0 10-00:00:00 /sbin/launchd`,
+        `  700     1 01:00:00 ${APP}/Contents/MacOS/Xcode`,
+        `12000   700 00:00 ${service(APP)}`,
+        "",
+      ].join("\n");
+      const { seen, runs } = await idle(dir, table);
+      expect(seen).toEqual([[12000], [12000], [12000], [12000]]);
+      expect(runs).toMatchObject([{ status: "running", bundlePath: bundle }]);
+    });
+  });
+
+  describe("a terminal build naming its DerivedData by a relative path", () => {
+    const APP = "/Applications/Xcode.app";
+    const table = (derivedDataPath: string) =>
+      [
+        `    1     0 10-00:00:00 /sbin/launchd`,
+        `  700     1 05:00:00 ${APP}/Contents/MacOS/Xcode`,
+        `12000   700 04:00:00 ${service(APP)}`,
+        `  950     1 00:30 /usr/bin/xcodebuild -workspace Amion.xcworkspace -scheme Amion -derivedDataPath ${derivedDataPath} build`,
+        "",
+      ].join("\n");
+
+    it("owns that root when it is the shared one, however it is spelled", async () => {
+      const { base, dir, root } = derivedData();
+      const data = join(root, "Build/Intermediates.noindex/XCBuildData");
+      mkdirSync(data, { recursive: true });
+      writeFileSync(join(data, "build.db-journal"), "");
+      const checkout = join(base, "ios-amion-v2-2");
+      const name = root.slice(dir.length + 1);
+      for (const spelling of [`../DerivedData/${name}`, `${dir}/./${name}/`, `${base}/./DerivedData/../DerivedData/${name}`]) {
+        const { seen, runs } = await idle(dir, table(spelling), { 950: checkout });
+        expect(seen).toEqual([[950], [950], [950], [950]]);
+        expect(runs.map((run) => run.pid)).toEqual([950]);
+      }
+    });
+
+    it("does not own the shared root when it names another", async () => {
+      const { base, dir, root } = derivedData();
+      const bundle = testBundle(root, "Test-Amion-2026.11.11_08-43-56--1000.xcresult", false);
+      const checkout = join(base, "ios-amion-v2-2");
+      const { seen, runs } = await idle(dir, table("../DerivedData-cli/Amion"), { 950: checkout });
+      expect(seen).toEqual([[950, 12000], [950, 12000], [950, 12000], [950, 12000]]);
+      expect(runs.find((run) => run.pid === 12000)).toMatchObject({ status: "running", bundlePath: bundle });
     });
   });
 });

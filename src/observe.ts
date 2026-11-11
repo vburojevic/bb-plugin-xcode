@@ -10,7 +10,8 @@
  * Import-light on purpose: `host.ts` bundles it.
  */
 
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 
 import { readTextFileBounded } from "./bounded-file";
 import { processCwd, psSnapshot } from "./exec";
@@ -167,11 +168,8 @@ export class ProcessObserver {
     } catch {
       return;
     }
-    const sessionStart = xcodeAppOf(procs, service)?.startedAt ?? null;
-    const notBefore = Math.max(
-      service.startedAt !== null ? service.startedAt - SERVICE_START_SLACK_MS : -Infinity,
-      sessionStart !== null ? sessionStart - SESSION_START_SLACK_MS : -Infinity,
-    );
+    const notBefore = actionsNotBefore(service.startedAt, xcodeAppOf(procs, service)?.startedAt ?? null);
+    if (notBefore === null) return;
     const terminal = activities.filter((entry) => !entry.isDaemon);
     const kept: XcodeAction[] = [];
     for (const action of actions) {
@@ -212,17 +210,25 @@ export class ProcessObserver {
    * Is a terminal build working in this root? A build that names its
    * DerivedData (`-derivedDataPath`, or its compilers' arguments) works there
    * and nowhere else — the same workspace built by Xcode.app into another
-   * root is not its. Only a build that names none yet is judged by the
-   * workspace it builds (by path, or as the one in its directory), the way
-   * it will use the workspace's shared root.
+   * root is not its. A name is compared as the directory it is: a relative
+   * `-derivedDataPath` from the build's own directory, any spelling
+   * normalized, links resolved. Only a build that names none yet (or only a
+   * relative one from a directory not known) is judged by the workspace it
+   * builds (by path, or as the one in its directory), the way it will use
+   * the workspace's shared root.
    */
   private async runByTerminal(root: string, terminal: readonly LiveActivity[]): Promise<boolean> {
-    const rootOf = (build: LiveActivity) =>
-      build.derivedDataPath !== null || build.roots.length > 0
-        ? build.derivedDataPath === root || build.roots.includes(root)
-        : null;
-    if (terminal.some((build) => rootOf(build) === true)) return true;
-    const unplaced = terminal.filter((build) => rootOf(build) === null);
+    const unplaced: LiveActivity[] = [];
+    for (const build of terminal) {
+      const named = namedRoots(build);
+      if (named.length === 0) {
+        unplaced.push(build);
+        continue;
+      }
+      for (const path of named) {
+        if (await sameDirectory(path, root)) return true;
+      }
+    }
     if (unplaced.length === 0) return false;
     const workspace = await this.rootWorkspace(root);
     if (workspace === null) return false;
@@ -288,4 +294,45 @@ export class ProcessObserver {
     if (this.gitCache.size > MAX_CACHE_ENTRIES) this.gitCache.clear();
     return context;
   }
+}
+
+/**
+ * The earliest an action may have begun and still be one the running Xcode
+ * is serving; null when nothing on disk can be credited to it.
+ *
+ * With its Xcode.app known, the app's own start fences off what an earlier
+ * session left, however soon it was reopened, while a bundle Xcode named a
+ * little before launching the service for it still counts. Without it — two
+ * Xcodes open and the service under launchd — that allowance cannot be told
+ * from a crash's leftovers, so only what began under this service counts: a
+ * test whose service started after its bundle is then seen only through the
+ * service's children, a gap rather than a build that is not there.
+ */
+export function actionsNotBefore(serviceStart: number | null, sessionStart: number | null): number | null {
+  if (sessionStart !== null) {
+    return Math.max(
+      sessionStart - SESSION_START_SLACK_MS,
+      serviceStart !== null ? serviceStart - SERVICE_START_SLACK_MS : -Infinity,
+    );
+  }
+  return serviceStart !== null ? serviceStart - SESSION_START_SLACK_MS : null;
+}
+
+/** The DerivedData roots a terminal build names, as absolute paths. */
+function namedRoots(build: LiveActivity): string[] {
+  const cwd = build.cwd !== null && isAbsolute(build.cwd) ? build.cwd : null;
+  const named: string[] = [];
+  for (const path of [build.derivedDataPath, ...build.roots]) {
+    if (path === null) continue;
+    if (isAbsolute(path)) named.push(normalize(path));
+    else if (cwd !== null) named.push(resolve(cwd, path));
+  }
+  return named;
+}
+
+/** Are two absolute paths the same directory, by spelling or once resolved? */
+async function sameDirectory(a: string, b: string): Promise<boolean> {
+  if (normalize(a) === normalize(b)) return true;
+  const [realA, realB] = await Promise.all([realpath(a).catch(() => null), realpath(b).catch(() => null)]);
+  return realA !== null && realA === realB;
 }
