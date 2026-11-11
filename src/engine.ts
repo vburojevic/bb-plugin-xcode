@@ -565,6 +565,10 @@ export class Engine {
       // simply never got its verdict.
       .listRuns({ limit: 200, includeNoise: true, threadId: outcome.threadId })
       .filter((run) => !VERDICT_STATUSES.has(run.status))
+      // Xcode.app's builds — its build service, or a row only its log store
+      // knows — are attributed to a thread through their workspace, but no
+      // command launched them, so no command's exit speaks for them.
+      .filter((run) => !run.id.startsWith("m:") && !isBuildServiceCommand(run.cmdline))
       .filter((run) => run.startedAt >= outcome.startedAt - LAUNCH_SLACK_MS)
       .filter(
         (run) =>
@@ -711,7 +715,17 @@ export class Engine {
           !isHostBuildRun(run) || !run.scheme || !entry.scheme || run.scheme === entry.scheme,
       );
 
-    const target = candidates[0] ?? null;
+    // A tracked build stops being a verdict candidate once its own bundle has
+    // been read (rank verified), but its log entry still lands here, often
+    // later: look for it whatever its rank before filing a standalone row.
+    const target =
+      candidates[0] ??
+      (hostId === null
+        ? null
+        : (this.store
+            .findHostBuildsAround(entry.startedAt, MATCH_SLACK_MS, hostId)
+            .find((run) => !run.scheme || !entry.scheme || run.scheme === entry.scheme) ??
+          null));
 
     if (target && isHostBuildRun(target)) {
       // The build the host worker ran writes this entry too. Its verdict
@@ -991,6 +1005,11 @@ export class Engine {
     this.hooks.log(`verdict from bundle: ${target.status} (${target.id})`);
     return true;
   }
+}
+
+/** Is this the command line of Xcode.app's resident build service? */
+function isBuildServiceCommand(cmdline: string | null): boolean {
+  return cmdline !== null && /\/(?:SWB|XCB)BuildService(?:\s|$)/.test(cmdline);
 }
 
 /** Which log domain may speak about which run kind. */

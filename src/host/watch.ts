@@ -32,7 +32,7 @@ import {
 import { findDeveloperTool, xcresultJson } from "../exec";
 import { isFinalized, MAX_LOG_MANIFEST_BYTES, parseBundleWith } from "../machine";
 import { LOG_DOMAINS, parseManifest } from "../manifest";
-import { ProcessObserver, type ObserverDeps } from "../observe";
+import { ProcessObserver, readRootWorkspace, type ObserverDeps } from "../observe";
 import { shimPaths } from "../shim";
 import type { LiveActivity } from "../types";
 import { boundSummary } from "./builds";
@@ -71,7 +71,12 @@ export class HostWatch {
   private tool: Promise<string | null> | null = null;
 
   constructor(private readonly deps: HostWatchDeps) {
-    this.observer = new ProcessObserver(deps.observer);
+    this.observer = new ProcessObserver({
+      // `info.plist` is read from inside the root only, like its manifests.
+      workspaceOf: async (root) =>
+        (await staysInside(join(root, "info.plist"), root)) ? readRootWorkspace(root) : null,
+      ...deps.observer,
+    });
   }
 
   /** Where the worker's own tracked builds write; those are not watched here. */
@@ -81,8 +86,15 @@ export class HostWatch {
 
   // ------------------------------------------------------------------ probe
 
+  /**
+   * Throws rather than answer with less than the whole truth: the server
+   * ends every run on this Mac that a snapshot leaves out, so a `ps` that
+   * printed nothing (it timed out under load) or a list over the reply cap
+   * must be no answer, never "no builds".
+   */
   async probe(now: number): Promise<{ activities: WireActivity[] }> {
-    const snapshot = (await this.observer.snapshot(now)) ?? [];
+    const snapshot = await this.observer.snapshot(now);
+    if (snapshot === null) throw new Error("ps gave no process list on this Mac");
     const activities: WireActivity[] = [];
     for (const activity of snapshot) {
       // A `-resultBundlePath` is relative to the build's own directory, which
@@ -91,7 +103,9 @@ export class HostWatch {
       if (bundle !== null && isUnder(bundle, this.buildsDir)) continue;
       if (bundle !== null) await this.remember(bundle);
       activities.push(toWire({ ...activity, resultBundlePath: bundle }));
-      if (activities.length >= MAX_ACTIVITIES) break;
+    }
+    if (activities.length > MAX_ACTIVITIES) {
+      throw new Error(`${activities.length} Xcode builds on this Mac, more than one reply can list`);
     }
     return { activities };
   }
@@ -136,11 +150,13 @@ export class HostWatch {
         continue;
       }
       const domains: ManifestReadReply["roots"][number]["domains"] = [];
+      let unread = false;
       for (const file of files) {
         let xml: string;
         try {
           xml = await readTextFileBounded(file.path, MAX_LOG_MANIFEST_BYTES);
         } catch {
+          unread = true;
           continue;
         }
         const entries = parseManifest(xml)
@@ -165,6 +181,9 @@ export class HostWatch {
           }));
         domains.push({ kind: file.kind, mtimeMs: file.mtimeMs, entries });
       }
+      // A manifest that could not be read must be asked for again, so no
+      // modification time is reported that would let the next call skip it.
+      if (unread) for (const domain of domains) domain.mtimeMs = null;
       const reply = { root, workspace, domains };
       // Over the budget, the rest are left out unread; the server asks again.
       const cost = Buffer.byteLength(JSON.stringify(reply), "utf8");
@@ -182,8 +201,11 @@ export class HostWatch {
     paths: readonly string[];
   }): Promise<InspectBundlesReply> {
     const candidates = new Set<string>(await this.shimBundles());
+    const observed = await this.observedBundles();
     for (const path of request.paths) {
-      if (await this.mayRead(path)) candidates.add(path);
+      // A bundle a build here named but never wrote is still listed (as not
+      // finalized): that is how a killed build is told from a slow one.
+      if (observed.has(path) || (await this.mayRead(path))) candidates.add(path);
     }
     for (const root of request.roots) {
       if (!(await isDerivedRoot(root))) continue;

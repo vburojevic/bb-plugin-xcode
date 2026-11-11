@@ -11,7 +11,9 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 
+import { Collector } from "../src/collector";
 import { Engine, MISSES_BEFORE_FINISHING, observedRunId } from "../src/engine";
+import type { MachineIO } from "../src/machine";
 import { RANK, type Run } from "../src/model";
 import { selectHostsToWatch } from "../src/remote-watch";
 import { SCOPE_IDLE_TTL_MS, ThreadScopes } from "../src/scopes";
@@ -338,6 +340,63 @@ describe("log entries and bundles from another Mac", () => {
     expect(store.hasSeen("manifest:A1B2C3D4-0000-0000-0000-000000000001")).toBe(true);
   });
 
+  it("absorbs it also once the tracked build's own bundle made it verified", () => {
+    const store = migrated();
+    const engine = engineWith(store);
+    store.insertRun(
+      run("w:abc-0123456789ab", {
+        hostId: MBP,
+        scheme: "Amion",
+        status: "passed",
+        statusRank: RANK.verified,
+        endedAt: NOW + 30_000,
+      }),
+    );
+    engine.foldManifestEntry("/dd/Amion-x", "build", entry(), NOW, { hostId: MBP });
+    expect(store.listRuns({ limit: 10, includeNoise: true }).map((row) => row.id)).toEqual([
+      "w:abc-0123456789ab",
+    ]);
+  });
+
+  it("never lets a thread command's exit settle an Xcode.app build", () => {
+    const store = migrated();
+    const engine = engineWith(store);
+    const ide = {
+      threadId: "thr_mbp",
+      status: "finishing" as const,
+      startedAt: NOW + 1_000,
+      endedAt: NOW + 20_000,
+    };
+    store.insertRun(
+      run(observedRunId(MBP, 812, NOW + 1_000), {
+        ...ide,
+        hostId: MBP,
+        pid: 812,
+        cmdline:
+          "/Applications/Xcode.app/Contents/SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/SWBBuildService.bundle/Contents/MacOS/SWBBuildService",
+      }),
+    );
+    store.insertRun(run("m:IDE-ENTRY", { ...ide, hostId: MBP, pid: null }));
+    const folded = engine.foldThreadCommandExit(
+      {
+        taskId: "task",
+        threadId: "thr_mbp",
+        command: "xcodebuild -scheme Other build",
+        cwd: "",
+        startedAt: NOW,
+        endedAt: NOW + 30_000,
+        exitCode: 0,
+        interrupted: false,
+      },
+      NOW + 31_000,
+    );
+    expect(folded).toBe(false);
+    expect(store.listRuns({ limit: 10, includeNoise: true }).map((row) => row.status)).toEqual([
+      "finishing",
+      "finishing",
+    ]);
+  });
+
   it("lets an Xcode.app build of another scheme beside a tracked one keep its own row", () => {
     const store = migrated();
     const engine = engineWith(store);
@@ -475,5 +534,36 @@ describe("which Macs are watched", () => {
     expect(
       selectHostsToWatch({ scopeHosts: [], optIn: [MBP], openRunHosts: [AIR], serverHostId: null }),
     ).toEqual([]);
+  });
+});
+
+describe("the bundle sweep's view of a finished build", () => {
+  it("looks again before calling a build killed, since the listing may be minutes old", async () => {
+    const store = migrated();
+    const engine = engineWith(store);
+    const bundle = "/Users/me/out/Run.xcresult";
+    store.insertRun(
+      run("r:1:1", { status: "finishing", bundlePath: bundle, endedAt: NOW - 60_000 }),
+    );
+    let listings = 0;
+    const io: MachineIO = {
+      snapshot: async () => [],
+      discoverRoots: async () => [],
+      readManifests: async () => [],
+      // The sweep's own listing predates the bundle being finalized; by the
+      // time it gets to this bundle, it is.
+      listBundles: async () => {
+        listings += 1;
+        return { candidates: [bundle], finalized: new Set(listings === 1 ? [] : [bundle]) };
+      },
+      parseBundle: async () => ({ status: "empty" }),
+    };
+    const collector = new Collector(
+      { store, engine, listProjects: async () => [], log: { debug: () => undefined, warn: () => undefined }, dataDir: "", io },
+      { scanProjects: false, extraRoots: [] },
+    );
+    await collector.sweepBundles(NOW);
+    expect(listings).toBe(2);
+    expect(store.getRun("r:1:1")?.status).toBe("finishing");
   });
 });

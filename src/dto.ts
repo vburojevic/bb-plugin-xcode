@@ -99,7 +99,7 @@ export class DtoMapper {
   }
 
   private typicalFor(run: Run): number | null {
-    const key = `${run.root}|${run.scheme}|${run.kind}`;
+    const key = `${run.hostId ?? ""}|${run.root}|${run.scheme}|${run.kind}`;
     const now = Date.now();
     const hit = this.typicalMemo.get(key);
     if (hit && now - hit.at < TYPICAL_TTL_MS) return hit.value;
@@ -107,6 +107,7 @@ export class DtoMapper {
       root: run.root,
       scheme: run.scheme,
       kind: run.kind,
+      hostId: run.hostId,
     });
     if (this.typicalMemo.size > TYPICAL_MAX_ENTRIES) this.typicalMemo.clear();
     this.typicalMemo.set(key, { at: now, value });

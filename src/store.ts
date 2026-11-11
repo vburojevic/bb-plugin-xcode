@@ -744,15 +744,17 @@ export class Store {
     root: string | null;
     scheme: string | null;
     kind: RunKind;
+    /** The Mac the root is on; null for this one. Same path, other Mac: other root. */
+    hostId?: string | null;
   }): number | null {
     if (!query.root || !query.scheme) return null;
     const rows = this.sql(
       `SELECT (ended_at - started_at) AS ms FROM run
-        WHERE root = ? AND scheme = ? AND kind = ?
+        WHERE root = ? AND scheme = ? AND kind = ? AND host_id IS ?
           AND ended_at IS NOT NULL
           AND status IN ('passed', 'warnings')
         ORDER BY started_at DESC LIMIT 20`,
-    ).all(query.root, query.scheme, query.kind) as Array<{ ms: number }>;
+    ).all(query.root, query.scheme, query.kind, query.hostId ?? null) as Array<{ ms: number }>;
 
     const samples = rows
       .map((row) => row.ms)
@@ -850,6 +852,22 @@ export class Store {
         WHERE status_rank < 2
           AND kind NOT IN ('index','package')
           AND host_id IS ?
+          AND started_at <= ?
+          AND COALESCE(ended_at, started_at + ?) >= ?
+        ORDER BY started_at DESC LIMIT 20`,
+    ).all(hostId, aroundMs + slackMs, slackMs, aroundMs - slackMs) as RunRowRaw[];
+    return rows.map(toRun);
+  }
+
+  /**
+   * Tracked builds on one Mac overlapping a moment, at any rank: the runs a
+   * log entry Xcode wrote for one of them must be absorbed by, even after
+   * its bundle made it ineligible as a verdict candidate.
+   */
+  findHostBuildsAround(aroundMs: number, slackMs: number, hostId: string): Run[] {
+    const rows = this.sql(
+      `SELECT * FROM run
+        WHERE host_id = ? AND id LIKE 'w:%'
           AND started_at <= ?
           AND COALESCE(ended_at, started_at + ?) >= ?
         ORDER BY started_at DESC LIMIT 20`,

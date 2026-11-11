@@ -9,7 +9,7 @@
  * out as Xcode lays DerivedData out.
  */
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
@@ -129,6 +129,37 @@ describe("probe", () => {
   });
 });
 
+describe("probe gives no answer rather than a partial one", () => {
+  it("fails when ps printed nothing, so the server ends no runs on it", async () => {
+    const { machine, call } = setup();
+    machine.ps = "";
+    await expect(call("probe", {})).rejects.toThrow(/no process list/);
+  });
+
+  it("fails when there are more builds than one reply can list", async () => {
+    const { machine, call } = setup();
+    machine.ps = Array.from(
+      { length: 65 },
+      (_, index) => `${1000 + index}     1 00:05 /usr/bin/xcodebuild -scheme S${index} build`,
+    ).join("\n");
+    await expect(call("probe", {})).rejects.toThrow(/more than one reply can list/);
+  });
+
+  it("reads a root's info.plist only from inside the root", async () => {
+    const { machine, call, base } = setup();
+    const outside = join(base, "outside.plist");
+    writeFileSync(
+      outside,
+      `<plist version="1.0"><dict><key>WorkspacePath</key><string>/secret/App.xcworkspace</string></dict></plist>`,
+    );
+    const linked = makeDerivedRoot(join(base, "Library/Developer/Xcode/DerivedData/Linked-abc"));
+    symlinkSync(outside, join(linked, "info.plist"));
+    machine.ps = xcodeAppPs({ servicePid: 812, root: linked, workers: 1 });
+    const { activities } = await call<{ activities: Activity[] }>("probe", {});
+    expect(activities[0]).toMatchObject({ roots: [linked], container: null });
+  });
+});
+
 describe("discoverRoots", () => {
   it("finds Xcode's shared DerivedData and roots inside the checkouts it is given", async () => {
     const { call, root, checkout, base } = setup();
@@ -203,6 +234,26 @@ describe("readManifests", () => {
     expect(changed.roots[0]!.domains[0]!.entries.map((entry) => entry.uniqueIdentifier)).toEqual(["NEWER-1"]);
   });
 
+  it("reports no modification time while a manifest there cannot be read", async () => {
+    const { call, root } = setup();
+    const testManifest = join(root, "Logs/Test/LogStoreManifest.plist");
+    writeFileSync(testManifest, "<plist/>");
+    chmodSync(testManifest, 0o000);
+    try {
+      const reply = await call<Reply>("readManifests", {
+        roots: [{ path: root, ifModifiedSince: null }],
+        notBefore: null,
+      });
+      // The Build manifest still comes back, but nothing lets the next call
+      // skip the Test one it could not read.
+      expect(reply.roots[0]!.domains.map((domain) => [domain.kind, domain.mtimeMs])).toEqual([
+        ["build", null],
+      ]);
+    } finally {
+      chmodSync(testManifest, 0o644);
+    }
+  });
+
   it("reads only DerivedData roots, and no manifest a link leads out of one", async () => {
     const { call, base, root } = setup();
     const elsewhere = join(base, "elsewhere");
@@ -262,6 +313,17 @@ describe("result bundles", () => {
     }
     const listed = await call<{ candidates: string[] }>("inspectBundles", { roots: [], paths: [stray] });
     expect(listed.candidates).toEqual([]);
+  });
+
+  it("lists a bundle a build here named but never wrote, as not finalized", async () => {
+    const { call, machine, checkout } = setup();
+    const bundle = join(checkout, "out/Killed.xcresult");
+    machine.ps = `  950     1 00:05 /usr/bin/xcodebuild -scheme Amion build -resultBundlePath ${bundle}\n`;
+    await call("probe", {});
+    expect(await call("inspectBundles", { roots: [], paths: [bundle] })).toEqual({
+      candidates: [bundle],
+      finalized: [],
+    });
   });
 
   it("reads a bundle a terminal build on this Mac named, also after a worker restart", async () => {

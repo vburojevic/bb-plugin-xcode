@@ -479,7 +479,12 @@ export class Collector {
 
       // Root Info.plist only exists once xcodebuild finalizes the bundle
       // (verified on disk: an in-progress or killed bundle has only Data/).
-      const finalized = finalizedSet.has(bundle);
+      let finalized = finalizedSet.has(bundle);
+      // The listing may be minutes old by now (each bundle parse can take a
+      // minute). Before calling a build killed, look again.
+      if (!finalized && claimer) {
+        finalized = (await this.io.listBundles([], [bundle])).finalized.has(bundle);
+      }
 
       // Process gone, bundle never finalized: xcodebuild finalizes on every
       // normal exit including failures, so after a grace period this build
