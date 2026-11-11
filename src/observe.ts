@@ -16,7 +16,7 @@ import { readTextFileBounded } from "./bounded-file";
 import { processCwd, psSnapshot } from "./exec";
 import { gitInfoFor, type GitInfo } from "./git";
 import { isRecord, parsePlist } from "./plist";
-import { buildServices, findRootActivities, parsePsOutput, quietServiceActivity } from "./proc";
+import { buildServices, findRootActivities, parsePsOutput, quietServiceActivity, xcodeAppOf } from "./proc";
 import type { LiveActivity } from "./types";
 import { DerivedDataActions, type XcodeAction, type XcodeActionSource } from "./xcode-actions";
 
@@ -31,6 +31,12 @@ const MAX_CACHE_ENTRIES = 500;
  * earlier service — a crash's unfinished bundle, a hot journal.
  */
 const SERVICE_START_SLACK_MS = 60_000;
+/**
+ * An action never begins before the Xcode.app that runs it: one that did was
+ * left by an Xcode that has since quit or crashed, however quickly it was
+ * reopened. The slack covers `ps etime`'s whole seconds only.
+ */
+const SESSION_START_SLACK_MS = 2_000;
 
 /**
  * The workspace or project a DerivedData root belongs to.
@@ -142,9 +148,9 @@ export class ProcessObserver {
    * keeps it in the snapshot, says which root (so workspace, so thread) from
    * its first second, when it began, and for a test, the bundle its verdict
    * will be read from. Only while a service process exists, only actions
-   * that began under this service, and never one a terminal `xcodebuild` is
-   * running: that build is already its own activity, and its journal is not
-   * Xcode.app's.
+   * that began under this service and this Xcode.app, and never one a
+   * terminal `xcodebuild` is running: that build is already its own activity,
+   * and its journal is not Xcode.app's.
    */
   private async addXcodeActions(
     procs: ReturnType<typeof parsePsOutput>,
@@ -161,11 +167,15 @@ export class ProcessObserver {
     } catch {
       return;
     }
-    const serviceStart = service.startedAt;
+    const sessionStart = xcodeAppOf(procs, service)?.startedAt ?? null;
+    const notBefore = Math.max(
+      service.startedAt !== null ? service.startedAt - SERVICE_START_SLACK_MS : -Infinity,
+      sessionStart !== null ? sessionStart - SESSION_START_SLACK_MS : -Infinity,
+    );
     const terminal = activities.filter((entry) => !entry.isDaemon);
     const kept: XcodeAction[] = [];
     for (const action of actions) {
-      if (serviceStart !== null && action.startedAt < serviceStart - SERVICE_START_SLACK_MS) continue;
+      if (action.startedAt < notBefore) continue;
       if (await this.runByTerminal(action.root, terminal)) continue;
       kept.push(action);
     }
@@ -199,17 +209,24 @@ export class ProcessObserver {
   }
 
   /**
-   * Is a terminal build working in this root — naming it, or building the
-   * workspace it belongs to (by path, or as the one in its directory)?
+   * Is a terminal build working in this root? A build that names its
+   * DerivedData (`-derivedDataPath`, or its compilers' arguments) works there
+   * and nowhere else — the same workspace built by Xcode.app into another
+   * root is not its. Only a build that names none yet is judged by the
+   * workspace it builds (by path, or as the one in its directory), the way
+   * it will use the workspace's shared root.
    */
   private async runByTerminal(root: string, terminal: readonly LiveActivity[]): Promise<boolean> {
-    if (terminal.length === 0) return false;
-    if (terminal.some((build) => build.derivedDataPath === root || build.roots.includes(root))) {
-      return true;
-    }
+    const rootOf = (build: LiveActivity) =>
+      build.derivedDataPath !== null || build.roots.length > 0
+        ? build.derivedDataPath === root || build.roots.includes(root)
+        : null;
+    if (terminal.some((build) => rootOf(build) === true)) return true;
+    const unplaced = terminal.filter((build) => rootOf(build) === null);
+    if (unplaced.length === 0) return false;
     const workspace = await this.rootWorkspace(root);
     if (workspace === null) return false;
-    return terminal.some((build) => {
+    return unplaced.some((build) => {
       const cwd = build.cwd !== null && isAbsolute(build.cwd) ? build.cwd : null;
       if (build.container !== null) {
         const container = isAbsolute(build.container)

@@ -757,3 +757,27 @@ export function quietServiceActivity(proc: ObservedProcess, now: number): LiveAc
     isDaemon: true,
   };
 }
+
+/** `…/Xcode.app/Contents/MacOS/Xcode`, under whatever name the app has. */
+const XCODE_APP_RE = /\.app\/Contents\/MacOS\/Xcode$/;
+
+/**
+ * The Xcode.app process a build service belongs to: the one above it, else
+ * the only one running. Null when that cannot be told.
+ */
+export function xcodeAppOf(
+  procs: readonly ObservedProcess[],
+  service: ObservedProcess,
+): ObservedProcess | null {
+  const isXcode = (proc: ObservedProcess) => proc.comm === "Xcode" && XCODE_APP_RE.test(argv0(proc.args));
+  const byPid = new Map(procs.map((proc) => [proc.pid, proc]));
+  const seen = new Set<number>([service.pid]);
+  let cursor = byPid.get(service.ppid);
+  while (cursor && !seen.has(cursor.pid)) {
+    if (isXcode(cursor)) return cursor;
+    seen.add(cursor.pid);
+    cursor = byPid.get(cursor.ppid);
+  }
+  const apps = procs.filter(isXcode);
+  return apps.length === 1 ? apps[0]! : null;
+}

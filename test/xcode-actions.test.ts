@@ -440,3 +440,163 @@ function crashed(root: string): Run {
     hostId: MBP,
   };
 }
+
+describe("review of 4a750ba", () => {
+  const APP = "/Applications/Xcode.app/Contents/MacOS/Xcode";
+  const SERVICE =
+    "/Applications/Xcode.app/Contents/SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/SWBBuildService.bundle/Contents/MacOS/SWBBuildService";
+  const NOW = Date.UTC(2026, 10, 11, 18, 44, 16);
+  const store = () => {
+    const db = new Database(":memory:") as unknown as Db;
+    for (const statement of MIGRATIONS) db.prepare(statement).run();
+    return new Store(db);
+  };
+  /** Xcode.app and its service, up this long, plus any other processes. */
+  const ps = (xcode: string, service: string, extra: string[] = []) =>
+    [
+      `    1     0 10-00:00:00 /sbin/launchd`,
+      `  700     1 ${xcode} ${APP}`,
+      `12000   700 ${service} ${SERVICE}`,
+      ...extra,
+      "",
+    ].join("\n");
+
+  describe("a build-only action adopted after a restart", () => {
+    const service = (actionStartedAt: number): LiveActivity => ({
+      pid: 12000,
+      comm: "SWBBuildService",
+      args: SERVICE,
+      startedAt: NOW - 3_600_000,
+      roots: ["/dd/Amion"],
+      workerCount: 0,
+      phase: null,
+      currentFile: null,
+      isDaemon: true,
+      kind: "unknown",
+      scheme: null,
+      container: "/w/Amion.xcworkspace",
+      configuration: null,
+      destination: null,
+      derivedDataPath: null,
+      resultBundlePath: null,
+      cwd: null,
+      actionStartedAt,
+    });
+    const a = NOW - 60_000;
+
+    function adopted() {
+      const runs = store();
+      new Engine(runs, { projectFor: () => null, threadFor: () => null, log: () => undefined }).foldSnapshot(
+        [service(a)],
+        NOW,
+        MBP,
+      );
+      const after = new Engine(runs, { projectFor: () => null, threadFor: () => null, log: () => undefined });
+      after.hydrate(NOW + 1_000);
+      return { runs, after };
+    }
+
+    it("is not the next build, when that is what the first probe after it shows", () => {
+      const { runs, after } = adopted();
+      after.foldSnapshot([service(a + 90_000)], NOW + 40_000, MBP);
+      expect(
+        runs.listRuns({ limit: 10, includeNoise: true }).map((row) => [row.startedAt, row.status]),
+      ).toEqual([
+        [a + 90_000, "running"],
+        [a, "finishing"],
+      ]);
+    });
+
+    it("is still its own build when that is what the first probe shows", () => {
+      const { runs, after } = adopted();
+      after.foldSnapshot([service(a)], NOW + 2_000, MBP);
+      expect(
+        runs.listRuns({ limit: 10, includeNoise: true }).map((row) => [row.startedAt, row.status]),
+      ).toEqual([[a, "running"]]);
+    });
+  });
+
+  describe("Xcode reopened right after a crash", () => {
+    async function idle(dir: string, table: string) {
+      const watch = new ProcessObserver({
+        ps: async () => table,
+        cwdOf: async () => null,
+        gitOf: async () => null,
+        actions: new DerivedDataActions(dir),
+      });
+      const runs = store();
+      const engine = new Engine(runs, { projectFor: () => null, threadFor: () => null, log: () => undefined });
+      const seen = [];
+      for (let tick = 0; tick <= MISSES_BEFORE_FINISHING; tick += 1) {
+        const snapshot = (await watch.snapshot(NOW + tick * 2_000))!;
+        seen.push(snapshot.length);
+        engine.foldSnapshot(snapshot, NOW + tick * 2_000, MBP);
+      }
+      return { seen, runs: runs.listRuns({ limit: 10, includeNoise: true }) };
+    }
+
+    it("does not take the crashed session's unfinished bundle for an action", async () => {
+      const { dir, root } = derivedData();
+      // The test began at 18:43:46Z; Xcode crashed, was reopened ten seconds
+      // later, and its new service started ten seconds after that.
+      testBundle(root, "Test-Amion-2026.11.11_08-43-46--1000.xcresult", false);
+      expect(await idle(dir, ps("00:20", "00:10"))).toEqual({ seen: [0, 0, 0, 0], runs: [] });
+    });
+
+    it("nor its build's journal", async () => {
+      const { dir, root } = derivedData();
+      const data = join(root, "Build/Intermediates.noindex/XCBuildData");
+      mkdirSync(data, { recursive: true });
+      const journal = join(data, "build.db-journal");
+      writeFileSync(journal, "");
+      utimesSync(journal, new Date(NOW - 30_000), new Date(NOW - 30_000));
+      expect(await idle(dir, ps("00:20", "00:10"))).toEqual({ seen: [0, 0, 0, 0], runs: [] });
+    });
+
+    it("while this session's action, named before its service started, is one", async () => {
+      const { dir, root } = derivedData();
+      const bundle = testBundle(root, "Test-Amion-2026.11.11_08-43-46--1000.xcresult", false);
+      const { seen, runs } = await idle(dir, ps("01:00:00", "00:10"));
+      expect(seen).toEqual([1, 1, 1, 1]);
+      expect(runs).toMatchObject([{ status: "running", bundlePath: bundle }]);
+    });
+  });
+
+  describe("Xcode.app testing while a terminal builds the same workspace elsewhere", () => {
+    it("keeps the IDE's action, which is in a root the terminal build does not use", async () => {
+      const { base, dir, root } = derivedData();
+      const bundle = testBundle(root, "Test-Amion-2026.11.11_08-43-46--1000.xcresult", false);
+      const checkout = join(base, "ios-amion-v2-2");
+      const own = join(checkout, ".build-cli");
+      const terminals = [
+        // Its own DerivedData, by argument...
+        `  950     1 00:20 /usr/bin/xcodebuild -workspace Amion.xcworkspace -scheme Amion -derivedDataPath .build-cli build`,
+        // ...or as its compilers name it.
+        `  960     1 00:20 /usr/bin/xcodebuild -workspace Amion.xcworkspace -scheme Amion build`,
+        `  961   960 00:02 /usr/bin/clang -c /src/App/main.m -o ${own}/Build/Intermediates.noindex/App.build/main.o`,
+      ];
+      for (const lines of [terminals.slice(0, 1), terminals.slice(1)]) {
+        const watch = new ProcessObserver({
+          ps: async () => ps("01:00:00", "00:50:00", lines),
+          cwdOf: async (pid) => (pid === 12000 ? "/" : checkout),
+          gitOf: async () => null,
+          actions: new DerivedDataActions(dir),
+        });
+        const runs = store();
+        const engine = new Engine(runs, { projectFor: () => null, threadFor: () => null, log: () => undefined });
+        // Minutes of the simulator running the tests: the service has no
+        // children, and the terminal build goes on beside it.
+        for (let tick = 0; tick <= MISSES_BEFORE_FINISHING; tick += 1) {
+          const snapshot = (await watch.snapshot(NOW + tick * 2_000))!;
+          expect(snapshot.find((activity) => activity.pid === 12000)).toMatchObject({
+            roots: [root],
+            resultBundlePath: bundle,
+          });
+          engine.foldSnapshot(snapshot, NOW + tick * 2_000, MBP);
+        }
+        const ide = runs.listRuns({ limit: 10, includeNoise: true }).filter((run) => run.pid === 12000);
+        expect(ide).toMatchObject([{ status: "running", root, bundlePath: bundle }]);
+      }
+    });
+  });
+});

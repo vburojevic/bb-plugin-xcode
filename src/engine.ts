@@ -133,6 +133,12 @@ interface LiveEntry {
   container: string | null;
   /** For a build service: when the Xcode action it serves began. */
   actionStartedAt?: number | null;
+  /**
+   * When the run began as far as it knows: its row's start. Its action, once
+   * named, cannot have begun after it — the run was already that action when
+   * it was first seen — so an action that did is the next one.
+   */
+  runStartedAt: number;
   /** The result bundle the run is known to write, once it is. */
   bundlePath?: string | null;
   misses: number;
@@ -181,7 +187,7 @@ export function observedRunId(hostId: string | null, pid: number, startedAt: num
 
 /** Is a build service now serving another root or workspace than its run's? */
 function switchedBuild(
-  entry: Pick<LiveEntry, "root" | "container" | "actionStartedAt" | "bundlePath">,
+  entry: Pick<LiveEntry, "root" | "container" | "actionStartedAt" | "bundlePath" | "runStartedAt">,
   activity: LiveActivity,
 ): boolean {
   // Another test action: every one writes a bundle of its own.
@@ -192,6 +198,13 @@ function switchedBuild(
   const began = activity.actionStartedAt ?? null;
   const was = entry.actionStartedAt ?? null;
   if (began !== null && was !== null && Math.abs(began - was) > ACTION_SLACK_MS) return true;
+  // A run that has not learned its action's start yet — first seen through
+  // children alone, or adopted after a restart with nothing on disk to name
+  // it — still knows when it was already running. An action that began after
+  // that is not its own, whichever snapshot shows it first. (Should Xcode
+  // name a build's journal only after its first compilers are seen, one
+  // build reads as two runs; never two builds as one.)
+  if (began !== null && was === null && began > entry.runStartedAt + ACTION_SLACK_MS) return true;
   const root = activity.derivedDataPath ?? activity.roots[0] ?? null;
   if (entry.root !== null && root !== null) return !activity.roots.includes(entry.root) && root !== entry.root;
   if (entry.container !== null && activity.container !== null) {
@@ -249,6 +262,7 @@ export class Engine {
             ? (parseTestBundleName(basename(run.bundlePath ?? ""))?.startedAt ?? null)
             : null,
           bundlePath: run.bundlePath,
+          runStartedAt: run.startedAt,
           misses: 0,
           lastSeenAt: now,
           expectedStartedAt: run.startedAt,
@@ -439,6 +453,7 @@ export class Engine {
         container: activity.container,
         actionStartedAt: activity.actionStartedAt ?? null,
         bundlePath: activity.resultBundlePath,
+        runStartedAt: startedAt,
         misses: 0,
         lastSeenAt: now,
         sawWork: Boolean(activity.phase && activity.phase !== "preparing"),
