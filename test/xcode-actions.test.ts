@@ -752,3 +752,87 @@ describe("review of eb9291b", () => {
     });
   });
 });
+
+describe("review of 85c41cd: a stable and a beta Xcode, each with its own service", () => {
+  const NOW = Date.UTC(2026, 10, 11, 18, 44, 16);
+  const STABLE = "/Applications/Xcode.app";
+  const BETA = "/Applications/Xcode-beta.app";
+  const service = (app: string) =>
+    `${app}/Contents/SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/SWBBuildService.bundle/Contents/MacOS/SWBBuildService`;
+  const compiler = (pid: number, parent: number, root: string) =>
+    `${String(pid).padStart(5)} ${String(parent).padStart(5)} 00:02 ${STABLE}/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend -frontend -c -primary-file /src/App/File.swift -o ${root}/Build/Intermediates.noindex/App.build/Debug-iphonesimulator/App.build/Objects-normal/arm64/File.o`;
+  /** Beta open for hours; stable reopened 10 s ago, its service up 5 s. */
+  const table = (betaFirst: boolean, extra: string[] = []) => {
+    const beta = [`  800     1 05:00:00 ${BETA}/Contents/MacOS/Xcode`, `13000   800 04:00:00 ${service(BETA)}`];
+    const stable = [`  700     1 00:10 ${STABLE}/Contents/MacOS/Xcode`, `12000   700 00:05 ${service(STABLE)}`];
+    return [`    1     0 10-00:00:00 /sbin/launchd`, ...(betaFirst ? [...beta, ...stable] : [...stable, ...beta]), ...extra, ""].join("\n");
+  };
+  const store = () => {
+    const db = new Database(":memory:") as unknown as Db;
+    for (const statement of MIGRATIONS) db.prepare(statement).run();
+    return new Store(db);
+  };
+  async function probes(dir: string, ps: string) {
+    const watch = new ProcessObserver({
+      ps: async () => ps,
+      cwdOf: async () => "/",
+      gitOf: async () => null,
+      actions: new DerivedDataActions(dir),
+    });
+    const runs = store();
+    const engine = new Engine(runs, { projectFor: () => null, threadFor: () => null, log: () => undefined });
+    const seen: LiveActivity[][] = [];
+    for (let tick = 0; tick <= MISSES_BEFORE_FINISHING; tick += 1) {
+      const snapshot = (await watch.snapshot(NOW + tick * 2_000))!;
+      seen.push(snapshot);
+      engine.foldSnapshot(snapshot, NOW + tick * 2_000, MBP);
+    }
+    return { seen, runs: runs.listRuns({ limit: 10, includeNoise: true }) };
+  }
+  /** Stable's test began 20 s ago and stable crashed; so did a build's journal. */
+  function crashed() {
+    const fixture = derivedData();
+    testBundle(fixture.root, "Test-Amion-2026.11.11_08-43-56--1000.xcresult", false);
+    const data = join(fixture.root, "Build/Intermediates.noindex/XCBuildData");
+    mkdirSync(data, { recursive: true });
+    const journal = join(data, "build.db-journal");
+    writeFileSync(journal, "");
+    utimesSync(journal, new Date(NOW - 20_000), new Date(NOW - 20_000));
+    return fixture;
+  }
+
+  for (const betaFirst of [true, false]) {
+    const order = betaFirst ? "beta listed first" : "stable listed first";
+
+    it(`never makes stable's abandoned bundle or journal beta's build (${order})`, async () => {
+      const { dir } = crashed();
+      expect(await probes(dir, table(betaFirst))).toEqual({ seen: [[], [], [], []], runs: [] });
+    });
+
+    it(`gives beta the action in the root its compilers work in (${order})`, async () => {
+      const { dir, root } = derivedData();
+      // Beta's own test, begun under it a minute ago, still compiling.
+      const bundle = testBundle(root, "Test-Amion-2026.11.11_08-43-16--1000.xcresult", false);
+      const { seen, runs } = await probes(dir, table(betaFirst, [compiler(9000, 13000, root)]));
+      for (const snapshot of seen) {
+        expect(snapshot).toMatchObject([{ pid: 13000, roots: [root], resultBundlePath: bundle, kind: "test" }]);
+      }
+      expect(runs).toMatchObject([{ pid: 13000, status: "running", bundlePath: bundle }]);
+    });
+
+    it(`gives restarted stable its own new action, and beta nothing of stable's crash (${order})`, async () => {
+      const { base, dir, root: crashedRoot } = crashed();
+      // Stable's new test, in another workspace, begun after it reopened.
+      const other = makeDerivedRoot(join(dir, "Other-zyxwvutsrqponmlkjihgfedcbazy"), {
+        workspace: join(base, "Other/Other.xcworkspace"),
+      });
+      const bundle = testBundle(other, "Test-Other-2026.11.11_08-44-14--1000.xcresult", false);
+      const { seen, runs } = await probes(dir, table(betaFirst, [compiler(9000, 12000, other)]));
+      for (const snapshot of seen) {
+        expect(snapshot).toMatchObject([{ pid: 12000, roots: [other], resultBundlePath: bundle }]);
+        expect(snapshot.flatMap((activity) => activity.roots)).not.toContain(crashedRoot);
+      }
+      expect(runs).toMatchObject([{ pid: 12000, status: "running", bundlePath: bundle }]);
+    });
+  }
+});

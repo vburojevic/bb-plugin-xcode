@@ -151,52 +151,72 @@ export class ProcessObserver {
    * will be read from. Only while a service process exists, only actions
    * that began under this service and this Xcode.app, and never one a
    * terminal `xcodebuild` is running: that build is already its own activity,
-   * and its journal is not Xcode.app's.
+   * and its journal is not Xcode.app's. With several services running (two
+   * Xcodes), each keeps only the actions in roots its children work in.
    */
   private async addXcodeActions(
     procs: ReturnType<typeof parsePsOutput>,
     activities: LiveActivity[],
     now: number,
   ): Promise<void> {
-    const service = buildServices(procs)[0];
-    if (!service) return;
-    let activity = activities.find((entry) => entry.pid === service.pid);
-    const seenRoots = activity ? [...activity.roots] : [];
-    let actions: XcodeAction[];
+    const services = buildServices(procs);
+    if (services.length === 0) return;
+    const working = new Map<number, string[]>();
+    for (const service of services) {
+      working.set(service.pid, [...(activities.find((entry) => entry.pid === service.pid)?.roots ?? [])]);
+    }
+    let found: XcodeAction[];
     try {
-      actions = await this.actions.inProgress(now, seenRoots);
+      found = await this.actions.inProgress(now, [...working.values()].flat());
     } catch {
       return;
     }
-    const notBefore = actionsNotBefore(service.startedAt, xcodeAppOf(procs, service)?.startedAt ?? null);
-    if (notBefore === null) return;
     const terminal = activities.filter((entry) => !entry.isDaemon);
-    const kept: XcodeAction[] = [];
-    for (const action of actions) {
-      if (action.startedAt < notBefore) continue;
-      if (await this.runByTerminal(action.root, terminal)) continue;
-      kept.push(action);
+    const actions: XcodeAction[] = [];
+    for (const action of found) {
+      if (!(await this.runByTerminal(action.root, terminal))) actions.push(action);
     }
-    actions = kept;
-    // The action of a root the service is visibly working in, else the one
-    // action there is. Two at once with no other clue: liveness, no claim.
-    const own = actions.filter((action) => seenRoots.includes(action.root));
-    const roots = new Set(actions.map((action) => action.root));
-    const tests = actions.filter((action) => action.kind === "test");
-    const chosen =
-      own.find((action) => action.kind === "test") ??
-      own[0] ??
-      (tests.length === 1 ? tests[0] : null) ??
-      (roots.size === 1 ? actions[0] : null);
     if (actions.length === 0) return;
-    if (!activity) {
-      activity = quietServiceActivity(service, now);
-      activities.push(activity);
+
+    for (const service of services) {
+      const notBefore = actionsNotBefore(service.startedAt, xcodeAppOf(procs, service)?.startedAt ?? null);
+      if (notBefore === null) continue;
+      const seenRoots = working.get(service.pid)!;
+      const mine = actions.filter((action) => action.startedAt >= notBefore);
+      // A root the service is visibly working in is its own, whatever else
+      // runs on this Mac.
+      const own = mine.filter((action) => seenRoots.includes(action.root));
+      if (own.length > 0) {
+        this.credit(activities.find((entry) => entry.pid === service.pid)!, own, mine);
+        continue;
+      }
+      // Evidence on disk alone names no service. With one, it is that one's;
+      // with several (a stable and a beta Xcode, each with its own), any of
+      // them could have left it, and the one whose session would rule it out
+      // as a leftover may not be the one asked. So none is: a quiet action
+      // goes unseen until its service's children show it, rather than a
+      // crashed session's bundle showing as another Xcode's build.
+      if (services.length > 1) continue;
+      const roots = new Set(mine.map((action) => action.root));
+      const tests = mine.filter((action) => action.kind === "test");
+      // The one action there is. Two at once with no other clue: liveness, no claim.
+      const chosen = (tests.length === 1 ? tests[0] : null) ?? (roots.size === 1 ? mine[0] : null);
+      if (mine.length === 0) continue;
+      let activity = activities.find((entry) => entry.pid === service.pid);
+      if (!activity) {
+        activity = quietServiceActivity(service, now);
+        activities.push(activity);
+      }
+      if (chosen) this.credit(activity, [chosen], mine);
     }
-    if (!chosen) return;
+  }
+
+  /** Give a service's activity the action it is serving: the test first. */
+  private credit(activity: LiveActivity, candidates: readonly XcodeAction[], all: readonly XcodeAction[]): void {
+    const chosen = candidates.find((action) => action.kind === "test") ?? candidates[0]!;
     if (!activity.roots.includes(chosen.root)) activity.roots.unshift(chosen.root);
     activity.actionStartedAt = Math.min(
-      ...actions.filter((action) => action.root === chosen.root).map((action) => action.startedAt),
+      ...all.filter((action) => action.root === chosen.root).map((action) => action.startedAt),
     );
     if (chosen.kind === "test") {
       activity.kind = "test";
