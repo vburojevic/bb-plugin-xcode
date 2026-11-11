@@ -9,7 +9,18 @@
  * out as Xcode lays DerivedData out.
  */
 
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
@@ -341,5 +352,77 @@ describe("result bundles", () => {
       finalized: [bundle],
     });
     expect(await call("summarizeBundle", { path: bundle })).toMatchObject({ status: "ok" });
+  });
+});
+
+describe("Xcode.app's actions found on disk", () => {
+  /** Xcode's name for a test action's bundle, at a UTC time. */
+  const bundleName = (at: number) => {
+    const d = new Date(at);
+    const two = (n: number) => String(n).padStart(2, "0");
+    return `Test-Amion-${d.getUTCFullYear()}.${two(d.getUTCMonth() + 1)}.${two(d.getUTCDate())}_${two(d.getUTCHours())}-${two(d.getUTCMinutes())}-${two(d.getUTCSeconds())}-+0000.xcresult`;
+  };
+
+  it("never makes a bundle found on disk one the worker may read from anywhere", async () => {
+    const { machine, call, root, base, dataDir, restartWorker } = setup();
+    machine.ps = xcodeAppPs({ servicePid: 812 });
+
+    // A link with a test action's name, into a bundle another checkout is
+    // still writing: not an action of this root, and not readable through it.
+    const outside = join(base, "Elsewhere/Other.xcresult");
+    mkdirSync(join(outside, "Data"), { recursive: true });
+    const link = join(root, "Logs/Test", bundleName(NOW - 60_000));
+    symlinkSync(outside, link);
+    expect(await call("probe", {})).toEqual({ activities: [] });
+    writeFileSync(join(outside, "Info.plist"), "");
+    expect(await call("summarizeBundle", { path: link })).toMatchObject({ status: "refused" });
+    await restartWorker();
+    expect(await call("summarizeBundle", { path: link })).toMatchObject({ status: "refused" });
+
+    // A real one is the action's, and is read where it is, by that root's
+    // fence — it never joins the paths builds here named.
+    rmSync(link);
+    const bundle = join(root, "Logs/Test", bundleName(NOW - 30_000));
+    mkdirSync(join(bundle, "Data"), { recursive: true });
+    const { activities } = await call<{ activities: Activity[] }>("probe", {});
+    expect(activities).toMatchObject([{ pid: 812, resultBundlePath: bundle }]);
+    const observed = join(dataDir, "observed-bundles.json");
+    expect(existsSync(observed) ? readFileSync(observed, "utf8") : "").not.toContain(bundle);
+    writeFileSync(join(bundle, "Info.plist"), "");
+    expect(await call("summarizeBundle", { path: bundle })).toMatchObject({ status: "ok" });
+  });
+
+  it("does not give a terminal build's journal to an idle Xcode", async () => {
+    const { machine, call, root, dataDir, checkout } = setup();
+    const data = join(root, "Build/Intermediates.noindex/XCBuildData");
+    mkdirSync(data, { recursive: true });
+    const journal = join(data, "build.db-journal");
+    writeFileSync(journal, "");
+    // Set back to when the build began; the birth time follows on macOS.
+    utimesSync(journal, new Date(NOW - 30_000), new Date(NOW - 30_000));
+
+    // A tracked build through the worker, in the workspace's shared
+    // DerivedData, still planning: nothing under it names the root yet.
+    const tracked = join(dataDir, "builds", "mvv-0123456789ab", "result.xcresult");
+    machine.ps = xcodeAppPs({
+      servicePid: 812,
+      extra: [
+        `  900     1 00:30 /bin/sh -c wrapper`,
+        `  901   900 00:30 /usr/bin/xcodebuild -workspace Amion.xcworkspace -scheme Amion build -resultBundlePath ${tracked}`,
+      ].join("\n"),
+    });
+    machine.cwds.set(901, checkout);
+    expect(await call("probe", {})).toEqual({ activities: [] });
+
+    // Once it names the root, the same.
+    machine.ps = xcodeAppPs({
+      servicePid: 812,
+      extra: [
+        `  900     1 00:30 /bin/sh -c wrapper`,
+        `  901   900 00:30 /usr/bin/xcodebuild -scheme Amion build -resultBundlePath ${tracked}`,
+        ` 9100   901 00:02 /usr/bin/clang -c /src/App/main.m -o ${root}/Build/Intermediates.noindex/App.build/main.o`,
+      ].join("\n"),
+    });
+    expect(await call("probe", {})).toEqual({ activities: [] });
   });
 });

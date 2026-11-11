@@ -87,7 +87,10 @@ dir. What it reads is fenced on that Mac, with symlinks resolved there:
 - result bundles only in a root's `Logs/Test`, in the plugin's own shim
   directory, or at a `-resultBundlePath` that a build on that Mac was seen
   using. A path the server names that is none of these is refused, so the
-  server can no longer name an arbitrary bundle to parse;
+  server can no longer name an arbitrary bundle to parse. A bundle or
+  `build.db-journal` found on disk as evidence of an Xcode.app action counts
+  only as a real directory or file inside its root, never through a link, and
+  never joins the list of paths builds named;
 - checkouts to scan for DerivedData only as existing directories, walked
   without following links.
 

@@ -110,6 +110,11 @@ export interface LiveActivity extends ActivityAttribution {
    * Xcode opened; this is the build's.
    */
   actionStartedAt?: number | null;
+  /**
+   * `resultBundlePath` was found on disk, not named by the build: it is
+   * evidence of an action, never a path the build asked to have read.
+   */
+  resultBundleFound?: boolean;
 }
 
 /** One entry from a `LogStoreManifest.plist` `logs` dict. */

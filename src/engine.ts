@@ -24,7 +24,8 @@ import { isHostBuildRun, type Store } from "./store";
 import type { LiveActivity } from "./types";
 import type { BuildResults, TestResults } from "./types";
 import type { BackgroundCommandOutcome } from "./thread-outcome";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { parseTestBundleName } from "./xcode-actions";
 
 /**
  * Consecutive probe misses before a running process is considered gone.
@@ -180,9 +181,12 @@ export function observedRunId(hostId: string | null, pid: number, startedAt: num
 
 /** Is a build service now serving another root or workspace than its run's? */
 function switchedBuild(
-  entry: Pick<LiveEntry, "root" | "container" | "actionStartedAt">,
+  entry: Pick<LiveEntry, "root" | "container" | "actionStartedAt" | "bundlePath">,
   activity: LiveActivity,
 ): boolean {
+  // Another test action: every one writes a bundle of its own.
+  const bundle = activity.resultBundlePath;
+  if (bundle !== null && entry.bundlePath && bundle !== entry.bundlePath) return true;
   // Another action began: back to back in one workspace, with no quiet
   // snapshot between them to end the first.
   const began = activity.actionStartedAt ?? null;
@@ -239,6 +243,11 @@ export class Engine {
           pid: run.pid,
           root: run.root,
           container: run.container,
+          // A test action's bundle names the second it began: the identity
+          // the next action is told apart by survives a restart with it.
+          actionStartedAt: isBuildServiceCommand(run.cmdline)
+            ? (parseTestBundleName(basename(run.bundlePath ?? ""))?.startedAt ?? null)
+            : null,
           bundlePath: run.bundlePath,
           misses: 0,
           lastSeenAt: now,
@@ -354,19 +363,7 @@ export class Engine {
           delete tracked.expectedStartedAt;
           tracked.misses = 0;
           tracked.lastSeenAt = now;
-          // A test action's bundle can be named after the run began: claim it,
-          // so its verdict is read from that bundle when the action ends.
-          if (!tracked.bundlePath && activity.resultBundlePath) {
-            tracked.bundlePath = activity.resultBundlePath;
-            const current = this.store.getRun(tracked.runId);
-            if (current && current.bundlePath === null) {
-              current.bundlePath = activity.resultBundlePath;
-              if (activity.kind === "test") current.kind = "test";
-              current.scheme ??= activity.scheme;
-              this.store.updateRun(current);
-              changed = true;
-            }
-          }
+          if (this.learn(tracked, activity, hostId)) changed = true;
           if (activity.phase && activity.phase !== "preparing") {
             tracked.sawWork = true;
           }
@@ -463,6 +460,54 @@ export class Engine {
       if (this.retire(entry, now)) changed = true;
     }
 
+    return changed;
+  }
+
+  /**
+   * What a later snapshot of a run's process knows that its first did not.
+   *
+   * Xcode.app's build service is often first seen through children that name
+   * no project — SDK modules compiled before any of the project's — and only
+   * a few probes later through its action on disk: the action's start, its
+   * bundle, its root and so its workspace. All of it is kept the moment it
+   * arrives: the start and bundle tell the next action from this one, and
+   * the root and workspace put the run on its project and thread while it is
+   * still running. Only what is missing is filled; nothing known is replaced.
+   */
+  private learn(tracked: LiveEntry, activity: LiveActivity, hostId: string | null): boolean {
+    tracked.actionStartedAt ??= activity.actionStartedAt ?? null;
+    const root = activity.derivedDataPath ?? activity.roots[0] ?? null;
+    const bundle = !tracked.bundlePath ? activity.resultBundlePath : null;
+    const newRoot = tracked.root === null ? root : null;
+    const newContainer = tracked.container === null ? activity.container : null;
+    if (!bundle && !newRoot && !newContainer) return false;
+    tracked.bundlePath ||= bundle;
+    tracked.root ??= newRoot;
+    tracked.container ??= newContainer;
+
+    const run = this.store.getRun(tracked.runId);
+    if (!run) return false;
+    let changed = false;
+    // A test action's bundle can be named after the run began: claim it, so
+    // its verdict is read from that bundle when the action ends.
+    if (bundle && run.bundlePath === null) {
+      run.bundlePath = bundle;
+      if (activity.kind === "test") run.kind = "test";
+      run.scheme ??= activity.scheme;
+      changed = true;
+    }
+    if ((newRoot && run.root === null) || (newContainer && run.container === null)) {
+      run.root ??= newRoot;
+      run.container ??= newContainer;
+      run.cwd ??= activity.cwd;
+      run.branch ??= activity.branch ?? null;
+      run.worktree ??= activity.worktree ?? null;
+      const signals = { root: run.root, cwd: run.cwd, container: run.container };
+      run.projectId ??= this.hooks.projectFor(signals, hostId);
+      run.threadId ??= this.hooks.threadFor(signals, hostId);
+      changed = true;
+    }
+    if (changed) this.store.updateRun(run);
     return changed;
   }
 

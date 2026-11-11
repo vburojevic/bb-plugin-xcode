@@ -103,7 +103,9 @@ export class HostWatch {
       // only this Mac knows; the server stores what it is told as the path.
       const bundle = absoluteFrom(activity.resultBundlePath, activity.cwd);
       if (bundle !== null && isUnder(bundle, this.buildsDir)) continue;
-      if (bundle !== null) await this.remember(bundle);
+      // Only a path a build named joins the bundles it may read; one found on
+      // disk is read where it was found, under that root's fence, or not at all.
+      if (bundle !== null && !activity.resultBundleFound) await this.remember(bundle);
       activities.push(toWire({ ...activity, resultBundlePath: bundle }));
     }
     if (activities.length > MAX_ACTIVITIES) {

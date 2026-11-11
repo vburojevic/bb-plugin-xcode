@@ -10,7 +10,7 @@
  * Import-light on purpose: `host.ts` bundles it.
  */
 
-import { join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { readTextFileBounded } from "./bounded-file";
 import { processCwd, psSnapshot } from "./exec";
@@ -24,6 +24,13 @@ import { DerivedDataActions, type XcodeAction, type XcodeActionSource } from "./
 const MAX_ROOT_INFO_BYTES = 64 * 1024;
 /** Directories recur; the caches only have to cover a working set. */
 const MAX_CACHE_ENTRIES = 500;
+/**
+ * How long before its build service's own start an action may have begun and
+ * still be that service's. Xcode names a test action's bundle first and may
+ * only then launch a service to build it; anything older was left by an
+ * earlier service — a crash's unfinished bundle, a hot journal.
+ */
+const SERVICE_START_SLACK_MS = 60_000;
 
 /**
  * The workspace or project a DerivedData root belongs to.
@@ -94,15 +101,16 @@ export class ProcessObserver {
 
     const procs = parsePsOutput(stdout, now);
     const activities = findRootActivities(procs);
+    // Each build's directory first: it is what says which workspace a
+    // terminal build owns, before Xcode.app's service is given an action.
+    for (const activity of activities) {
+      if (signal?.aborted) return null;
+      activity.cwd = await this.cwdFor(activity.pid);
+    }
     await this.addXcodeActions(procs, activities, now);
     for (const activity of activities) {
       if (signal?.aborted) return null;
-      let cwd = this.cwdCache.get(activity.pid);
-      if (cwd === undefined) {
-        cwd = await this.cwdOf(activity.pid);
-        this.cwdCache.set(activity.pid, cwd);
-      }
-      activity.cwd = cwd;
+      activity.cwd = await this.cwdFor(activity.pid);
       if (activity.container === null) {
         activity.container = await this.workspaceFor(activity);
       }
@@ -116,6 +124,15 @@ export class ProcessObserver {
     return activities;
   }
 
+  private async cwdFor(pid: number): Promise<string | null> {
+    let cwd = this.cwdCache.get(pid);
+    if (cwd === undefined) {
+      cwd = await this.cwdOf(pid);
+      this.cwdCache.set(pid, cwd);
+    }
+    return cwd;
+  }
+
   /**
    * Give Xcode.app's build service the action it is serving.
    *
@@ -124,7 +141,10 @@ export class ProcessObserver {
    * which reads only the process tree. An action in progress in DerivedData
    * keeps it in the snapshot, says which root (so workspace, so thread) from
    * its first second, when it began, and for a test, the bundle its verdict
-   * will be read from. Only while a service process exists.
+   * will be read from. Only while a service process exists, only actions
+   * that began under this service, and never one a terminal `xcodebuild` is
+   * running: that build is already its own activity, and its journal is not
+   * Xcode.app's.
    */
   private async addXcodeActions(
     procs: ReturnType<typeof parsePsOutput>,
@@ -141,6 +161,15 @@ export class ProcessObserver {
     } catch {
       return;
     }
+    const serviceStart = service.startedAt;
+    const terminal = activities.filter((entry) => !entry.isDaemon);
+    const kept: XcodeAction[] = [];
+    for (const action of actions) {
+      if (serviceStart !== null && action.startedAt < serviceStart - SERVICE_START_SLACK_MS) continue;
+      if (await this.runByTerminal(action.root, terminal)) continue;
+      kept.push(action);
+    }
+    actions = kept;
     // The action of a root the service is visibly working in, else the one
     // action there is. Two at once with no other clue: liveness, no claim.
     const own = actions.filter((action) => seenRoots.includes(action.root));
@@ -164,8 +193,34 @@ export class ProcessObserver {
     if (chosen.kind === "test") {
       activity.kind = "test";
       activity.resultBundlePath = chosen.bundlePath;
+      activity.resultBundleFound = true;
       activity.scheme ??= chosen.scheme;
     }
+  }
+
+  /**
+   * Is a terminal build working in this root — naming it, or building the
+   * workspace it belongs to (by path, or as the one in its directory)?
+   */
+  private async runByTerminal(root: string, terminal: readonly LiveActivity[]): Promise<boolean> {
+    if (terminal.length === 0) return false;
+    if (terminal.some((build) => build.derivedDataPath === root || build.roots.includes(root))) {
+      return true;
+    }
+    const workspace = await this.rootWorkspace(root);
+    if (workspace === null) return false;
+    return terminal.some((build) => {
+      const cwd = build.cwd !== null && isAbsolute(build.cwd) ? build.cwd : null;
+      if (build.container !== null) {
+        const container = isAbsolute(build.container)
+          ? build.container
+          : cwd !== null
+            ? resolve(cwd, build.container)
+            : null;
+        return container === workspace;
+      }
+      return cwd !== null && resolve(cwd) === dirname(workspace);
+    });
   }
 
   /** The cached workspace of a root, read once. */

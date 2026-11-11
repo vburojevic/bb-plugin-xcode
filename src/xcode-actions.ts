@@ -23,14 +23,16 @@
  *
  * Both name their root, so they also say which workspace (its `info.plist`)
  * and so which thread. They are read only while a build service process
- * exists — no Xcode, no action — and are bounded in age, so a bundle or
- * journal a crash left behind cannot keep a run alive for long.
+ * exists — no Xcode, no action — and only as what they are on disk: a bundle
+ * or journal that is a link, or leads out of its root, is not evidence of
+ * anything. The observer also drops any that predate the service it would be
+ * given to (a crash's leftovers), and they are bounded in age.
  */
 
-import { readdir, stat } from "node:fs/promises";
+import { lstat, readdir, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 
-import { DEFAULT_DERIVED_DATA, discoverDefaultRoots } from "./discovery";
+import { DEFAULT_DERIVED_DATA } from "./discovery";
 
 /** An action older than this is a leftover, not one still running. */
 export const MAX_ACTION_AGE_MS = 3 * 3_600_000;
@@ -73,13 +75,20 @@ export function parseTestBundleName(name: string): { scheme: string; startedAt: 
 export class DerivedDataActions implements XcodeActionSource {
   private roots: string[] = [];
   private rootsAt = -Infinity;
+  private listedAt: number | null = null;
 
   constructor(private readonly derivedDataDir: string = DEFAULT_DERIVED_DATA) {}
 
   async inProgress(now: number, extraRoots: readonly string[]): Promise<XcodeAction[]> {
-    if (now - this.rootsAt >= ROOTS_TTL_MS) {
-      this.roots = await discoverDefaultRoots(this.derivedDataDir);
+    // A new workspace's first action creates its root: the directory's own
+    // modification time says so on the next probe, not a minute later.
+    const listedAt = await stat(this.derivedDataDir)
+      .then((info) => info.mtimeMs)
+      .catch(() => null);
+    if (now - this.rootsAt >= ROOTS_TTL_MS || listedAt !== this.listedAt) {
+      this.roots = await listRoots(this.derivedDataDir);
       this.rootsAt = now;
+      this.listedAt = listedAt;
     }
     const roots = [...new Set([...this.roots, ...extraRoots])];
     const actions: XcodeAction[] = [];
@@ -91,6 +100,33 @@ export class DerivedDataActions implements XcodeActionSource {
     }
     return actions.sort((a, b) => b.startedAt - a.startedAt);
   }
+}
+
+/**
+ * Every directory in the shared DerivedData directory. Not only those with a
+ * log store yet: a first action's bundle can come before its `Logs/Build`.
+ */
+async function listRoots(derivedData: string): Promise<string[]> {
+  const entries = await readdir(derivedData, { withFileTypes: true }).catch(() => []);
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => join(derivedData, entry.name))
+    .sort();
+}
+
+/**
+ * Is `path` a real `kind` (no link at the end) that, links resolved, still
+ * sits inside `root`? Only then does it speak for an action in that root —
+ * and only then may it ever be read as that root's.
+ */
+async function isOwnEntry(path: string, root: string, kind: "directory" | "file"): Promise<boolean> {
+  const info = await lstat(path).catch(() => null);
+  if (!info || (kind === "directory" ? !info.isDirectory() : !info.isFile())) return false;
+  const [real, realRoot] = await Promise.all([
+    realpath(path).catch(() => null),
+    realpath(root).catch(() => null),
+  ]);
+  return real !== null && realRoot !== null && real.startsWith(`${realRoot}/`);
 }
 
 /** The newest test bundle of a root, when it has not been finalized yet. */
@@ -105,6 +141,7 @@ async function testInProgress(root: string, now: number): Promise<XcodeAction | 
   }
   // Only the newest can be running: a later one means it was left behind.
   if (!newest || now - newest.startedAt > MAX_ACTION_AGE_MS) return null;
+  if (!(await isOwnEntry(newest.path, root, "directory"))) return null;
   const finalized = await stat(join(newest.path, "Info.plist"))
     .then((info) => info.isFile())
     .catch(() => false);
@@ -121,6 +158,7 @@ async function testInProgress(root: string, now: number): Promise<XcodeAction | 
 /** A build holding its build database open, judged by the journal's age. */
 async function buildInProgress(root: string, now: number): Promise<XcodeAction | null> {
   const journal = join(root, "Build", "Intermediates.noindex", "XCBuildData", "build.db-journal");
+  if (!(await isOwnEntry(journal, root, "file"))) return null;
   const info = await stat(journal).catch(() => null);
   if (!info?.isFile()) return null;
   // Birth time where the file system keeps one; the change time otherwise.
@@ -128,4 +166,3 @@ async function buildInProgress(root: string, now: number): Promise<XcodeAction |
   if (now - startedAt > MAX_ACTION_AGE_MS) return null;
   return { root, kind: "build", startedAt, bundlePath: null, scheme: null };
 }
-
