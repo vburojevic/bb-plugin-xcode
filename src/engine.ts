@@ -20,7 +20,7 @@ import {
   VERDICT_STATUSES,
   statusTransitionAllowed,
 } from "./model";
-import type { Store } from "./store";
+import { isHostBuildRun, type Store } from "./store";
 import type { LiveActivity } from "./types";
 import type { BuildResults, TestResults } from "./types";
 import type { BackgroundCommandOutcome } from "./thread-outcome";
@@ -67,18 +67,27 @@ export function looksLikeBuildLauncher(command: string): boolean {
 }
 
 export interface EngineHooks {
-  /** Resolve which bb project owns a path, most specific wins. */
-  projectFor(signals: {
-    root?: string | null;
-    cwd?: string | null;
-    container?: string | null;
-  }): string | null;
-  /** Resolve which bb thread's environment contains a path, if any. */
-  threadFor(signals: {
-    root?: string | null;
-    cwd?: string | null;
-    container?: string | null;
-  }): string | null;
+  /**
+   * Resolve which bb project owns a path, most specific wins. `hostId` is the
+   * machine the path is on (null: this one); a path means nothing elsewhere.
+   */
+  projectFor(
+    signals: {
+      root?: string | null;
+      cwd?: string | null;
+      container?: string | null;
+    },
+    hostId: string | null,
+  ): string | null;
+  /** Resolve which bb thread's environment, on that machine, contains a path. */
+  threadFor(
+    signals: {
+      root?: string | null;
+      cwd?: string | null;
+      container?: string | null;
+    },
+    hostId: string | null,
+  ): string | null;
   /** Notify the host when a newly observed process becomes a tracked run. */
   onRunStarted?(run: Run): void;
   log(message: string): void;
@@ -107,6 +116,9 @@ export const RUNNING_MAX_AGE_MS = 12 * 3_600_000;
 
 interface LiveEntry {
   runId: string;
+  /** The machine whose process table this pid is in; null for this one. */
+  hostId: string | null;
+  pid: number;
   misses: number;
   lastSeenAt: number;
   /**
@@ -130,9 +142,44 @@ interface LiveEntry {
   sawWork?: boolean;
 }
 
+/**
+ * A live process's identity: its pid, on its machine.
+ *
+ * A pid alone stopped being enough once other Macs' process tables were folded
+ * in: two Macs hand out the same numbers, and keyed by pid, one Mac's build
+ * would have adopted — or retired — the other's.
+ */
+function liveKey(hostId: string | null, pid: number): string {
+  return `${hostId ?? ""}#${pid}`;
+}
+
+/**
+ * A process-observed run's id. This machine's keep the form they always had;
+ * another Mac's carry its host, because the same pid can start in the same
+ * second on two Macs.
+ */
+export function observedRunId(hostId: string | null, pid: number, startedAt: number): string {
+  const seconds = Math.round(startedAt / 1000);
+  return hostId === null ? `r:${pid}:${seconds}` : `r:${hostId}:${pid}:${seconds}`;
+}
+
+/**
+ * Is the process in a snapshot the one a run adopted at boot was started by?
+ *
+ * An `xcodebuild` must report the start time the run recorded. Xcode.app's
+ * build service cannot: the run started when the service picked up work, long
+ * after the service itself started. What a recycled pid cannot do is predate
+ * the run — a process that took over the number after a restart started after
+ * the build did — so for the service that is the test.
+ */
+function sameProcess(activity: LiveActivity, expectedStartedAt: number): boolean {
+  if (activity.isDaemon) return activity.startedAt <= expectedStartedAt + ADOPTION_SLACK_MS;
+  return Math.abs(activity.startedAt - expectedStartedAt) <= ADOPTION_SLACK_MS;
+}
+
 export class Engine {
-  /** Keyed by pid — the probe's identity for a live activity. */
-  private readonly live = new Map<number, LiveEntry>();
+  /** Keyed by `liveKey` — the probe's identity for a live activity. */
+  private readonly live = new Map<string, LiveEntry>();
 
   constructor(
     private readonly store: Store,
@@ -148,14 +195,15 @@ export class Engine {
    */
   hydrate(now: number): void {
     for (const run of this.store.listUnresolved()) {
-      // A remote run's pid is a pid on another Mac. Adopting it here would let
-      // this machine's process table retire it, or a local process that
-      // happens to hold the same number keep it alive. `src/remote.ts` owns
-      // those runs.
-      if (run.hostId !== null) continue;
+      // A tracked build on another Mac is `src/remote.ts`'s to settle; no
+      // process table speaks for it. A watched one is adopted under its own
+      // Mac, so only that Mac's snapshots can confirm or retire it.
+      if (isHostBuildRun(run)) continue;
       if (run.status === "running" && run.pid !== null) {
-        this.live.set(run.pid, {
+        this.live.set(liveKey(run.hostId, run.pid), {
           runId: run.id,
+          hostId: run.hostId,
+          pid: run.pid,
           misses: 0,
           lastSeenAt: now,
           expectedStartedAt: run.startedAt,
@@ -170,9 +218,12 @@ export class Engine {
     }
   }
 
-  /** True while anything is running or awaiting its verdict. */
-  hasOpenRuns(): boolean {
-    return this.store.hasUnresolved();
+  /**
+   * True while anything is running or awaiting its verdict, on one machine
+   * (null: this one).
+   */
+  hasOpenRuns(hostId: string | null = null): boolean {
+    return this.store.hasUnresolved(hostId);
   }
 
   liveWorkerCount(runId: string, activities: readonly LiveActivity[]): number | null {
@@ -201,41 +252,58 @@ export class Engine {
     return phase;
   }
 
-  /** The live process snapshot backing a run, for phase and current file. */
+  /**
+   * The live process snapshot backing a run, for phase and current file.
+   * `activities` is the latest snapshot of the run's own machine.
+   */
   liveActivity(
     runId: string,
     activities: readonly LiveActivity[],
   ): LiveActivity | null {
-    for (const [pid, entry] of this.live) {
+    for (const entry of this.live.values()) {
       if (entry.runId !== runId) continue;
-      return activities.find((a) => a.pid === pid) ?? null;
+      return activities.find((a) => a.pid === entry.pid) ?? null;
     }
     return null;
+  }
+
+  /** Forget the live process behind a run that has been settled. */
+  private dropLive(runId: string): void {
+    for (const [key, entry] of this.live) {
+      if (entry.runId === runId) this.live.delete(key);
+    }
   }
 
   // ------------------------------------------------------------- probe fold
 
   /**
-   * Fold one probe snapshot. Returns true when persisted state changed.
+   * Fold one machine's probe snapshot (`hostId` null: this machine). Returns
+   * true when persisted state changed.
+   *
+   * A snapshot is complete for its own machine only: a pid missing from it
+   * ends a run on that machine and nowhere else. Each Mac is folded on its
+   * own, at its own pace, and a slow or unreachable one simply sends nothing.
    */
-  foldSnapshot(activities: readonly LiveActivity[], now: number): boolean {
+  foldSnapshot(
+    activities: readonly LiveActivity[],
+    now: number,
+    hostId: string | null = null,
+  ): boolean {
     let changed = false;
-    const seenPids = new Set<number>();
+    const seenKeys = new Set<string>();
 
     for (const activity of activities) {
-      seenPids.add(activity.pid);
-      const tracked = this.live.get(activity.pid);
+      const key = liveKey(hostId, activity.pid);
+      seenKeys.add(key);
+      const tracked = this.live.get(key);
       if (tracked) {
         // A provisionally adopted pid has to prove it is still the process the
         // stored run described. A mismatch means the pid was recycled while
         // this plugin was down: retire the orphan and let the loop fall
         // through to mint a run for the build that is genuinely there.
         const expected = tracked.expectedStartedAt;
-        if (
-          expected !== undefined &&
-          Math.abs(activity.startedAt - expected) > ADOPTION_SLACK_MS
-        ) {
-          this.live.delete(activity.pid);
+        if (expected !== undefined && !sameProcess(activity, expected)) {
+          this.live.delete(key);
           this.retire(tracked, now, "pid reused across a restart");
           changed = true;
         } else {
@@ -251,8 +319,20 @@ export class Engine {
       }
 
       const root = activity.derivedDataPath ?? activity.roots[0] ?? null;
+      /**
+       * When this build began, as far as anyone can tell.
+       *
+       * For `xcodebuild` that is the process's own start. Xcode.app's build
+       * service is different: it stays resident for the whole Xcode session
+       * and serves build after build, so its start time is when Xcode was
+       * opened. Used as the run's start, a build began hours ago; used in the
+       * run's id, every build after the first in a session minted the id the
+       * first one already had, and was silently dropped. The service shows up
+       * here only while it has work, so the first sighting is the start.
+       */
+      const startedAt = activity.isDaemon ? Math.max(now, activity.startedAt) : activity.startedAt;
       const run: Run = {
-        id: `r:${activity.pid}:${Math.round(activity.startedAt / 1000)}`,
+        id: observedRunId(hostId, activity.pid, startedAt),
         status: "running",
         statusRank: RANK.observed,
         kind: activity.kind,
@@ -260,16 +340,19 @@ export class Engine {
         container: activity.container,
         configuration: activity.configuration,
         destination: activity.destination,
-        projectId: this.hooks.projectFor({
-          root,
-          cwd: activity.cwd,
-          container: activity.container,
-        }),
+        projectId: this.hooks.projectFor(
+          {
+            root,
+            cwd: activity.cwd,
+            container: activity.container,
+          },
+          hostId,
+        ),
         root,
         cwd: activity.cwd,
         pid: activity.pid,
         cmdline: activity.args.slice(0, 4000),
-        startedAt: activity.startedAt,
+        startedAt,
         endedAt: null,
         errorCount: 0,
         warningCount: 0,
@@ -281,17 +364,22 @@ export class Engine {
         detailed: false,
         branch: activity.branch ?? null,
         worktree: activity.worktree ?? null,
-        threadId: this.hooks.threadFor({
-          root,
-          cwd: activity.cwd,
-          container: activity.container,
-        }),
-        // The probe reads this machine's process table, so: this machine.
-        hostId: null,
+        threadId: this.hooks.threadFor(
+          {
+            root,
+            cwd: activity.cwd,
+            container: activity.container,
+          },
+          hostId,
+        ),
+        // The machine whose process table this came from.
+        hostId,
       };
       this.store.insertRun(run);
-      this.live.set(activity.pid, {
+      this.live.set(key, {
         runId: run.id,
+        hostId,
+        pid: activity.pid,
         misses: 0,
         lastSeenAt: now,
         sawWork: Boolean(activity.phase && activity.phase !== "preparing"),
@@ -304,12 +392,12 @@ export class Engine {
     // Hysteresis: only repeated absence moves a run to `finishing`, and the
     // end time is when the process was last SEEN — our detection grace is
     // never billed to the build.
-    for (const [pid, entry] of [...this.live]) {
-      if (seenPids.has(pid)) continue;
+    for (const [key, entry] of [...this.live]) {
+      if (entry.hostId !== hostId || seenKeys.has(key)) continue;
       entry.misses += 1;
       if (entry.misses < MISSES_BEFORE_FINISHING) continue;
 
-      this.live.delete(pid);
+      this.live.delete(key);
       if (this.retire(entry, now)) changed = true;
     }
 
@@ -355,7 +443,7 @@ export class Engine {
     for (const run of this.store.listUnresolved()) {
       if (run.status === "running") {
         if (now - run.startedAt < RUNNING_MAX_AGE_MS) continue;
-        if (run.pid !== null) this.live.delete(run.pid);
+        this.dropLive(run.id);
         run.status = "ended";
         run.statusRank = RANK.observed;
         run.endedAt ??= now;
@@ -395,8 +483,9 @@ export class Engine {
       warnings: number;
     },
     now: number,
+    hostId: string | null = null,
   ): boolean {
-    const target = this.store.getRunByBundlePath(bundlePath);
+    const target = this.store.getRunByBundlePath(bundlePath, hostId);
     if (!target) return false;
 
     const verdict: RunStatus =
@@ -422,9 +511,7 @@ export class Engine {
     target.status = verdict;
     target.statusRank = RANK.logged;
     target.endedAt ??= now;
-    for (const [pid, live] of this.live) {
-      if (live.runId === target.id) this.live.delete(pid);
-    }
+    this.dropLive(target.id);
     this.store.updateRun(target);
     this.hooks.log(`verdict from wrapped exit: ${verdict} (${target.id})`);
     return true;
@@ -509,9 +596,7 @@ export class Engine {
       target.status = verdict;
       target.statusRank = RANK.logged;
       target.endedAt ??= Math.min(outcome.endedAt, now);
-      for (const [pid, live] of this.live) {
-        if (live.runId === target.id) this.live.delete(pid);
-      }
+      this.dropLive(target.id);
       this.store.updateRun(target);
       this.hooks.log(
         `verdict from thread command exit: ${verdict} (${target.id})`,
@@ -584,6 +669,12 @@ export class Engine {
    * A manifest entry ENRICHES the overlapping run. It creates a standalone
    * run only when nothing overlaps — an IDE build from before the plugin
    * loaded, for example.
+   *
+   * `context` says where the entry was read: the machine (null: this one),
+   * and the workspace or project the root belongs to, from the root's own
+   * `info.plist`. That workspace is what ties an Xcode.app build to a
+   * thread: nothing else about it names the checkout, because its build
+   * service runs from `/` and its DerivedData lives in `~/Library`.
    */
   foldManifestEntry(
     root: string,
@@ -601,17 +692,34 @@ export class Engine {
       testFailureCount: number;
     },
     now: number,
+    context: { hostId?: string | null; container?: string | null } = {},
   ): boolean {
     if (entry.startedAt === null) return false;
     const key = `manifest:${entry.uniqueIdentifier}`;
     if (this.store.hasSeen(key)) return false;
+    const hostId = context.hostId ?? null;
+    const container = context.container ?? null;
 
     const candidates = this.store
-      .findVerdictCandidates(entry.startedAt, MATCH_SLACK_MS)
+      .findVerdictCandidates(entry.startedAt, MATCH_SLACK_MS, hostId)
       .filter((run) => !run.root || run.root === root)
-      .filter((run) => domainCompatible(domainKind, run.kind));
+      .filter((run) => domainCompatible(domainKind, run.kind))
+      // A tracked build on another Mac claims only its own scheme's entry; an
+      // Xcode.app build of something else alongside it keeps its own row.
+      .filter(
+        (run) =>
+          !isHostBuildRun(run) || !run.scheme || !entry.scheme || run.scheme === entry.scheme,
+      );
 
     const target = candidates[0] ?? null;
+
+    if (target && isHostBuildRun(target)) {
+      // The build the host worker ran writes this entry too. Its verdict
+      // comes from its exit and its own bundle (`src/remote.ts`), so the
+      // entry is absorbed, never folded — and never becomes a second row.
+      if (target.status !== "running") this.store.markSeen(key, now);
+      return false;
+    }
 
     if (target) {
       // A test run's compile phase writes a Build entry whose status covers
@@ -624,6 +732,8 @@ export class Engine {
       target.analyzerCount = Math.max(target.analyzerCount, entry.analyzerCount);
       target.scheme ??= entry.scheme;
       target.root ??= root;
+      target.container ??= container;
+      target.threadId ??= this.hooks.threadFor({ root, container }, hostId);
 
       // A live process has not finished, whatever a log entry claims. One
       // invocation writes an entry per action, so the clean phase of
@@ -675,9 +785,7 @@ export class Engine {
         target.status = verdict;
         target.statusRank = RANK.logged;
         target.endedAt ??= entry.endedAt ?? now;
-        for (const [pid, live] of this.live) {
-          if (live.runId === target.id) this.live.delete(pid);
-        }
+        this.dropLive(target.id);
         this.hooks.log(`verdict from manifest: ${verdict} (${target.id})`);
       }
       this.store.updateRun(target);
@@ -692,10 +800,10 @@ export class Engine {
       statusRank: RANK.logged,
       kind: domainKind,
       scheme: entry.scheme,
-      container: null,
+      container,
       configuration: null,
       destination: null,
-      projectId: this.hooks.projectFor({ root }),
+      projectId: this.hooks.projectFor({ root, container }, hostId),
       root,
       cwd: null,
       pid: null,
@@ -712,8 +820,8 @@ export class Engine {
       detailed: false,
       branch: null,
       worktree: null,
-      threadId: null,
-      hostId: null,
+      threadId: this.hooks.threadFor({ root, container }, hostId),
+      hostId,
     };
     this.store.insertRun(run);
     return true;
@@ -725,6 +833,9 @@ export class Engine {
    * Fold a parsed `.xcresult`. The bundle is ground truth (rank: verified):
    * it attaches to the overlapping run, or the run that already claims the
    * bundle path, and sets the final verdict, findings, and per-test rows.
+   *
+   * `hostId` is the machine the bundle was read on (null: this one); only
+   * that machine's runs can have written it.
    */
   foldBundle(
     bundlePath: string,
@@ -745,6 +856,7 @@ export class Engine {
       target: string | null;
     }[],
     now: number,
+    hostId: string | null = null,
   ): boolean {
     if (!build && !tests) return false;
     const anchor =
@@ -753,12 +865,14 @@ export class Engine {
 
     // Prefer the run that already recorded this bundle path (wrapper/`bb
     // xcode run` case), else window-match.
-    const byPath = this.store.getRunByBundlePath(bundlePath);
+    const byPath = this.store.getRunByBundlePath(bundlePath, hostId);
     const target =
       byPath ??
       this.store
-        .findVerdictCandidates(anchor, MATCH_SLACK_MS)
-        .filter((run) => run.kind !== "index")[0] ??
+        .findVerdictCandidates(anchor, MATCH_SLACK_MS, hostId)
+        // A tracked build on another Mac is folded only from its own bundle,
+        // by path; a bundle Xcode left nearby must not take it over.
+        .filter((run) => run.kind !== "index" && !isHostBuildRun(run))[0] ??
       null;
     if (!target) return false;
 
@@ -870,9 +984,7 @@ export class Engine {
       target.status = verdict;
       target.statusRank = RANK.verified;
       target.endedAt ??= tests?.endedAt ?? build?.endedAt ?? now;
-      for (const [pid, live] of this.live) {
-        if (live.runId === target.id) this.live.delete(pid);
-      }
+      this.dropLive(target.id);
     }
 
     this.store.updateRun(target);

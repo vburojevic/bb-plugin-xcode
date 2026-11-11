@@ -268,8 +268,8 @@ describe("getRunByBundlePath", () => {
     for (let i = 0; i < 200; i++) {
       store.insertRun(run(`r:new-${i}`, { startedAt: NOW + (i + 1) * 1_000 }));
     }
-    expect(store.getRunByBundlePath(bundle)?.id).toBe("r:old");
-    expect(store.getRunByBundlePath("/tmp/bundles/absent.xcresult")).toBeNull();
+    expect(store.getRunByBundlePath(bundle, null)?.id).toBe("r:old");
+    expect(store.getRunByBundlePath("/tmp/bundles/absent.xcresult", null)).toBeNull();
   });
 
   it("lists bundles that still need reading, and forgets them once scanned", () => {

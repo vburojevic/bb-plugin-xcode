@@ -203,7 +203,7 @@ export async function waitForVerdict(
     const run = match.runId
       ? store.getRun(match.runId)
       : match.bundlePath
-        ? store.getRunByBundlePath(match.bundlePath)
+        ? store.getRunByBundlePath(match.bundlePath, null)
         : null;
     if (run && VERDICT_STATUSES.has(run.status)) return run;
     if (run && run.status === "ended") return run;

@@ -62,6 +62,26 @@ export class ThreadScopes {
     return [...this.byThread.values()];
   }
 
+  /**
+   * Other Macs with a thread checkout that is active, or was within the idle
+   * TTL. These are the Macs worth watching: a build there now is most likely
+   * a thread's. Read against the TTL here, not only by `prune`, which runs
+   * when a thread turns active and so can leave an idle scope in place.
+   */
+  watchedHosts(now: number): string[] {
+    const hosts = new Set<string>();
+    for (const scope of this.byThread.values()) {
+      if (scope.hostId === null) continue;
+      if (scope.active || now - scope.updatedAt <= SCOPE_IDLE_TTL_MS) hosts.add(scope.hostId);
+    }
+    return [...hosts];
+  }
+
+  /** Checkouts of scopes on one Mac, for its root discovery. */
+  pathsOn(hostId: string): string[] {
+    return [...new Set(this.list().filter((scope) => scope.hostId === hostId).map((scope) => scope.path))];
+  }
+
   /** Drop scopes idle past the TTL. Active scopes never expire. */
   prune(now: number): void {
     for (const [threadId, scope] of this.byThread) {
@@ -77,19 +97,22 @@ export class ThreadScopes {
    * recently updated beats the rest — two threads can share a checkout (a
    * thread plus its side chat), and the one actually running is the answer.
    *
-   * Only scopes on this machine are candidates: the signals come from this
-   * machine's process table, and another Mac can hold the very same path.
+   * Only scopes on the machine the signals were read on are candidates
+   * (`hostId` null: this one): another Mac can hold the very same path.
    */
-  threadFor(signals: {
-    root?: string | null;
-    cwd?: string | null;
-    container?: string | null;
-  }): string | null {
+  threadFor(
+    signals: {
+      root?: string | null;
+      cwd?: string | null;
+      container?: string | null;
+    },
+    hostId: string | null = null,
+  ): string | null {
     let best: ThreadScope | null = null;
     for (const path of [signals.cwd, signals.container, signals.root]) {
       if (!path) continue;
       for (const scope of this.byThread.values()) {
-        if (scope.hostId !== null) continue;
+        if (scope.hostId !== hostId) continue;
         if (!pathIsUnder(path, scope.path)) continue;
         if (!best) {
           best = scope;
