@@ -843,6 +843,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
             // `serverHostId` is read synchronously by the watcher.
             await resolveHostId();
             remoteWatch.reconcile(signal);
+            // Rows from a watched Mac name it; keep the names warm (cached).
+            if (remoteWatch.hosts().length > 0) await listHosts();
           } catch (error: unknown) {
             log.debug(`remote watch reconcile failed: ${String(error)}`);
           }

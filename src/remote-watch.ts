@@ -170,6 +170,8 @@ export interface RemoteWatchDeps {
   log: { debug(m: string): void; info(m: string): void; warn(m: string): void };
   isDisposed(): boolean;
   now?: () => number;
+  /** Sweep cadences; tests shorten them. */
+  timing?: { sweepPendingMs?: number; sweepIdleMs?: number; failureBaseMs?: number };
 }
 
 interface Watched {
@@ -231,8 +233,8 @@ export class RemoteWatch {
     await Promise.all(loops.map((entry) => entry.done));
   }
 
-  /** One pass over one Mac: what `watch`'s loop does each turn. Exposed for tests. */
-  async pass(
+  /** One pass over one Mac: what `watch`'s loop does each turn. */
+  private async pass(
     hostId: string,
     state: { lastDiscoverAt: number; lastSweepAt: number; pending: boolean },
     signal: AbortSignal,
@@ -250,7 +252,9 @@ export class RemoteWatch {
     if (signal.aborted) return;
     if (await collector.probeTick(this.now(), signal)) this.deps.publishSoon();
     if (signal.aborted) return;
-    const sweepEvery = state.pending ? SWEEP_PENDING_MS : SWEEP_IDLE_MS;
+    const sweepEvery = state.pending
+      ? (this.deps.timing?.sweepPendingMs ?? SWEEP_PENDING_MS)
+      : (this.deps.timing?.sweepIdleMs ?? SWEEP_IDLE_MS);
     if (this.now() - state.lastSweepAt >= sweepEvery) {
       state.lastSweepAt = this.now();
       const manifests = await collector.sweepManifests(this.now(), signal);
@@ -309,7 +313,10 @@ export class RemoteWatch {
       const elapsed = this.now() - startedAt;
       const cooldown =
         failures > 0
-          ? Math.min(FAILURE_BASE_MS * 2 ** (failures - 1), FAILURE_MAX_MS)
+          ? Math.min(
+              (this.deps.timing?.failureBaseMs ?? FAILURE_BASE_MS) * 2 ** (failures - 1),
+              FAILURE_MAX_MS,
+            )
           : Math.min(
               Math.max(settings.scanIntervalMs, elapsed * PROBE_DUTY_FACTOR),
               PROBE_MAX_SLEEP_MS,
