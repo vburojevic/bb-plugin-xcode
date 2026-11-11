@@ -1,9 +1,10 @@
 /**
  * The collector: turns the outside world into engine observations.
  *
- * Owns all I/O — `ps` snapshots, manifest reads, `xcresulttool` invocations,
- * root discovery — and hands plain data to the engine. The engine owns all
- * state; the collector owns none beyond caches.
+ * Decides what to read — `ps` snapshots, manifests, result bundles, root
+ * discovery — and hands plain data to the engine; a `MachineIO`
+ * (`src/machine.ts`) does the reading. The engine owns all state; the
+ * collector owns none beyond caches.
  *
  * One collector watches one machine. The machine running bb has one for the
  * life of the plugin, reading its own disk through `LocalMachine`; another
@@ -54,11 +55,6 @@ export interface CollectorDeps {
   io?: MachineIO;
   /** Extra checkouts to scan for DerivedData on that Mac (thread scopes). */
   scanPaths?(): readonly string[];
-  /**
-   * Oldest log entry worth reading from another Mac's manifests, so the first
-   * look at a Mac does not ship years of history across the network.
-   */
-  manifestHorizon?(now: number): number | null;
 }
 
 /**
@@ -391,7 +387,6 @@ export class Collector {
       ifModifiedSince: this.manifestsReadAt.get(path) ?? null,
     }));
     if (roots.length === 0) return false;
-    const horizon = this.deps.manifestHorizon?.(now) ?? null;
     for (const read of await this.io.readManifests(roots, signal)) {
       if (signal?.aborted) return changed;
       let consumed = true;
@@ -399,7 +394,6 @@ export class Collector {
       for (const domain of read.domains) {
         readAt = Math.max(readAt ?? 0, domain.mtimeMs ?? 0) || null;
         for (const entry of domain.entries) {
-          if (horizon !== null && entry.startedAt !== null && entry.startedAt < horizon) continue;
           const folded = this.deps.engine.foldManifestEntry(
             read.root,
             domain.kind,

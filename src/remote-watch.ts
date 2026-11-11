@@ -54,16 +54,22 @@ export class RemoteMachine implements MachineIO {
   constructor(
     private readonly host: HostCaller,
     readonly hostId: string,
-    /** Oldest log entry worth shipping; null for all of them. */
+    /**
+     * Oldest log entry worth shipping, so the first look at a Mac does not
+     * carry years of history across the network; null for all of them.
+     */
     private readonly notBefore: () => number | null = () => null,
+    /** Aborts calls in flight when the Mac stops being watched or bb reloads. */
+    private readonly signal?: AbortSignal,
   ) {}
+
+  private options(timeoutMs: number) {
+    return { hostId: this.hostId, timeoutMs, ...(this.signal ? { signal: this.signal } : {}) };
+  }
 
   /** Transport failures throw: no answer is never taken for "no builds". */
   async snapshot(): Promise<LiveActivity[] | null> {
-    const reply = await this.host.call("probe", {}, {
-      hostId: this.hostId,
-      timeoutMs: PROBE_TIMEOUT_MS,
-    });
+    const reply = await this.host.call("probe", {}, this.options(PROBE_TIMEOUT_MS));
     return reply.activities.map((activity) => ({ ...activity }));
   }
 
@@ -71,7 +77,7 @@ export class RemoteMachine implements MachineIO {
     const reply = await this.host.call(
       "discoverRoots",
       { projectPaths: request.projectPaths.filter((path) => path.startsWith("/")).slice(0, 64) },
-      { hostId: this.hostId, timeoutMs: READ_TIMEOUT_MS },
+      this.options(READ_TIMEOUT_MS),
     );
     return reply.roots;
   }
@@ -82,7 +88,7 @@ export class RemoteMachine implements MachineIO {
     const reply = await this.host.call(
       "readManifests",
       { roots: roots.slice(0, 200).map((root) => ({ ...root })), notBefore: this.notBefore() },
-      { hostId: this.hostId, timeoutMs: READ_TIMEOUT_MS },
+      this.options(READ_TIMEOUT_MS),
     );
     return reply.roots;
   }
@@ -94,7 +100,7 @@ export class RemoteMachine implements MachineIO {
         roots: roots.slice(0, 200),
         paths: claimed.filter((path) => path.startsWith("/")).slice(0, 500),
       },
-      { hostId: this.hostId, timeoutMs: READ_TIMEOUT_MS },
+      this.options(READ_TIMEOUT_MS),
     );
     return { candidates: reply.candidates, finalized: new Set(reply.finalized) };
   }
@@ -103,7 +109,7 @@ export class RemoteMachine implements MachineIO {
     const reply = await this.host.call(
       "summarizeBundle",
       { path },
-      { hostId: this.hostId, timeoutMs: SUMMARY_TIMEOUT_MS },
+      this.options(SUMMARY_TIMEOUT_MS),
     );
     switch (reply.status) {
       case "ok":
@@ -278,10 +284,12 @@ export class RemoteWatch {
         // Never read: another Mac's files are read on that Mac.
         dataDir: "",
         hostId,
-        io: new RemoteMachine(this.deps.host, hostId, () => {
-          const days = this.deps.settings().retentionDays;
-          return this.now() - days * 86_400_000;
-        }),
+        io: new RemoteMachine(
+          this.deps.host,
+          hostId,
+          () => this.now() - this.deps.settings().retentionDays * 86_400_000,
+          signal,
+        ),
         scanPaths: () => this.deps.scopePaths(hostId),
       },
       { scanProjects: settings.scanProjects, extraRoots: [] },
