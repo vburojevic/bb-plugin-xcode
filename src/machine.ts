@@ -78,7 +78,9 @@ export type ParsedBundle =
   /** xcresulttool made nothing of it: still being written, or corrupt. */
   | { status: "empty" }
   /** Not readable here at all (no Xcode); try again later, not a failure. */
-  | { status: "unavailable"; reason: string };
+  | { status: "unavailable"; reason: string }
+  /** The machine will never read this one; stop asking. */
+  | { status: "refused"; reason: string };
 
 export interface MachineIO {
   /** The Xcode builds running there now; null when there is no answer. */

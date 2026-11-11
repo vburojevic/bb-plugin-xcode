@@ -23,7 +23,7 @@ import {
   shimPaths,
   uninstallShim,
 } from "./shim";
-import type { Store } from "./store";
+import { isHostBuildRun, type Store } from "./store";
 import type { BuildPhase } from "./types";
 import { pathIsUnder, runMatchesScope, type ThreadScope } from "./scopes";
 import { resolveBuildArgv, waitForVerdict } from "./wrapped";
@@ -390,7 +390,16 @@ export function createCli(deps: CliDeps) {
     if (target.status !== "running" || target.pid === null) {
       return { exitCode: 1, stderr: `Run ${id} is not running.\n` };
     }
-    if (target.hostId !== null) return stopRemote(target, ctx);
+    if (target.hostId !== null) {
+      if (isHostBuildRun(target)) return stopRemote(target, ctx);
+      // Watched, not run: this plugin started nothing there to stop, and it
+      // will not signal a process on another Mac it did not start.
+      const machine = deps.machineName(target.hostId) ?? target.hostId;
+      return {
+        exitCode: 1,
+        stderr: `Run ${id} is a build this plugin only watches on ${machine}; stop it there (Xcode's Stop button, or Ctrl-C in its terminal).\n`,
+      };
+    }
     /**
      * Only signal a pid the probe can still see.
      *

@@ -54,18 +54,23 @@ export async function looksLikeDerivedRoot(path: string): Promise<boolean> {
   return isDirectory(join(path, "Logs", "Build"));
 }
 
-/** Immediate children of the shared DerivedData directory that have log stores. */
-export async function discoverDefaultRoots(): Promise<string[]> {
+/**
+ * Immediate children of the shared DerivedData directory that have log stores.
+ * `derivedData` is that directory on the machine this runs on.
+ */
+export async function discoverDefaultRoots(
+  derivedData: string = DEFAULT_DERIVED_DATA,
+): Promise<string[]> {
   let entries: string[];
   try {
-    entries = await readdir(DEFAULT_DERIVED_DATA);
+    entries = await readdir(derivedData);
   } catch {
     return [];
   }
   const found: string[] = [];
   await Promise.all(
     entries.map(async (entry) => {
-      const path = join(DEFAULT_DERIVED_DATA, entry);
+      const path = join(derivedData, entry);
       if (await looksLikeDerivedRoot(path)) found.push(path);
     }),
   );

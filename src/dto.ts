@@ -11,7 +11,7 @@ import { destinationLabel } from "./destination";
 import type { Engine } from "./engine";
 import { durationMs, type Run } from "./model";
 import type { Store } from "./store";
-import type { BuildPhase } from "./types";
+import type { BuildPhase, LiveActivity } from "./types";
 
 export interface RunDto {
   id: string;
@@ -77,7 +77,14 @@ export class DtoMapper {
     private readonly engine: Engine,
     private readonly collector: Collector,
     private readonly machineName: (hostId: string) => string | null = () => null,
+    /** Another Mac's latest process snapshot, while it is watched. */
+    private readonly activitiesOn: (hostId: string) => readonly LiveActivity[] = () => [],
   ) {}
+
+  /** The latest snapshot of the machine a run is on. */
+  private activitiesFor(run: Run): readonly LiveActivity[] {
+    return run.hostId === null ? this.collector.getLastActivities() : this.activitiesOn(run.hostId);
+  }
 
   /** Re-read the collector's project list. Cheap; call before a batch. */
   refreshProjectNames(): void {
@@ -112,7 +119,7 @@ export class DtoMapper {
     // the worker count, once for the phase and once for the current file.
     const activity =
       run.status === "running"
-        ? this.engine.liveActivity(run.id, this.collector.getLastActivities())
+        ? this.engine.liveActivity(run.id, this.activitiesFor(run))
         : null;
 
     return {

@@ -529,6 +529,11 @@ export class Collector {
         parserUnavailable = true;
         continue;
       }
+      if (parsed.status === "refused") {
+        this.deps.log.debug(`not reading ${bundle}: ${parsed.reason}`);
+        store.markSeen(scannedKey, now);
+        continue;
+      }
       // A bundle still being written parses as nothing — leave it unseen so a
       // later sweep retries. Bounded: a CORRUPT bundle also parses as
       // nothing, and unbounded retries meant two 60s-class xcresulttool
