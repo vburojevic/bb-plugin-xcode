@@ -28,6 +28,12 @@ export interface ThreadScope {
   branch: string | null;
   /** True while the thread is running a turn. */
   active: boolean;
+  /**
+   * When the thread last ran a turn, as far as this plugin saw: set when one
+   * starts or ends, never by merely resolving the scope (opening an old
+   * thread resolves it too). Null when no turn was seen.
+   */
+  activeAt?: number | null;
   updatedAt: number;
 }
 
@@ -37,14 +43,21 @@ export const SCOPE_IDLE_TTL_MS = 30 * 60_000;
 export class ThreadScopes {
   private readonly byThread = new Map<string, ThreadScope>();
 
+  /** An active scope's turn is running now; an idle one keeps its `activeAt`. */
   upsert(scope: Omit<ThreadScope, "updatedAt">, now: number): void {
     if (!scope.path.startsWith("/")) return;
-    this.byThread.set(scope.threadId, { ...scope, updatedAt: now });
+    this.byThread.set(scope.threadId, {
+      ...scope,
+      activeAt: scope.active ? now : (scope.activeAt ?? null),
+      updatedAt: now,
+    });
   }
 
+  /** The thread's turn ended now. */
   deactivate(threadId: string, now: number): void {
     const scope = this.byThread.get(threadId);
     if (scope) {
+      if (scope.active) scope.activeAt = now;
       scope.active = false;
       scope.updatedAt = now;
     }
@@ -63,16 +76,20 @@ export class ThreadScopes {
   }
 
   /**
-   * Other Macs with a thread checkout that is active, or was within the idle
-   * TTL. These are the Macs worth watching: a build there now is most likely
-   * a thread's. Read against the TTL here, not only by `prune`, which runs
-   * when a thread turns active and so can leave an idle scope in place.
+   * Other Macs with a thread checkout that is running a turn, or ran one
+   * within the idle TTL. These are the Macs worth watching: a build there now
+   * is most likely a thread's. Measured from the last turn (`activeAt`), not
+   * from when the scope was last resolved: opening an old thread resolves
+   * it, and must not start a process scan on its Mac.
    */
   watchedHosts(now: number): string[] {
     const hosts = new Set<string>();
     for (const scope of this.byThread.values()) {
       if (scope.hostId === null) continue;
-      if (scope.active || now - scope.updatedAt <= SCOPE_IDLE_TTL_MS) hosts.add(scope.hostId);
+      const lastTurn = scope.activeAt ?? null;
+      if (scope.active || (lastTurn !== null && now - lastTurn <= SCOPE_IDLE_TTL_MS)) {
+        hosts.add(scope.hostId);
+      }
     }
     return [...hosts];
   }

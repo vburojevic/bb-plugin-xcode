@@ -16,6 +16,7 @@ import { Engine, MISSES_BEFORE_FINISHING, observedRunId } from "../src/engine";
 import type { MachineIO } from "../src/machine";
 import { RANK, type Run } from "../src/model";
 import { selectHostsToWatch } from "../src/remote-watch";
+import { ScopeSync } from "../src/scope-sync";
 import { SCOPE_IDLE_TTL_MS, ThreadScopes } from "../src/scopes";
 import {
   bundleScannedKey,
@@ -256,6 +257,38 @@ describe("Xcode.app's resident build service", () => {
     ]);
   });
 
+  it("ends one build and starts another when the service moves to another workspace", () => {
+    const store = migrated();
+    const scopes = new ThreadScopes();
+    const scope = { projectId: null, environmentId: "env", branch: null, active: true, hostId: MBP };
+    scopes.upsert({ ...scope, threadId: "thr_a", path: "/w/A" }, NOW);
+    scopes.upsert({ ...scope, threadId: "thr_b", path: "/w/B" }, NOW);
+    const engine = engineWith(store, scopes);
+    engine.foldSnapshot(
+      [service({ roots: ["/dd/A"], container: "/w/A/App.xcworkspace" })],
+      NOW,
+      MBP,
+    );
+    // The Mac was out of reach while A finished; the next answer is B.
+    engine.foldSnapshot(
+      [service({ roots: ["/dd/B"], container: "/w/B/App.xcworkspace" })],
+      NOW + 300_000,
+      MBP,
+    );
+    const runs = store.listRuns({ limit: 10, includeNoise: true });
+    expect(runs.map((row) => [row.threadId, row.root, row.status])).toEqual([
+      ["thr_b", "/dd/B", "running"],
+      ["thr_a", "/dd/A", "finishing"],
+    ]);
+    // Still serving B: the same run, not a third.
+    engine.foldSnapshot(
+      [service({ roots: ["/dd/B"], container: "/w/B/App.xcworkspace" })],
+      NOW + 302_000,
+      MBP,
+    );
+    expect(store.listRuns({ limit: 10, includeNoise: true })).toHaveLength(2);
+  });
+
   it("re-adopts a build across a restart, and refuses a recycled pid", () => {
     const store = migrated();
     store.insertRun(run(observedRunId(MBP, 555, NOW), { hostId: MBP, pid: 555, startedAt: NOW }));
@@ -356,6 +389,43 @@ describe("log entries and bundles from another Mac", () => {
     expect(store.listRuns({ limit: 10, includeNoise: true }).map((row) => row.id)).toEqual([
       "w:abc-0123456789ab",
     ]);
+  });
+
+  it("never absorbs another worktree's log entry of the same scheme", () => {
+    const store = migrated();
+    const engine = engineWith(store);
+    // A tracked build in worktree A, on default DerivedData: no root known.
+    store.insertRun(
+      run("w:abc-0123456789ab", {
+        hostId: MBP,
+        scheme: "Amion",
+        root: null,
+        cwd: "/w/A",
+        container: "Amion.xcworkspace",
+        status: "passed",
+        statusRank: RANK.verified,
+        endedAt: NOW + 30_000,
+      }),
+    );
+    // Worktree B's Xcode.app build of the same scheme, at the same time.
+    engine.foldManifestEntry("/dd/Amion-b", "build", entry(), NOW, {
+      hostId: MBP,
+      container: "/w/B/Amion.xcworkspace",
+    });
+    expect(store.getRun("m:A1B2C3D4-0000-0000-0000-000000000001")).toMatchObject({
+      container: "/w/B/Amion.xcworkspace",
+      hostId: MBP,
+    });
+    // A's own entry is still absorbed.
+    engine.foldManifestEntry(
+      "/dd/Amion-a",
+      "build",
+      entry({ uniqueIdentifier: "A-OWN" }),
+      NOW,
+      { hostId: MBP, container: "/w/A/Amion.xcworkspace" },
+    );
+    expect(store.getRun("m:A-OWN")).toBeNull();
+    expect(store.hasSeen("manifest:A-OWN")).toBe(true);
   });
 
   it("never lets a thread command's exit settle an Xcode.app build", () => {
@@ -506,10 +576,12 @@ describe("the store, per Mac", () => {
 describe("which Macs are watched", () => {
   const base = { projectId: null, environmentId: "env", branch: null };
 
-  it("watches a Mac while a thread there is active or idle within the TTL", () => {
+  it("watches a Mac while a thread there runs a turn, and for the idle TTL after it", () => {
     const scopes = new ThreadScopes();
     scopes.upsert({ ...base, threadId: "thr_a", path: "/a", hostId: MBP, active: true }, NOW);
-    scopes.upsert({ ...base, threadId: "thr_b", path: "/b", hostId: AIR, active: false }, NOW);
+    // A turn on the Air ended at NOW.
+    scopes.upsert({ ...base, threadId: "thr_b", path: "/b", hostId: AIR, active: true }, NOW - 600_000);
+    scopes.deactivate("thr_b", NOW);
     scopes.upsert({ ...base, threadId: "thr_c", path: "/c", hostId: null, active: true }, NOW);
 
     expect(scopes.watchedHosts(NOW + 60_000).sort()).toEqual([AIR, MBP]);
@@ -517,6 +589,36 @@ describe("which Macs are watched", () => {
     expect(scopes.watchedHosts(NOW + SCOPE_IDLE_TTL_MS + 1)).toEqual([MBP]);
     scopes.deactivate("thr_a", NOW + SCOPE_IDLE_TTL_MS);
     expect(scopes.watchedHosts(NOW + 2 * SCOPE_IDLE_TTL_MS + 1)).toEqual([]);
+  });
+
+  it("does not start watching a Mac because an old thread's scope was resolved", async () => {
+    const store = migrated();
+    let clock = NOW;
+    const sync = new ScopeSync({
+      store,
+      getThread: async () => ({ environmentId: "env_old" }),
+      getEnvironment: async () => ({ path: "/Users/me/Old", hostId: MBP }),
+      serverHostId: async () => "host_server",
+      log: () => undefined,
+      isDisposed: () => false,
+      onChanged: () => undefined,
+      now: () => clock,
+    });
+    // Opening the thread in the UI: chatStatus resolves its scope cold.
+    await sync.refresh("thr_old", false);
+    expect(sync.get("thr_old")?.hostId).toBe(MBP);
+    expect(sync.scopes.watchedHosts(clock)).toEqual([]);
+
+    // A real turn starts and ends: watched through it and the TTL after.
+    clock += 60_000;
+    await sync.refresh("thr_new", true);
+    sync.deactivate("thr_new");
+    clock += SCOPE_IDLE_TTL_MS - 1;
+    expect(sync.scopes.watchedHosts(clock)).toEqual([MBP]);
+    // Resolving it again later (TTL-expired cache) does not extend the window.
+    await sync.refresh("thr_new", false);
+    clock += 2;
+    expect(sync.scopes.watchedHosts(clock)).toEqual([]);
   });
 
   it("adds Macs the person opted in and Macs with a build still open, never this one", () => {
@@ -565,5 +667,99 @@ describe("the bundle sweep's view of a finished build", () => {
     await collector.sweepBundles(NOW);
     expect(listings).toBe(2);
     expect(store.getRun("r:1:1")?.status).toBe("finishing");
+  });
+});
+
+describe("an Xcode.app test bundle on a Mac with two checkouts", () => {
+  const summary = {
+    status: "passed" as const,
+    startedAt: NOW + 1_000,
+    endedAt: NOW + 20_000,
+    total: 12,
+    passed: 12,
+    failed: 0,
+    skipped: 0,
+    expectedFailures: 0,
+    destination: null,
+  };
+
+  function sweeper(store: Store, engine: Engine, bundles: string[]) {
+    const io: MachineIO = {
+      snapshot: async () => [],
+      discoverRoots: async () => [],
+      readManifests: async () => [],
+      listBundles: async () => ({ candidates: bundles, finalized: new Set(bundles) }),
+      parseBundle: async () => ({ status: "ok", build: null, summary, tests: [] }),
+    };
+    return new Collector(
+      { store, engine, listProjects: async () => [], log: { debug: () => undefined, warn: () => undefined }, dataDir: "", io, hostId: MBP },
+      { scanProjects: false, extraRoots: [] },
+    );
+  }
+
+  const ide = (pid: number, root: string, threadId: string, startedAt: number) =>
+    run(observedRunId(MBP, pid, startedAt), {
+      hostId: MBP,
+      pid,
+      root,
+      threadId,
+      kind: "unknown",
+      startedAt,
+      status: "finishing",
+      endedAt: NOW + 25_000,
+    });
+
+  it("goes to the run of the checkout whose DerivedData holds it", async () => {
+    const store = migrated();
+    const engine = engineWith(store);
+    store.upsertRoot("/dd/A", null, "process", NOW, MBP);
+    store.upsertRoot("/dd/B", null, "process", NOW, MBP);
+    store.insertRun(ide(1, "/dd/A", "thr_a", NOW));
+    // B started a little later, so it is the newest overlapping run.
+    store.insertRun(ide(2, "/dd/B", "thr_b", NOW + 2_000));
+
+    await sweeper(store, engine, ["/dd/A/Logs/Test/Test-App.xcresult"]).sweepBundles(NOW + 60_000);
+    expect(store.getRun(observedRunId(MBP, 1, NOW))).toMatchObject({ status: "passed", testTotal: 12 });
+    expect(store.getRun(observedRunId(MBP, 2, NOW + 2_000))).toMatchObject({
+      status: "finishing",
+      testTotal: null,
+      detailed: false,
+    });
+  });
+
+  it("is applied once its run ends, when it was finalized while the run still ran", async () => {
+    const store = migrated();
+    const engine = engineWith(store);
+    store.upsertRoot("/dd/A", null, "process", NOW, MBP);
+    const service = activity({
+      pid: 812,
+      comm: "SWBBuildService",
+      isDaemon: true,
+      roots: ["/dd/A"],
+      startedAt: NOW - 3_600_000,
+      kind: "unknown",
+      scheme: null,
+    });
+    engine.foldSnapshot([service], NOW, MBP);
+    const id = observedRunId(MBP, 812, NOW);
+    const bundle = "/dd/A/Logs/Test/Test-App.xcresult";
+    const collector = sweeper(store, engine, [bundle]);
+
+    // Xcode finalizes the bundle before the probe has missed the service
+    // three times: the run is still `running` when the sweep reads it.
+    await collector.sweepBundles(NOW + 2_000);
+    expect(store.getRun(id)).toMatchObject({ status: "running", bundlePath: bundle });
+    expect(store.hasSeen(bundleScannedKey(MBP, bundle))).toBe(false);
+    // A sweep while it still runs leaves it alone.
+    await collector.sweepBundles(NOW + 3_000);
+    expect(store.getRun(id)?.status).toBe("running");
+
+    for (let tick = 1; tick <= MISSES_BEFORE_FINISHING; tick += 1) {
+      engine.foldSnapshot([], NOW + 4_000 + tick * 2_000, MBP);
+    }
+    expect(store.getRun(id)?.status).toBe("finishing");
+    await collector.sweepBundles(NOW + 12_000);
+    expect(store.getRun(id)).toMatchObject({ status: "passed", statusRank: RANK.verified, testTotal: 12 });
+    expect(store.hasSeen(bundleScannedKey(MBP, bundle))).toBe(true);
   });
 });

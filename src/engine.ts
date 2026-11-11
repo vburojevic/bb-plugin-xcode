@@ -24,6 +24,7 @@ import { isHostBuildRun, type Store } from "./store";
 import type { LiveActivity } from "./types";
 import type { BuildResults, TestResults } from "./types";
 import type { BackgroundCommandOutcome } from "./thread-outcome";
+import { dirname, isAbsolute, resolve } from "node:path";
 
 /**
  * Consecutive probe misses before a running process is considered gone.
@@ -119,6 +120,13 @@ interface LiveEntry {
   /** The machine whose process table this pid is in; null for this one. */
   hostId: string | null;
   pid: number;
+  /**
+   * What the run was building: its DerivedData root and workspace. Xcode.app's
+   * build service keeps its pid from one build to the next, so for it a
+   * change of these is a new build.
+   */
+  root: string | null;
+  container: string | null;
   misses: number;
   lastSeenAt: number;
   /**
@@ -163,6 +171,19 @@ export function observedRunId(hostId: string | null, pid: number, startedAt: num
   return hostId === null ? `r:${pid}:${seconds}` : `r:${hostId}:${pid}:${seconds}`;
 }
 
+/** Is a build service now serving another root or workspace than its run's? */
+function switchedBuild(
+  entry: Pick<LiveEntry, "root" | "container">,
+  activity: LiveActivity,
+): boolean {
+  const root = activity.derivedDataPath ?? activity.roots[0] ?? null;
+  if (entry.root !== null && root !== null) return !activity.roots.includes(entry.root) && root !== entry.root;
+  if (entry.container !== null && activity.container !== null) {
+    return entry.container !== activity.container;
+  }
+  return false;
+}
+
 /**
  * Is the process in a snapshot the one a run adopted at boot was started by?
  *
@@ -204,6 +225,8 @@ export class Engine {
           runId: run.id,
           hostId: run.hostId,
           pid: run.pid,
+          root: run.root,
+          container: run.container,
           misses: 0,
           lastSeenAt: now,
           expectedStartedAt: run.startedAt,
@@ -306,6 +329,13 @@ export class Engine {
           this.live.delete(key);
           this.retire(tracked, now, "pid reused across a restart");
           changed = true;
+        } else if (activity.isDaemon && switchedBuild(tracked, activity)) {
+          // The same build service, now building another workspace: the build
+          // it was serving is over, however briefly it went quiet (or however
+          // long the Mac was out of reach) in between.
+          this.live.delete(key);
+          this.retire(tracked, now, "the build service moved to another workspace");
+          changed = true;
         } else {
           // Identity confirmed; it is an ordinary tracked pid from here on.
           delete tracked.expectedStartedAt;
@@ -380,6 +410,8 @@ export class Engine {
         runId: run.id,
         hostId,
         pid: activity.pid,
+        root,
+        container: activity.container,
         misses: 0,
         lastSeenAt: now,
         sawWork: Boolean(activity.phase && activity.phase !== "preparing"),
@@ -704,9 +736,10 @@ export class Engine {
     const hostId = context.hostId ?? null;
     const container = context.container ?? null;
 
+    const owner: ArtifactOwner = { root, workspace: container };
     const candidates = this.store
       .findVerdictCandidates(entry.startedAt, MATCH_SLACK_MS, hostId)
-      .filter((run) => !run.root || run.root === root)
+      .filter((run) => ownedBy(run, owner))
       .filter((run) => domainCompatible(domainKind, run.kind))
       // A tracked build on another Mac claims only its own scheme's entry; an
       // Xcode.app build of something else alongside it keeps its own row.
@@ -724,7 +757,11 @@ export class Engine {
         ? null
         : (this.store
             .findHostBuildsAround(entry.startedAt, MATCH_SLACK_MS, hostId)
-            .find((run) => !run.scheme || !entry.scheme || run.scheme === entry.scheme) ??
+            .find(
+              (run) =>
+                ownedBy(run, owner) &&
+                (!run.scheme || !entry.scheme || run.scheme === entry.scheme),
+            ) ??
           null));
 
     if (target && isHostBuildRun(target)) {
@@ -871,6 +908,8 @@ export class Engine {
     }[],
     now: number,
     hostId: string | null = null,
+    /** Where an unclaimed bundle was found; only that checkout's runs may take it. */
+    owner: ArtifactOwner | null = null,
   ): boolean {
     if (!build && !tests) return false;
     const anchor =
@@ -886,7 +925,10 @@ export class Engine {
         .findVerdictCandidates(anchor, MATCH_SLACK_MS, hostId)
         // A tracked build on another Mac is folded only from its own bundle,
         // by path; a bundle Xcode left nearby must not take it over.
-        .filter((run) => run.kind !== "index" && !isHostBuildRun(run))[0] ??
+        .filter(
+          (run) =>
+            run.kind !== "index" && !isHostBuildRun(run) && (owner === null || ownedBy(run, owner)),
+        )[0] ??
       null;
     if (!target) return false;
 
@@ -984,6 +1026,10 @@ export class Engine {
     // Only a failure is allowed to speak early.
     if (target.status === "running" && verdict !== "failed") {
       verdict = null;
+      // Its outcome is not applied yet, so this bundle is not done with: the
+      // run now claims it, which keeps every sweep off it while the run is
+      // live, and the first sweep after it ends reads it again and settles it.
+      this.store.clearSeen(key);
     }
 
     if (
@@ -1005,6 +1051,47 @@ export class Engine {
     this.hooks.log(`verdict from bundle: ${target.status} (${target.id})`);
     return true;
   }
+}
+
+/**
+ * Where an artifact (a log entry, a test bundle) came from: the DerivedData
+ * root it was found in, and the workspace that root belongs to.
+ */
+export interface ArtifactOwner {
+  root: string | null;
+  workspace: string | null;
+}
+
+/**
+ * Could this run have written an artifact from that owner?
+ *
+ * Time overlap alone is not enough once two checkouts on one Mac build at
+ * once — two worktrees of one repo routinely share a scheme too. A known root
+ * decides; otherwise the workspace, against the run's container or working
+ * directory. Only when neither side says anything is it left to time, as it
+ * always was.
+ */
+export function ownedBy(
+  run: Pick<Run, "root" | "container" | "cwd">,
+  owner: ArtifactOwner,
+): boolean {
+  if (run.root !== null && owner.root !== null) return run.root === owner.root;
+  const workspace = owner.workspace;
+  if (workspace === null) return true;
+  const container =
+    run.container !== null && !isAbsolute(run.container) && run.cwd !== null
+      ? resolve(run.cwd, run.container)
+      : run.container;
+  if (container !== null && isAbsolute(container)) return container === workspace;
+  if (run.cwd !== null && isAbsolute(run.cwd)) {
+    return isUnder(workspace, run.cwd) || isUnder(run.cwd, dirname(workspace));
+  }
+  return true;
+}
+
+function isUnder(path: string, base: string): boolean {
+  const root = base.endsWith("/") ? base.slice(0, -1) : base;
+  return path === root || path.startsWith(`${root}/`);
 }
 
 /** Is this the command line of Xcode.app's resident build service? */

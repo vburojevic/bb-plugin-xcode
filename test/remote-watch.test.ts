@@ -173,13 +173,15 @@ describe("an Xcode.app build on the thread's Mac", () => {
     watch.reconcile(signal);
     mac.machine.ps = xcodeAppPs({ servicePid: 812, root: mac.root, workers: 1 });
     const live = await until(() => store.listUnresolved()[0]);
-    mac.machine.ps = xcodeAppPs({ servicePid: 812 });
-    await until(() => store.getRun(live.id)?.status === "finishing");
-
+    // The normal order: Xcode finalizes the bundle while the probe still sees
+    // the build, so the sweep reads it before the run has ended.
     makeTestBundle(mac.root, "Test-Amion-2026.11.11_12-00-00-+0000");
+    await until(() => store.getRun(live.id)?.detailed);
+    expect(store.getRun(live.id)?.status).toBe("running");
+    mac.machine.ps = xcodeAppPs({ servicePid: 812 });
     const settled = await until(() => {
       const row = store.getRun(live.id);
-      return row?.detailed ? row : null;
+      return row?.status === "passed" ? row : null;
     });
     expect(settled).toMatchObject({ status: "passed", statusRank: 2, hostId: MBP.id, threadId: THREAD });
   });

@@ -14,7 +14,7 @@
  * as one.
  */
 
-import { Engine } from "./engine";
+import { Engine, type ArtifactOwner } from "./engine";
 import { parseSimctlList, type SimulatorRef } from "./destination";
 import { findDeveloperTool, run as execTool } from "./exec";
 import {
@@ -120,6 +120,8 @@ export class Collector {
    * not asked to resend a manifest that has not changed.
    */
   private readonly manifestsReadAt = new Map<string, number>();
+  /** Each root's workspace, as its manifests' reader reported it. */
+  private readonly rootWorkspaces = new Map<string, string | null>();
   private simulators: SimulatorRef[] = [];
   private lastSimRefreshAt = 0;
   private xcresultTool: string | null | undefined;
@@ -389,6 +391,8 @@ export class Collector {
     if (roots.length === 0) return false;
     for (const read of await this.io.readManifests(roots, signal)) {
       if (signal?.aborted) return changed;
+      if (this.rootWorkspaces.size > 1000) this.rootWorkspaces.clear();
+      this.rootWorkspaces.set(read.root, read.workspace);
       let consumed = true;
       let readAt: number | null = null;
       for (const domain of read.domains) {
@@ -446,10 +450,19 @@ export class Collector {
     // question as "has this bundle been scanned". The seen key is the
     // authority on the latter, and keeping them separate is what lets a
     // deliberate re-queue actually re-read.
+    const roots = store.listRoots(host).map(({ path }) => path);
     const { candidates, finalized: finalizedSet } = await this.io.listBundles(
-      store.listRoots(host).map(({ path }) => path),
+      roots,
       store.listUnscannedBundlePaths(500, host),
     );
+    // A bundle Xcode left in a root's Test logs belongs to that root's checkout.
+    const rootByTestLogs = new Map(roots.map((root) => [`${root}/Logs/Test`, root]));
+    const ownerOf = (bundle: string): ArtifactOwner | null => {
+      const root = rootByTestLogs.get(bundle.slice(0, bundle.lastIndexOf("/")));
+      return root === undefined
+        ? null
+        : { root, workspace: this.rootWorkspaces.get(root) ?? null };
+    };
 
     /**
      * Whether `xcresulttool` can be had here, learned from the first bundle
@@ -555,9 +568,13 @@ export class Collector {
         parsed.tests,
         now,
         host,
+        ownerOf(bundle),
       );
-      store.markSeen(scannedKey, now);
       if (folded) changed = true;
+      // Matched to a run that is still running: its verdict waits for the
+      // run to end, and so does marking the bundle read (see `foldBundle`).
+      if (store.getRunByBundlePath(bundle, host)?.status === "running") continue;
+      store.markSeen(scannedKey, now);
     }
     return changed;
   }
