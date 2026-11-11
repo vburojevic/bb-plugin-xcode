@@ -119,7 +119,8 @@ export function XcodeActivityRow({
   // …"). An earlier version wrapped this to three lines to stop the fields
   // overlapping; it fixed the overlap and made the card two lines taller than
   // every neighbour in the stack, which read as a different component.
-  const meta = [run.destinationLabel, run.branch, tail].filter(
+  // A build on another Mac says which: the same thread can build on two.
+  const meta = [run.hostName, run.destinationLabel, run.branch, tail].filter(
     (part): part is string => Boolean(part),
   );
 

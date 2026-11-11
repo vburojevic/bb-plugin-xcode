@@ -108,6 +108,11 @@ export function describeCheckoutLocation(location: CheckoutLocation): string | n
     case "unknown":
       return null;
     case "other-host":
-      return `This thread's checkout lives on ${location.hostName}, but Xcode Simulators builds on the machine running bb.`;
+      // Tracked builds do run there (`xcode_build`, `bb xcode run`); Stills
+      // and the live mirror still drive this machine's simulators only.
+      return (
+        `This thread's checkout lives on ${location.hostName}, but Stills renders on the machine running bb. ` +
+        `Tracked builds (xcode_build, bb xcode run) do run on ${location.hostName}.`
+      );
   }
 }

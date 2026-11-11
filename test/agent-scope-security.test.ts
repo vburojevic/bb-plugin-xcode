@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createCli } from "../src/cli";
 import type { Collector } from "../src/collector";
+import { createLauncher } from "../src/launcher";
 import { RANK, type Run } from "../src/model";
+import type { RemoteBuilds } from "../src/remote";
 import type { ThreadScope } from "../src/scopes";
 import { MIGRATIONS, Store, type Db } from "../src/store";
 import { createTools } from "../src/tools";
@@ -69,7 +71,10 @@ function run(id: string, overrides: Partial<Run> = {}): Run {
   };
 }
 
-function fixture(checkoutRefusal: string | null = null) {
+/** The refusal a remote Mac's worker gives, when the test wants one. */
+const REMOTE_REFUSAL = "-derivedDataPath must stay inside this thread's checkout.";
+
+function fixture(checkoutHostId: string | null = null) {
   const store = makeStore();
   store.insertRun(run("r:mine"));
   store.insertRun(
@@ -109,8 +114,22 @@ function fixture(checkoutRefusal: string | null = null) {
     getLastActivities: () => [],
   } as unknown as Collector;
   const confirmHostAction = vi.fn(async () => false);
+  // Stands in for the other Mac's worker: it refuses, so nothing starts.
+  const remoteValidate = vi.fn(async () => ({ ok: false as const, message: REMOTE_REFUSAL }));
+  const launcher = createLauncher({
+    wrapped: {} as WrappedDeps,
+    remote: { validate: remoteValidate } as unknown as RemoteBuilds,
+    serverHostId: async () => "host_server",
+    listHosts: async () => [
+      { id: "host_server", name: "MacMini" },
+      { id: "host_other", name: "scw-mini" },
+    ],
+    log: { debug: () => undefined },
+  });
+  const scope = { ...SCOPE, hostId: checkoutHostId };
   const common = {
-    checkoutElsewhere: async () => checkoutRefusal,
+    launcher,
+    machineName: (hostId: string) => (hostId === "host_other" ? "scw-mini" : null),
     store,
     collector,
     dataDir: "/tmp/xcode-security-test",
@@ -119,11 +138,10 @@ function fixture(checkoutRefusal: string | null = null) {
     refreshProjectNames: () => undefined,
     scopeFor: async (threadId: string) =>
       threadId === SCOPE.threadId
-        ? SCOPE
+        ? scope
         : threadId === OTHER_SCOPE.threadId
           ? OTHER_SCOPE
           : null,
-    wrapped: {} as WrappedDeps,
     confirmHostAction,
   };
   const cli = createCli({
@@ -134,36 +152,53 @@ function fixture(checkoutRefusal: string | null = null) {
     ...common,
     showRun: (id) => ({ stdout: `detail:${id}` }),
   });
-  return { cli, confirmHostAction, tools };
+  return { cli, confirmHostAction, tools, remoteValidate };
 }
 
-describe("a checkout on another machine is refused with a sentence", () => {
-  const REFUSAL =
-    "This thread's checkout lives on scw-mini, but tracked xcodebuild runs on the machine running bb.";
-
-  it("refuses the agent build tool before touching the filesystem", async () => {
-    const { tools, confirmHostAction } = fixture(REFUSAL);
+describe("a checkout on another machine is built on that machine", () => {
+  it("routes the agent build tool to that Mac, which validates before anything runs", async () => {
+    const { tools, confirmHostAction, remoteValidate } = fixture("host_other");
     const result = await tools.build.execute(
-      { args: ["-scheme", "App"] },
+      { args: ["-scheme", "App", "-derivedDataPath", "../../elsewhere"] },
       { threadId: SCOPE.threadId, signal: new AbortController().signal },
     );
-    expect(result).toBe(REFUSAL);
-    // The old failure was an ENOENT thrown by realpath; nothing should have
-    // got as far as asking the user to approve a host action.
+    // The boundary was checked by the Mac that holds the checkout, and its
+    // sentence came back verbatim. The old failure was a bare ENOENT from
+    // realpath on the server, which does not have that directory.
+    expect(result).toBe(REMOTE_REFUSAL);
     expect(result).not.toContain("ENOENT");
+    expect(remoteValidate).toHaveBeenCalledWith(
+      { kind: "remote", hostId: "host_other", machineName: "scw-mini" },
+      {
+        argv: ["/usr/bin/xcodebuild", "-scheme", "App", "-derivedDataPath", "../../elsewhere"],
+        root: SCOPE.path,
+      },
+    );
     expect(confirmHostAction).not.toHaveBeenCalled();
   });
 
-  it("lets a checkout on this machine through the host gate", async () => {
-    const { tools } = fixture(null);
+  it("names the machine and validates there before asking a person", async () => {
+    const { cli, confirmHostAction, remoteValidate } = fixture("host_other");
+    const result = await cli.dispatch(
+      ["run", "--", "xcodebuild", "-scheme", "App", "build"],
+      { threadId: SCOPE.threadId, projectId: SCOPE.projectId!, cwd: SCOPE.path },
+    );
+    expect(remoteValidate).toHaveBeenCalledOnce();
+    // Refused by the worker, so nobody was asked to approve a doomed build.
+    expect(confirmHostAction).not.toHaveBeenCalled();
+    expect(result).toEqual({ exitCode: 1, stderr: `${REMOTE_REFUSAL}\n` });
+  });
+
+  it("keeps a checkout on this machine local", async () => {
+    const { tools, remoteValidate } = fixture("host_server");
     const result = await tools.build.execute(
       { args: ["-scheme", "App"] },
       { threadId: SCOPE.threadId, signal: new AbortController().signal },
     );
-    // It gets past the host gate and on to the real build path; whatever it
-    // fails on next, it must not be the cross-machine refusal.
-    expect(result).not.toBe(REFUSAL);
-    expect(result).not.toContain("lives on");
+    // It took the local path (whose realpath of a fixture directory fails),
+    // and never asked a worker anything.
+    expect(remoteValidate).not.toHaveBeenCalled();
+    expect(result).not.toBe(REMOTE_REFUSAL);
   });
 });
 

@@ -19,7 +19,7 @@ export interface ThreadScope {
   path: string;
   /**
    * Machine the checkout lives on. bb supports a server with enrolled Macs, so
-   * `path` is only meaningful on this host — see `checkoutHostMismatch`.
+   * `path` names a directory on that host — see `src/launcher.ts`.
    */
   hostId: string | null;
   branch: string | null;
