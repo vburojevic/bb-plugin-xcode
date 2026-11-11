@@ -9,6 +9,8 @@
  * Tracked builds whose checkout lives on another enrolled Mac run there,
  * through this plugin's `bb.host` worker (`host.ts`); `src/launcher.ts` picks
  * the machine and `src/remote.ts` keeps the run rows of the ones elsewhere.
+ * Builds on those Macs that nothing routed here — Xcode.app's, a terminal's —
+ * are watched through the same worker by `src/remote-watch.ts`.
  */
 
 
@@ -33,6 +35,7 @@ import { CLI_COMMANDS as SIM_VERBS } from "./src/sim/cli";
 import { hostContract, hostSignals } from "./src/host/contract";
 import { createLauncher, type HostSummary } from "./src/launcher";
 import { RemoteBuilds } from "./src/remote";
+import { RemoteWatch } from "./src/remote-watch";
 import { SETTINGS_DESCRIPTORS as SIMULATOR_SETTINGS } from "./src/sim/settings";
 import { ThreadSync } from "./src/thread-sync";
 import { AGENT_INSTRUCTIONS, createTools } from "./src/tools";
@@ -60,6 +63,8 @@ const REMOTE_RECONCILE_MS = 3_000;
 const REMOTE_IDLE_MS = 15_000;
 /** Host names change rarely; the list is re-read at most this often. */
 const HOSTS_TTL_MS = 60_000;
+/** How often the set of watched Macs is re-read. */
+const REMOTE_WATCH_RECONCILE_MS = 2_000;
 
 const OPPORTUNISTIC_PRUNE_MS = 6 * 3_600_000;
 
@@ -123,6 +128,13 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       label: "Extra DerivedData roots (comma separated)",
       default: "",
     },
+    watchMachines: {
+      type: "string",
+      label: "Always watch builds on these Macs (names, comma separated)",
+      description:
+        "Builds on another Mac — in Xcode, a terminal, or Xcode's own agent tools — are watched while a thread whose checkout is there is active or was in the last 30 minutes. Name a Mac here to watch it all the time. Watching means a process scan there every few seconds.",
+      default: "",
+    },
     // `bb.settings.define` is one call per plugin, so the Simulators half's
     // descriptors are spread in here rather than declared where they are read.
     // The key spaces are disjoint and asserted to be, in `test/sim/merge.test.ts`.
@@ -159,6 +171,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       extraRoots: values.extraRoots
         .split(",")
         .map((entry) => entry.trim())
+        .filter(Boolean),
+      watchMachines: values.watchMachines
+        .split(",")
+        .map((entry) => entry.trim().toLowerCase())
         .filter(Boolean),
     };
   };
@@ -232,13 +248,19 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       includePersonal: true,
       signal,
     });
+    // A source on another Mac names a path there; it scans and matches only
+    // that Mac's builds. When this machine's identity is unknown every source
+    // reads as this machine's, as all of them did before.
+    const server = await resolveHostId().catch(() => null);
     const out: CollectorProject[] = [];
     for (const project of projects) {
       const sources =
-        (project as { sources?: Array<{ path?: string }> }).sources ?? [];
+        (project as { sources?: Array<{ path?: string; hostId?: string | null }> }).sources ?? [];
       for (const source of sources) {
         if (source.path) {
-          out.push({ id: project.id, name: project.name, path: source.path });
+          const hostId =
+            server === null || !source.hostId || source.hostId === server ? null : source.hostId;
+          out.push({ id: project.id, name: project.name, path: source.path, hostId });
         }
       }
     }
@@ -311,9 +333,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   };
 
   const engine: Engine = new Engine(store, {
-    projectFor: (signals): string | null =>
-      collectorRef ? collectorRef.projectFor(signals) : null,
-    threadFor: (signals): string | null => scopeSync.scopes.threadFor(signals),
+    projectFor: (signals, hostId): string | null =>
+      collectorRef ? collectorRef.projectFor(signals, hostId) : null,
+    threadFor: (signals, hostId): string | null => scopeSync.scopes.threadFor(signals, hostId),
     log: (message) => log.debug(message),
   });
   const collector = new Collector(
@@ -323,7 +345,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   collectorRef = collector;
   engine.hydrate(Date.now());
 
-  const dto = new DtoMapper(store, engine, collector, machineName);
+  // Late-bound: the watcher needs the host client, created further down.
+  let remoteWatchRef: RemoteWatch | null = null;
+  const activitiesOn = (hostId: string) => remoteWatchRef?.activitiesOn(hostId) ?? [];
+  const dto = new DtoMapper(store, engine, collector, machineName, activitiesOn);
 
   const runRescan = (): void => {
     detach(
@@ -501,6 +526,42 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     }),
   ];
 
+  /**
+   * Builds on other Macs that nothing routed through this plugin. See
+   * `src/remote-watch.ts` for which Macs, and when.
+   */
+  const remoteWatch = new RemoteWatch({
+    store,
+    engine,
+    host: hostClient,
+    scopeHosts: (now) => scopeSync.scopes.watchedHosts(now),
+    scopePaths: (hostId) => scopeSync.scopes.pathsOn(hostId),
+    optInHosts: () => {
+      if (current.watchMachines.length === 0) return [];
+      if (Date.now() - hostsAt >= HOSTS_TTL_MS) {
+        detach(listHosts, (error) => log.debug(`host list failed: ${String(error)}`));
+      }
+      return hosts
+        .filter(
+          (entry) =>
+            current.watchMachines.includes(entry.name.toLowerCase()) ||
+            current.watchMachines.includes(entry.id.toLowerCase()),
+        )
+        .map((entry) => entry.id);
+    },
+    serverHostId: () => serverHostId,
+    projects: () => collector.getProjects(),
+    settings: () => ({
+      scanIntervalMs: current.scanIntervalMs,
+      scanProjects: current.scanProjects,
+      retentionDays: current.retentionDays,
+    }),
+    publishSoon,
+    log,
+    isDisposed,
+  });
+  remoteWatchRef = remoteWatch;
+
   const launcher = createLauncher({
     wrapped,
     remote,
@@ -546,7 +607,10 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     run.status === "running"
       ? engine.livePhase(
           run.id,
-          engine.liveActivity(run.id, collector.getLastActivities()),
+          engine.liveActivity(
+            run.id,
+            run.hostId === null ? collector.getLastActivities() : activitiesOn(run.hostId),
+          ),
         )
       : null;
 
@@ -762,6 +826,32 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           log.warn(`remote reconcile failed: ${String(error)}`);
         }
         await sleep(busy ? REMOTE_RECONCILE_MS : REMOTE_IDLE_MS, signal);
+      }
+    },
+  });
+
+  /**
+   * Watching other Macs. The set of Macs is re-read every couple of seconds,
+   * so a thread turning active on a MacBook has its Xcode.app build on the
+   * row within moments; each Mac then runs its own loop (`RemoteWatch`).
+   */
+  bb.background.service("remote-watch", {
+    async start(signal) {
+      try {
+        while (!signal.aborted) {
+          try {
+            // `serverHostId` is read synchronously by the watcher.
+            await resolveHostId();
+            remoteWatch.reconcile(signal);
+            // Rows from a watched Mac name it; keep the names warm (cached).
+            if (remoteWatch.hosts().length > 0) await listHosts();
+          } catch (error: unknown) {
+            log.debug(`remote watch reconcile failed: ${String(error)}`);
+          }
+          await sleep(REMOTE_WATCH_RECONCILE_MS, signal);
+        }
+      } finally {
+        await remoteWatch.stop();
       }
     },
   });

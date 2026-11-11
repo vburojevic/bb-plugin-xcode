@@ -39,7 +39,7 @@ import type { Engine } from "./engine";
 import { RANK, type Run } from "./model";
 import { parseXcodebuildArgs } from "./proc";
 import type { ThreadScope } from "./scopes";
-import type { Store } from "./store";
+import { HOST_BUILD_RUN_PREFIX, type Store } from "./store";
 import type { WrappedOutcome } from "./wrapped";
 import type {
   BuildProgress,
@@ -53,7 +53,7 @@ import type {
 export type HostCaller = Pick<ExperimentalHostClient<HostContract, HostSignals>, "call">;
 
 /** Run ids of remote builds: the build id, behind a fixed prefix. */
-const RUN_PREFIX = "w:";
+const RUN_PREFIX = HOST_BUILD_RUN_PREFIX;
 
 /** Call budgets. A summary can be three 60s-class xcresulttool runs. */
 const STATE_TIMEOUT_MS = 15_000;
@@ -470,6 +470,7 @@ export class RemoteBuilds {
               warnings: state.progress.warnings,
             },
             state.endedAt ?? now,
+            current.hostId,
           );
           // An age-capped run already carries the cap's end time; the Mac's
           // is the true one.
@@ -549,6 +550,7 @@ export class RemoteBuilds {
             result.summary ? { ...result.summary, tests: [] } : null,
             result.tests,
             this.now(),
+            hostId,
           );
           this.markScanned(bundlePath);
           return folded;

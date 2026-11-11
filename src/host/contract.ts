@@ -148,6 +148,93 @@ const testRowSchema = z
   })
   .strict();
 
+/** An absolute path on the Mac the worker runs on. */
+const machinePath = z.string().min(1).max(4096).startsWith("/");
+
+const runKind = z.enum([
+  "build",
+  "test",
+  "archive",
+  "clean",
+  "analyze",
+  "install",
+  "export",
+  "docbuild",
+  "package",
+  "index",
+  "unknown",
+]);
+
+const buildPhase = z.enum([
+  "preparing",
+  "resolving",
+  "compiling",
+  "assets",
+  "linking",
+  "packaging",
+  "signing",
+  "testing",
+]);
+
+/** One Xcode build seen in the Mac's process table, as `findRootActivities` reports it. */
+const activitySchema = z
+  .object({
+    pid: z.number().int().positive(),
+    comm: z.string().max(256),
+    args: z.string().max(4000),
+    startedAt: z.number(),
+    roots: z.array(z.string().max(4096)).max(32),
+    workerCount: z.number().int().nonnegative(),
+    phase: buildPhase.nullable(),
+    currentFile: z.string().max(1000).nullable(),
+    isDaemon: z.boolean(),
+    actionStartedAt: z.number().nullable(),
+    kind: runKind,
+    scheme: z.string().max(1000).nullable(),
+    container: z.string().max(4096).nullable(),
+    configuration: z.string().max(1000).nullable(),
+    destination: z.string().max(2000).nullable(),
+    derivedDataPath: z.string().max(4096).nullable(),
+    resultBundlePath: z.string().max(4096).nullable(),
+    cwd: z.string().max(4096).nullable(),
+    branch: z.string().max(1000).nullable(),
+    worktree: z.string().max(1000).nullable(),
+  })
+  .strict();
+
+/** The fields of a log-store entry the server folds. */
+const manifestRecordSchema = z
+  .object({
+    uniqueIdentifier: z.string().max(200),
+    title: z.string().max(2000).nullable(),
+    startedAt: z.number().nullable(),
+    endedAt: z.number().nullable(),
+    status: runStatus,
+    errorCount: z.number(),
+    warningCount: z.number(),
+    analyzerCount: z.number(),
+    testFailureCount: z.number(),
+  })
+  .strict();
+
+const summarizeOutput = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("ok"),
+      bundlePath: z.string(),
+      build: buildResultsSchema.nullable(),
+      summary: testSummarySchema.nullable(),
+      tests: z.array(testRowSchema).max(10_000),
+    })
+    .strict(),
+  /** Still running, or the bundle is not finalized yet. */
+  z.object({ status: z.literal("pending") }).strict(),
+  /** Nothing to parse: no record, no Xcode, or a bundle that never finalized. */
+  z.object({ status: z.literal("unavailable"), reason: z.string().max(2000) }).strict(),
+  /** The bundle exists but xcresulttool made nothing of it. */
+  z.object({ status: z.literal("unparseable") }).strict(),
+]);
+
 export const hostContract = defineRpcContract({
   /**
    * Check a build request where it will run, without starting anything.
@@ -188,23 +275,7 @@ export const hostContract = defineRpcContract({
   summarize: {
     experimental_retryable: true,
     input: z.object({ buildId: buildIdSchema }).strict(),
-    output: z.discriminatedUnion("status", [
-      z
-        .object({
-          status: z.literal("ok"),
-          bundlePath: z.string(),
-          build: buildResultsSchema.nullable(),
-          summary: testSummarySchema.nullable(),
-          tests: z.array(testRowSchema).max(10_000),
-        })
-        .strict(),
-      /** Still running, or the bundle is not finalized yet. */
-      z.object({ status: z.literal("pending") }).strict(),
-      /** Nothing to parse: no record, no Xcode, or a bundle that never finalized. */
-      z.object({ status: z.literal("unavailable"), reason: z.string().max(2000) }).strict(),
-      /** The bundle exists but xcresulttool made nothing of it. */
-      z.object({ status: z.literal("unparseable") }).strict(),
-    ]),
+    output: summarizeOutput,
   },
   /** Signal a running build, after proving the pid is still that build. */
   stop: {
@@ -218,6 +289,127 @@ export const hostContract = defineRpcContract({
     output: z
       .object({ stopped: z.boolean(), message: z.string().max(2000) })
       .strict(),
+  },
+  // ---- Watching builds this plugin did not start (Xcode.app, terminals) ----
+  //
+  // Read-only. Every path below is checked here, on the Mac it names, and the
+  // worker reads nothing outside DerivedData roots, the bundles builds on this
+  // Mac have named, and its own data directory.
+
+  /**
+   * The Xcode builds running on this Mac now: `ps`, then each build's
+   * working directory, git branch and workspace, read here. Builds this
+   * worker runs itself (`startBuild`) are left out: they are tracked already.
+   */
+  probe: {
+    experimental_retryable: true,
+    input: z.object({}).strict(),
+    output: z
+      .object({
+        activities: z.array(activitySchema).max(64),
+        /** Every build service alive on this Mac, reported or not. */
+        services: z
+          .array(z.object({ pid: z.number().int(), startedAt: z.number().nullable() }).strict())
+          .max(64)
+          .optional(),
+      })
+      .strict(),
+  },
+  /**
+   * DerivedData roots on this Mac: Xcode's shared location in this user's
+   * home, and any found by scanning the given checkouts.
+   */
+  discoverRoots: {
+    experimental_retryable: true,
+    input: z.object({ projectPaths: z.array(machinePath).max(64) }).strict(),
+    output: z
+      .object({
+        roots: z
+          .array(
+            z
+              .object({
+                path: z.string(),
+                via: z.enum(["default", "project-scan"]),
+                projectPath: z.string().nullable(),
+              })
+              .strict(),
+          )
+          .max(500),
+      })
+      .strict(),
+  },
+  /**
+   * The Build and Test log-store manifests of some roots, newest entries
+   * first. A root whose manifests have not changed since `ifModifiedSince`
+   * comes back with no domains; a root left out of the reply (not a root,
+   * or over the reply budget) was not read.
+   */
+  readManifests: {
+    experimental_retryable: true,
+    input: z
+      .object({
+        roots: z
+          .array(z.object({ path: machinePath, ifModifiedSince: z.number().nullable() }).strict())
+          .max(200),
+        /** Entries that started before this are left out. */
+        notBefore: z.number().nullable(),
+      })
+      .strict(),
+    output: z
+      .object({
+        roots: z
+          .array(
+            z
+              .object({
+                root: z.string(),
+                workspace: z.string().max(4096).nullable(),
+                domains: z
+                  .array(
+                    z
+                      .object({
+                        kind: z.enum(["build", "test"]),
+                        mtimeMs: z.number().nullable(),
+                        entries: z.array(manifestRecordSchema).max(1000),
+                      })
+                      .strict(),
+                  )
+                  .max(2),
+              })
+              .strict(),
+          )
+          .max(200),
+      })
+      .strict(),
+  },
+  /**
+   * The result bundles worth reading on this Mac: those Xcode left in the
+   * roots' Test logs, the shim's, and those of `paths` a build here named;
+   * plus which of them xcodebuild has finalized.
+   */
+  inspectBundles: {
+    experimental_retryable: true,
+    input: z
+      .object({
+        roots: z.array(machinePath).max(200),
+        paths: z.array(machinePath).max(500),
+      })
+      .strict(),
+    output: z
+      .object({
+        candidates: z.array(z.string()).max(4000),
+        finalized: z.array(z.string()).max(4000),
+      })
+      .strict(),
+  },
+  /** Parse a result bundle `inspectBundles` would list, on this Mac. */
+  summarizeBundle: {
+    experimental_retryable: true,
+    input: z.object({ path: machinePath }).strict(),
+    output: z.union([
+      summarizeOutput,
+      /** Not a bundle this worker will read: never ask about it again. */
+      z.object({ status: z.literal("refused"), reason: z.string().max(2000) }).strict(),
+    ]),
   },
   /** Retention for the builds this worker left on its Mac. */
   prune: {
@@ -258,4 +450,9 @@ export type BuildRequest = z.infer<typeof buildRequest>;
 export type StartRequest = z.infer<typeof startRequest>;
 export type BuildStarted = z.infer<typeof startedSchema>;
 export type SummarizeResult = z.output<(typeof hostContract)["summarize"]["output"]>;
+export type WireActivity = z.infer<typeof activitySchema>;
+export type ManifestReadReply = z.output<(typeof hostContract)["readManifests"]["output"]>;
+export type DiscoverRootsReply = z.output<(typeof hostContract)["discoverRoots"]["output"]>;
+export type SummarizeBundleResult = z.output<(typeof hostContract)["summarizeBundle"]["output"]>;
+export type InspectBundlesReply = z.output<(typeof hostContract)["inspectBundles"]["output"]>;
 export type StartBuildResult = z.output<(typeof hostContract)["startBuild"]["output"]>;

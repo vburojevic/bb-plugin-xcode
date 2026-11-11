@@ -251,7 +251,11 @@ export function createTools(deps: ToolDeps) {
         );
         const settled = await waitForVerdict(
           deps.store,
-          { bundlePath: started.bundlePath },
+          // A build on another Mac is found by its run id: its bundle path names
+          // a file on that Mac, and the same path could exist here.
+          started.runId !== null
+            ? { runId: started.runId }
+            : { bundlePath: started.bundlePath },
           { timeoutMs: VERDICT_GRACE_MS },
         );
 

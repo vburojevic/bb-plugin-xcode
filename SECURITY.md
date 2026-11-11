@@ -73,6 +73,33 @@ signalled. Signals reach the build's own process group, never the daemon's.
 Run rows are updated only by the Mac that ran them; a host signal carries
 bb's authenticated host id.
 
+### Watching builds on another Mac
+
+The worker also reports builds on its Mac that the plugin did not start. This
+covers Xcode.app, a terminal and Xcode's own agent tools. This half is read-only:
+it runs `ps`, `lsof` and `xcresulttool`, reads files, and starts, signals,
+writes or deletes nothing except a small list of bundle paths in its own data
+dir. What it reads is fenced on that Mac, with symlinks resolved there:
+
+- log-store manifests only at their fixed place inside a directory that is a
+  DerivedData root (it has `Logs/Build`), and never through a link that leads
+  out of it;
+- result bundles only in a root's `Logs/Test`, in the plugin's own shim
+  directory, or at a `-resultBundlePath` that a build on that Mac was seen
+  using. A path the server names that is none of these is refused, so the
+  server can no longer name an arbitrary bundle to parse. A bundle or
+  `build.db-journal` found on disk as evidence of an Xcode.app action counts
+  only as a real directory or file inside its root, never through a link, and
+  never joins the list of paths builds named;
+- checkouts to scan for DerivedData only as existing directories, walked
+  without following links.
+
+Replies are capped well under bb's 8 MiB host-RPC limit. A Mac is probed only
+while a thread whose checkout is on it is active or was recently, while the
+person has opted it in, or while a build seen there is still open. Each Mac's
+probe is held to the same duty cycle as the local one. `bb xcode stop` refuses
+a watched build on another Mac: the plugin signals only builds it started.
+
 Thread scoping compares machines as well as paths. Two Macs can hold the same
 checkout path on the same branch, so a path or checkout-name match only counts
 for a run on the scope's own machine; a thread can never read, wait on or stop

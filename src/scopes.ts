@@ -28,6 +28,12 @@ export interface ThreadScope {
   branch: string | null;
   /** True while the thread is running a turn. */
   active: boolean;
+  /**
+   * When the thread last ran a turn, as far as this plugin saw: set when one
+   * starts or ends, never by merely resolving the scope (opening an old
+   * thread resolves it too). Null when no turn was seen.
+   */
+  activeAt?: number | null;
   updatedAt: number;
 }
 
@@ -37,14 +43,21 @@ export const SCOPE_IDLE_TTL_MS = 30 * 60_000;
 export class ThreadScopes {
   private readonly byThread = new Map<string, ThreadScope>();
 
+  /** An active scope's turn is running now; an idle one keeps its `activeAt`. */
   upsert(scope: Omit<ThreadScope, "updatedAt">, now: number): void {
     if (!scope.path.startsWith("/")) return;
-    this.byThread.set(scope.threadId, { ...scope, updatedAt: now });
+    this.byThread.set(scope.threadId, {
+      ...scope,
+      activeAt: scope.active ? now : (scope.activeAt ?? null),
+      updatedAt: now,
+    });
   }
 
+  /** The thread's turn ended now. */
   deactivate(threadId: string, now: number): void {
     const scope = this.byThread.get(threadId);
     if (scope) {
+      if (scope.active) scope.activeAt = now;
       scope.active = false;
       scope.updatedAt = now;
     }
@@ -62,6 +75,30 @@ export class ThreadScopes {
     return [...this.byThread.values()];
   }
 
+  /**
+   * Other Macs with a thread checkout that is running a turn, or ran one
+   * within the idle TTL. These are the Macs worth watching: a build there now
+   * is most likely a thread's. Measured from the last turn (`activeAt`), not
+   * from when the scope was last resolved: opening an old thread resolves
+   * it, and must not start a process scan on its Mac.
+   */
+  watchedHosts(now: number): string[] {
+    const hosts = new Set<string>();
+    for (const scope of this.byThread.values()) {
+      if (scope.hostId === null) continue;
+      const lastTurn = scope.activeAt ?? null;
+      if (scope.active || (lastTurn !== null && now - lastTurn <= SCOPE_IDLE_TTL_MS)) {
+        hosts.add(scope.hostId);
+      }
+    }
+    return [...hosts];
+  }
+
+  /** Checkouts of scopes on one Mac, for its root discovery. */
+  pathsOn(hostId: string): string[] {
+    return [...new Set(this.list().filter((scope) => scope.hostId === hostId).map((scope) => scope.path))];
+  }
+
   /** Drop scopes idle past the TTL. Active scopes never expire. */
   prune(now: number): void {
     for (const [threadId, scope] of this.byThread) {
@@ -77,19 +114,22 @@ export class ThreadScopes {
    * recently updated beats the rest — two threads can share a checkout (a
    * thread plus its side chat), and the one actually running is the answer.
    *
-   * Only scopes on this machine are candidates: the signals come from this
-   * machine's process table, and another Mac can hold the very same path.
+   * Only scopes on the machine the signals were read on are candidates
+   * (`hostId` null: this one): another Mac can hold the very same path.
    */
-  threadFor(signals: {
-    root?: string | null;
-    cwd?: string | null;
-    container?: string | null;
-  }): string | null {
+  threadFor(
+    signals: {
+      root?: string | null;
+      cwd?: string | null;
+      container?: string | null;
+    },
+    hostId: string | null = null,
+  ): string | null {
     let best: ThreadScope | null = null;
     for (const path of [signals.cwd, signals.container, signals.root]) {
       if (!path) continue;
       for (const scope of this.byThread.values()) {
-        if (scope.hostId !== null) continue;
+        if (scope.hostId !== hostId) continue;
         if (!pathIsUnder(path, scope.path)) continue;
         if (!best) {
           best = scope;

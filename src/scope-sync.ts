@@ -128,6 +128,8 @@ export class ScopeSync {
           hostId,
           branch: env.branchName ?? null,
           active,
+          // Resolving a scope is not a turn: keep when the last one was.
+          activeAt: before?.activeAt ?? null,
         },
         this.now(),
       );
