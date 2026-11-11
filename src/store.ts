@@ -161,13 +161,32 @@ export const MIGRATIONS: readonly string[] = [
    */
   `CREATE INDEX IF NOT EXISTS run_bundle_idx ON run (bundle_path) WHERE bundle_path IS NOT NULL`,
 
-  // ---- Simulators (frozen from here down) ---------------------------------
+  // ---- Simulators (frozen) ------------------------------------------------
   // Spliced in, never interleaved. `bb.storage.migrate` applies statements by
   // index across the whole plugin, so the Simulators half cannot own its own
-  // array — its statements live in `src/sim/store.ts` for readability and are
-  // appended here, after everything above, permanently.
+  // array — its statements live in `src/sim/store.ts` for readability and sit
+  // here, at this offset, permanently. That array is frozen too: a statement
+  // appended to it would land in front of the tracker's v3 below and re-index
+  // every installed database. New statements from either half go at the end
+  // of THIS array. `test/sim/merge.test.ts` holds both offsets.
   ...SIMULATOR_MIGRATIONS,
+
+  // ---- v3: tracked builds on other Macs ------------------------------------
+  /**
+   * The Mac a run's process lives on, when that is not the machine running
+   * bb. NULL means this machine, which is every run the probe, the log store
+   * or the shim ever produced: those sources only see the server's own disk
+   * and process table. Set only by `src/remote.ts`, for builds the host
+   * worker ran on the thread's own Mac — and it is what keeps the server's
+   * own sweeps, which would read a remote path as "missing on disk", away
+   * from them.
+   */
+  `ALTER TABLE run ADD COLUMN host_id TEXT`,
+  `CREATE INDEX IF NOT EXISTS run_host_idx ON run (host_id) WHERE host_id IS NOT NULL`,
 ];
+
+/** Where the tracker's v3 statements start; asserted by the merge test. */
+export const V3_MIGRATIONS_START = MIGRATIONS.length - 2;
 
 /**
  * Escape a value for use as a LIKE prefix pattern.
@@ -233,6 +252,7 @@ interface RunRowRaw {
   branch: string | null;
   worktree: string | null;
   thread_id: string | null;
+  host_id: string | null;
 }
 
 function toRun(raw: RunRowRaw): Run {
@@ -263,6 +283,7 @@ function toRun(raw: RunRowRaw): Run {
     branch: raw.branch,
     worktree: raw.worktree,
     threadId: raw.thread_id,
+    hostId: raw.host_id,
   };
 }
 
@@ -299,8 +320,8 @@ export class Store {
          destination, project_id, root, cwd, pid, cmdline, started_at,
          ended_at, error_count, warning_count, analyzer_count, test_total,
          test_failed, test_skipped, bundle_path, detailed, branch, worktree,
-         thread_id
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         thread_id, host_id
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       run.id,
       run.status,
@@ -328,6 +349,7 @@ export class Store {
       run.branch,
       run.worktree,
       run.threadId,
+      run.hostId,
     );
   }
 
@@ -360,11 +382,17 @@ export class Store {
    * means "we looked at it". They are different questions, and keeping them
    * separate is what lets a deliberate re-queue actually re-read. Answered in
    * SQL so a long build's bundle cannot age out of a fixed window.
+   *
+   * This machine's bundles only. A remote run's bundle path names a file on
+   * another Mac; stat'ing it here reads as "never finalized" and would mark
+   * a perfectly good build cancelled. Those go through
+   * `listUnscannedRemoteBundles` and the host worker instead.
    */
   listUnscannedBundlePaths(limit = 500): string[] {
     const rows = this.sql(
       `SELECT bundle_path AS path, MAX(started_at) AS at FROM run
         WHERE bundle_path IS NOT NULL
+          AND host_id IS NULL
           AND (detailed = 0
                OR NOT EXISTS (SELECT 1 FROM seen_artifact s
                                WHERE s.key = 'bundle-scanned:' || run.bundle_path))
@@ -372,6 +400,54 @@ export class Store {
         ORDER BY at DESC LIMIT ?`,
     ).all(limit) as Array<{ path: string }>;
     return rows.map((row) => row.path);
+  }
+
+  /**
+   * Remote runs whose bundle the host worker has not summarized yet.
+   *
+   * The remote counterpart of `listUnscannedBundlePaths`: settled (a bundle of
+   * a running build is never complete), not yet detailed, not yet marked
+   * scanned. Newest first, so a backlog never starves the build someone is
+   * waiting on.
+   */
+  listUnscannedRemoteBundles(limit = 50): Array<{
+    runId: string;
+    hostId: string;
+    bundlePath: string;
+  }> {
+    const rows = this.sql(
+      `SELECT id, host_id, bundle_path FROM run
+        WHERE host_id IS NOT NULL AND bundle_path IS NOT NULL
+          AND status NOT IN ('running','finishing')
+          AND detailed = 0
+          AND NOT EXISTS (SELECT 1 FROM seen_artifact s
+                           WHERE s.key = 'bundle-scanned:' || run.bundle_path)
+        ORDER BY started_at DESC LIMIT ?`,
+    ).all(limit) as Array<{ id: string; host_id: string; bundle_path: string }>;
+    return rows.map((row) => ({
+      runId: row.id,
+      hostId: row.host_id,
+      bundlePath: row.bundle_path,
+    }));
+  }
+
+  /** Remote runs still waiting on their Mac to say how they ended. */
+  listOpenRemoteRuns(): Run[] {
+    const rows = this.sql(
+      `SELECT * FROM run WHERE host_id IS NOT NULL
+          AND status IN ('running','finishing')
+        ORDER BY started_at DESC`,
+    ).all() as RunRowRaw[];
+    return rows.map(toRun);
+  }
+
+  /** Every Mac this store holds a remote run for, for retention. */
+  listRemoteHostIds(): string[] {
+    return (
+      this.sql(
+        `SELECT DISTINCT host_id FROM run WHERE host_id IS NOT NULL`,
+      ).all() as Array<{ host_id: string }>
+    ).map((row) => row.host_id);
   }
 
   updateRun(run: Run): void {
@@ -558,11 +634,15 @@ export class Store {
    * every unresolved row and mapping it to a `Run` just to read `.length` —
    * alongside `expireFinishing`, which fetches the same rows for real. This is
    * the question actually being asked.
+   *
+   * On this machine: it sets the local probe's sweep cadence, and a build on
+   * another Mac gives this machine's DerivedData nothing new to read.
    */
   hasUnresolved(): boolean {
     return Boolean(
       this.sql(
-        `SELECT 1 FROM run WHERE status IN ('running','finishing') LIMIT 1`,
+        `SELECT 1 FROM run WHERE status IN ('running','finishing')
+            AND host_id IS NULL LIMIT 1`,
       ).get(),
     );
   }
@@ -576,12 +656,17 @@ export class Store {
    * the log-store entry spawn a duplicate standalone row (measured live).
    * The rank lattice already guards against a lower-rank source overwriting a
    * verified verdict; the filter's only job is candidacy, not protection.
+   *
+   * Local runs only. Every artifact these candidates are matched against was
+   * found on this machine's disk, so a build that overlapped in time on
+   * another Mac cannot be what it describes.
    */
   findVerdictCandidates(aroundMs: number, slackMs: number): Run[] {
     const rows = this.sql(
       `SELECT * FROM run
         WHERE status_rank < 2
           AND kind NOT IN ('index','package')
+          AND host_id IS NULL
           AND started_at <= ?
           AND COALESCE(ended_at, started_at + ?) >= ?
         ORDER BY started_at DESC LIMIT 20`,

@@ -54,6 +54,7 @@ function buildRun(overrides: Partial<Run> = {}): Run {
     branch: null,
     worktree: null,
     threadId: THREAD,
+    hostId: null,
     ...overrides,
   };
 }

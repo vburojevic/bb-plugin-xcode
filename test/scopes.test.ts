@@ -186,6 +186,7 @@ describe("Store.attributeRunsToThread", () => {
       branch: null,
       worktree: null,
       threadId: null,
+      hostId: null,
       ...overrides,
     });
 
@@ -271,6 +272,7 @@ describe("Store.typicalDurationMs", () => {
     branch: null,
     worktree: null,
     threadId: null,
+    hostId: null,
   };
   const add = (
     store: Store,

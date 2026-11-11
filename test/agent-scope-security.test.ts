@@ -64,6 +64,7 @@ function run(id: string, overrides: Partial<Run> = {}): Run {
     branch: SCOPE.branch,
     worktree: "App",
     threadId: SCOPE.threadId,
+    hostId: null,
     ...overrides,
   };
 }

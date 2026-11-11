@@ -148,6 +148,11 @@ export class Engine {
    */
   hydrate(now: number): void {
     for (const run of this.store.listUnresolved()) {
+      // A remote run's pid is a pid on another Mac. Adopting it here would let
+      // this machine's process table retire it, or a local process that
+      // happens to hold the same number keep it alive. `src/remote.ts` owns
+      // those runs.
+      if (run.hostId !== null) continue;
       if (run.status === "running" && run.pid !== null) {
         this.live.set(run.pid, {
           runId: run.id,
@@ -281,6 +286,8 @@ export class Engine {
           cwd: activity.cwd,
           container: activity.container,
         }),
+        // The probe reads this machine's process table, so: this machine.
+        hostId: null,
       };
       this.store.insertRun(run);
       this.live.set(activity.pid, {
@@ -540,6 +547,33 @@ export class Engine {
     return true;
   }
 
+  /**
+   * A build on another Mac whose wrapper is gone without having written how
+   * it ended — SIGKILLed, the Mac rebooted, or its record was deleted.
+   *
+   * "ended", not "cancelled": nobody here knows whether it was stopped, and
+   * the verdict-less status says exactly that. A finalized bundle read later
+   * still upgrades it through the rank lattice.
+   */
+  foldUnaccountedExit(runId: string, now: number, why: string): boolean {
+    const run = this.store.getRun(runId);
+    if (!run) return false;
+    if (
+      !statusTransitionAllowed(
+        { status: run.status, rank: run.statusRank },
+        { status: "ended", rank: RANK.observed },
+      )
+    ) {
+      return false;
+    }
+    run.status = "ended";
+    run.statusRank = RANK.observed;
+    run.endedAt ??= now;
+    this.store.updateRun(run);
+    this.hooks.log(`run ended without an exit status: ${run.id} (${why})`);
+    return true;
+  }
+
   // ---------------------------------------------------------- manifest fold
 
   /**
@@ -679,6 +713,7 @@ export class Engine {
       branch: null,
       worktree: null,
       threadId: null,
+      hostId: null,
     };
     this.store.insertRun(run);
     return true;
