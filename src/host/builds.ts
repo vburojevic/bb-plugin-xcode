@@ -272,11 +272,14 @@ export class HostBuilds {
   /** Starts in flight, by build id: a repeated start joins the first. */
   private readonly pendingStarts = new Map<string, Promise<StartBuildResult>>();
   /**
-   * Slots held by starts that passed admission and have not become watches
-   * yet. Counted with the watches, so concurrent starts cannot all pass a
-   * check that none of them has been counted in.
+   * Build ids holding one of this Mac's `MAX_LIVE_BUILDS` slots: starts in
+   * flight, launches waiting at their gate to be confirmed, and watches.
+   * A slot is claimed synchronously, so concurrent starts cannot all pass a
+   * check that none of them has been counted in, and it is held until the
+   * build is watched to its end or proven never to have run. No gate opens
+   * without one.
    */
-  private reserved = 0;
+  private readonly slots = new Set<string>();
   private adopted: Promise<void> | null = null;
   private tool: Promise<string | null> | null = null;
   private disposed = false;
@@ -351,21 +354,30 @@ export class HostBuilds {
     const checked = await this.validate(request);
     if (!checked.ok) return checked;
 
-    // Admission. Nothing may await between the count and the reservation,
-    // or concurrent starts all pass it.
-    if (this.watches.size + this.reserved >= MAX_LIVE_BUILDS) {
+    if (!this.claimSlot(buildId)) {
       return {
         ok: false,
         message: `${MAX_LIVE_BUILDS} tracked builds are already running on this Mac.`,
       };
     }
-    this.reserved += 1;
     try {
-      return await this.spawnBuild(buildId, request, checked.workingDir, hooks);
-    } finally {
-      // A started build is a watch by now; a failed one gives the slot back.
-      this.reserved -= 1;
+      const started = await this.spawnBuild(buildId, request, checked.workingDir, hooks);
+      // A started build is a watch by now, holding the slot it was given.
+      if (!started.ok) this.slots.delete(buildId);
+      return started;
+    } catch (error) {
+      // An unconfirmed launch keeps its slot: its wrapper may yet run.
+      if (!(error instanceof UnconfirmedLaunch)) this.slots.delete(buildId);
+      throw error;
     }
+  }
+
+  /** Take a slot for this build unless all are held. Synchronous by design. */
+  private claimSlot(buildId: string): boolean {
+    if (this.slots.has(buildId)) return true;
+    if (this.slots.size >= MAX_LIVE_BUILDS) return false;
+    this.slots.add(buildId);
+    return true;
   }
 
   private async spawnBuild(
@@ -441,7 +453,7 @@ export class HostBuilds {
       // recovers it from the intent once `ps` reads its real start, and
       // opens the gate then; until then it reports as launching.
       this.deps.log?.(`build ${buildId} (pid ${pid}) waits for a readable process table`);
-      throw new Error(
+      throw new UnconfirmedLaunch(
         `Started build ${buildId}, but could not read its process yet; ` +
           "it runs once this Mac can confirm it.",
       );
@@ -471,9 +483,11 @@ export class HostBuilds {
       const exited = await this.readExit({ exitPath: intent.exitPath });
       const identity = exited ? null : await this.probe(wrapperPid);
       // Could not look: the wrapper may well be there. Never call that lost.
-      if (identity === undefined) return { kind: "launching" };
+      if (identity === undefined) return this.launching(buildId);
       const alive =
         identity?.startedAt != null && identity.command?.includes(intent.marker) === true;
+      // Every slot is taken: it waits at its gate for one, or for its timeout.
+      if (alive && !this.claimSlot(buildId)) return { kind: "launching" };
       if (alive || exited) {
         const record: BuildRecord = {
           ...intent,
@@ -482,6 +496,7 @@ export class HostBuilds {
         };
         await writeJsonAtomic(join(this.dirFor(buildId), RECORD_FILE), record);
         if (alive) await openGate(record);
+        else this.slots.delete(buildId);
         this.deps.log?.(`recovered build ${buildId} from its launch intent`);
         return { kind: "record", record };
       }
@@ -489,9 +504,15 @@ export class HostBuilds {
     // Proof of a launch that never ran: no wrapper ever wrote its pid, or
     // `ps` says the one that did is gone without an exit. (A wrapper whose
     // gate times out writes its own exit, and is recovered as such above.)
-    return this.now() - intent.requestedAt < LAUNCH_SETTLE_MS
-      ? { kind: "launching" }
-      : { kind: "unlaunched" };
+    if (this.now() - intent.requestedAt < LAUNCH_SETTLE_MS) return this.launching(buildId);
+    this.slots.delete(buildId);
+    return { kind: "unlaunched" };
+  }
+
+  /** A launch not resolved yet still holds a slot: its wrapper may run. */
+  private launching(buildId: string): Recovery {
+    this.claimSlot(buildId);
+    return { kind: "launching" };
   }
 
   /**
@@ -504,6 +525,7 @@ export class HostBuilds {
     if (await exists(record.readyPath)) return;
     if (await this.readExit(record)) return;
     if ((await this.liveness(record)) !== "alive") return;
+    if (!this.claimSlot(record.buildId)) return;
     await openGate(record);
     this.deps.log?.(`opened the gate of recorded build ${record.buildId}`);
   }
@@ -597,6 +619,7 @@ export class HostBuilds {
     record: BuildRecord,
     exit: { status: number; endedAt: number } | null,
   ): Promise<BuildState> {
+    this.slots.delete(record.buildId);
     // A wrapper whose gate timed out ran nothing; its 125 is not a build's.
     const unlaunched = exit !== null && (await exists(record.unlaunchedPath));
     const decoded =
@@ -709,6 +732,8 @@ export class HostBuilds {
       done: Promise.resolve(),
     };
     this.watches.set(record.buildId, entry);
+    // Already running, so counted whether or not a slot was free for it.
+    this.slots.add(record.buildId);
     try {
       this.lease ??= hooks.retainWorker();
     } catch (error) {
@@ -722,6 +747,7 @@ export class HostBuilds {
       })
       .finally(() => {
         this.watches.delete(record.buildId);
+        this.slots.delete(record.buildId);
         if (this.watches.size === 0 && this.lease) {
           const lease = this.lease;
           this.lease = null;
@@ -1034,6 +1060,11 @@ export class HostBuilds {
     }
     return out;
   }
+}
+
+/** A wrapper is spawned and held at its gate, but `ps` has not confirmed it. */
+class UnconfirmedLaunch extends Error {
+  override readonly name = "UnconfirmedLaunch";
 }
 
 /** Incremental reader for a growing NDJSON stream file. */

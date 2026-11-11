@@ -791,6 +791,54 @@ describe("a launch the worker did not finish", () => {
     expect(existsSync(join(dir, "ready"))).toBe(false);
   });
 
+  it("counts unconfirmed launches against the limit, across a worker replacement", async () => {
+    const ws = workspace();
+    const { readProcessIdentity, ProcessInspectionError } = await import("../src/host/identity");
+    const ps = { broken: true };
+    const readIdentity = async (pid: number) => {
+      if (ps.broken) throw new ProcessInspectionError("ps timed out");
+      return readProcessIdentity(pid);
+    };
+    const startOn = (harness: Harness, buildId: string) =>
+      harness.experimental_call("startBuild", {
+        buildId,
+        argv: ["/usr/bin/xcodebuild", "-scheme", "pass", "build"],
+        root: ws.checkout,
+      });
+    const ids = Array.from({ length: 6 }, (_, index) => mintBuildId(Date.now() + index));
+    const gates = () => ids.filter((id) => existsSync(join(ws.dataDir, "builds", id, "ready")));
+
+    // Six threads ask during a `ps` outage: four launches wait unconfirmed,
+    // and they hold the Mac's four slots.
+    const first = harnessFor(ws, { readIdentity });
+    const outcomes = await Promise.allSettled(ids.map((id) => startOn(first, id)));
+    expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(4);
+    const refused = outcomes.filter(
+      (outcome) => outcome.status === "fulfilled" && !outcome.value.ok,
+    );
+    expect(refused).toHaveLength(2);
+    const held = ids.filter((id) => existsSync(join(ws.dataDir, "builds", id, "launch.json")));
+    expect(held).toHaveLength(4);
+
+    // A fresh worker finds those four on disk before it admits anything.
+    await first.experimental_dispose();
+    const second = harnessFor(ws, { readIdentity });
+    const late = await startOn(second, mintBuildId(Date.now() + 10));
+    expect(late).toMatchObject({ ok: false, message: expect.stringContaining("already running") });
+
+    // `ps` answers again: the four run, and no more than four gates ever open.
+    ps.broken = false;
+    const { states } = await second.experimental_call("buildStates", { buildIds: held });
+    expect(states.map((state) => state.status)).toEqual(["running", "running", "running", "running"]);
+    expect(gates()).toHaveLength(4);
+    for (const id of held) await until(() => exitedSignal(second, id));
+    expect(gates()).toHaveLength(4);
+
+    // Finished builds give their slots back.
+    const next = await startOn(second, mintBuildId(Date.now() + 20));
+    expect(next).toMatchObject({ ok: true });
+  });
+
   it("leaves no wrapper waiting at a gate whose directory is gone", async () => {
     const ws = workspace();
     const first = harnessFor(ws, hanging);
