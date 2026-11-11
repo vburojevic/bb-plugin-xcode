@@ -101,6 +101,24 @@ function fixture(checkoutHostId: string | null = null) {
       pid: 4242,
     }),
   );
+  // The same checkout path and branch on another Mac, owned by its thread,
+  // and a build there no thread has claimed yet.
+  store.insertRun(
+    run("w:twin-live", {
+      status: "running",
+      statusRank: RANK.observed,
+      threadId: "th_twin",
+      hostId: "host_other",
+      startedAt: NOW + 20_000,
+      endedAt: null,
+      pid: 5151,
+    }),
+  );
+  store.insertRun(
+    run("w:twin-unclaimed", { threadId: null, hostId: "host_other", startedAt: NOW + 21_000 }),
+  );
+  // A build on this machine at the path, before any thread claimed it.
+  store.insertRun(run("r:local-unclaimed", { threadId: null, startedAt: NOW + 22_000 }));
   store.upsertRoot("/private/DerivedData/App", "proj_app", "manifest", NOW);
   store.upsertRoot(
     "/private/DerivedData/SecretOther",
@@ -199,6 +217,45 @@ describe("a checkout on another machine is built on that machine", () => {
     // and never asked a worker anything.
     expect(remoteValidate).not.toHaveBeenCalled();
     expect(result).not.toBe(REMOTE_REFUSAL);
+  });
+});
+
+describe("the same checkout path on two Macs", () => {
+  const ctx = { threadId: SCOPE.threadId, projectId: SCOPE.projectId!, cwd: SCOPE.path };
+
+  it("never shows, waits on or stops the other Mac's run", async () => {
+    const { cli, confirmHostAction } = fixture(null);
+    for (const id of ["w:twin-live", "w:twin-unclaimed"]) {
+      expect(await cli.dispatch(["show", id], ctx)).toEqual({
+        exitCode: 1,
+        stderr: `No run with id '${id}'.\n`,
+      });
+      expect(await cli.dispatch(["wait", id, "--timeout", "1"], ctx)).toEqual({
+        exitCode: 1,
+        stderr: `No run with id '${id}'.\n`,
+      });
+    }
+    expect(await cli.dispatch(["stop", "w:twin-live"], ctx)).toEqual({
+      exitCode: 1,
+      stderr: "No run with id 'w:twin-live'.\n",
+    });
+    expect(confirmHostAction).not.toHaveBeenCalled();
+    expect((await cli.dispatch(["status"], ctx)).stdout).not.toContain("w:twin");
+    const runs = (await cli.dispatch(["runs"], ctx)).stdout ?? "";
+    expect(runs).not.toContain("w:twin");
+    expect(runs).toContain("r:local-unclaimed");
+  });
+
+  it("keeps a thread on the other Mac away from this machine's unclaimed run", async () => {
+    const { cli, tools } = fixture("host_other");
+    const runs = (await cli.dispatch(["runs"], ctx)).stdout ?? "";
+    expect(runs).toContain("w:twin-unclaimed");
+    expect(runs).not.toContain("r:local-unclaimed");
+    expect((await cli.dispatch(["show", "r:local-unclaimed"], ctx)).exitCode).toBe(1);
+    const status = await tools.status.execute({}, { threadId: SCOPE.threadId });
+    expect(status).not.toContain("r:local-unclaimed");
+    // Same Mac, same path: that is the same checkout, so it is this thread's.
+    expect(status).toContain("w:twin-live");
   });
 });
 

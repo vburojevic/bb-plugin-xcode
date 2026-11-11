@@ -255,6 +255,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     getThread: (threadId) => bb.sdk.threads.get({ threadId }),
     getEnvironment: (environmentId) =>
       bb.sdk.environments.get({ environmentId }),
+    // Late-bound: only called during a refresh, after the factory has run.
+    serverHostId: () => resolveHostId(),
     log: (message) => log.debug(message),
     isDisposed,
     onChanged: publishSoon,

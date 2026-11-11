@@ -223,6 +223,8 @@ export interface RunScope {
   threadId: string;
   path: string;
   branch: string | null;
+  /** The Mac the checkout is on; null for this machine. */
+  hostId: string | null;
 }
 
 interface RunRowRaw {
@@ -495,16 +497,23 @@ export class Store {
    * path — a build the probe saw before the thread's scope was registered
    * (the thread.active resolution races the first probe tick).
    */
-  attributeRunsToThread(threadId: string, path: string, since: number): number {
+  attributeRunsToThread(
+    threadId: string,
+    path: string,
+    hostId: string | null,
+    since: number,
+  ): number {
     const base = path.endsWith("/") ? path.slice(0, -1) : path;
     if (!base) return 0;
     const prefix = likePrefix(base);
+    // `IS`, not `=`: null-safe, and null is this machine. The same path on
+    // another Mac is a different checkout.
     const result = this.sql(
       `UPDATE run SET thread_id = ?
-        WHERE thread_id IS NULL AND started_at >= ?
+        WHERE thread_id IS NULL AND started_at >= ? AND host_id IS ?
           AND (cwd = ? OR cwd LIKE ? ESCAPE '\\'
                OR container = ? OR container LIKE ? ESCAPE '\\')`,
-    ).run(threadId, since, base, prefix, base, prefix) as { changes?: number };
+    ).run(threadId, since, hostId, base, prefix, base, prefix) as { changes?: number };
     return result?.changes ?? 0;
   }
 
@@ -1022,7 +1031,8 @@ export class Store {
  * The SQL half of `runMatchesScope`.
  *
  * Kept in lockstep with `scopes.ts` by `test/scopes.test.ts`, which runs the
- * same fixtures through both. The three arms, weakest last:
+ * same fixtures through both. The three arms, weakest last — the second and
+ * third only for a run on the scope's own machine:
  *
  *  - the run was attributed to this thread when it was observed;
  *  - one of its paths sits under the thread's checkout;
@@ -1034,7 +1044,6 @@ function scopeClause(scope: RunScope): { sql: string; params: unknown[] } {
   const base = scope.path.endsWith("/") ? scope.path.slice(0, -1) : scope.path;
   const prefix = likePrefix(base);
   const arms = [
-    "thread_id = ?",
     "cwd = ?",
     "cwd LIKE ? ESCAPE '\\'",
     "container = ?",
@@ -1043,7 +1052,6 @@ function scopeClause(scope: RunScope): { sql: string; params: unknown[] } {
     "root LIKE ? ESCAPE '\\'",
   ];
   const params: unknown[] = [
-    scope.threadId,
     base,
     prefix,
     base,
@@ -1055,5 +1063,10 @@ function scopeClause(scope: RunScope): { sql: string; params: unknown[] } {
     arms.push("(worktree = ? AND branch = ?)");
     params.push(base.slice(base.lastIndexOf("/") + 1), scope.branch);
   }
-  return { sql: `(${arms.join(" OR ")})`, params };
+  // The thread arm stands alone; every path/name arm is only meaningful on
+  // the run's own machine (`IS`: null-safe, null = this machine).
+  return {
+    sql: `(thread_id = ? OR (host_id IS ? AND (${arms.join(" OR ")})))`,
+    params: [scope.threadId, scope.hostId ?? null, ...params],
+  };
 }

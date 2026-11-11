@@ -98,6 +98,23 @@ describe("ThreadScopes.threadFor", () => {
     ).toBe("th_app");
   });
 
+  it("never attributes this machine's process to a scope on another Mac", () => {
+    const scopes = new ThreadScopes();
+    scopes.upsert(
+      {
+        threadId: "th_mbp",
+        projectId: "proj_1",
+        environmentId: "env_mbp",
+        path: "/Users/me/Git/App",
+        hostId: "host_mbp",
+        branch: "main",
+        active: true,
+      },
+      NOW,
+    );
+    expect(scopes.threadFor({ cwd: "/Users/me/Git/App/Sources" })).toBe(null);
+  });
+
   it("returns null for paths outside every scope", () => {
     expect(makeScopes().threadFor({ cwd: "/tmp/elsewhere" })).toBe(null);
   });
@@ -124,6 +141,7 @@ describe("runMatchesScope", () => {
     root: null,
     branch: null,
     worktree: null,
+    hostId: null,
   };
 
   it("matches by persisted threadId first", () => {
@@ -196,8 +214,14 @@ describe("Store.attributeRunsToThread", () => {
     store.insertRun(run("r4", { cwd: "/wt/App", threadId: "th_other" }));
     store.insertRun(run("r5", { cwd: "/wt/App", startedAt: NOW - 10_000 }));
 
-    const changed = store.attributeRunsToThread("th_app", "/wt/App", NOW - 5_000);
+    // The same path on another Mac is a different checkout.
+    store.insertRun(run("r6", { cwd: "/wt/App", hostId: "host_mbp" }));
+
+    const changed = store.attributeRunsToThread("th_app", "/wt/App", null, NOW - 5_000);
     expect(changed).toBe(2);
+    expect(store.getRun("r6")?.threadId).toBe(null);
+    expect(store.attributeRunsToThread("th_mbp", "/wt/App", "host_mbp", NOW - 5_000)).toBe(1);
+    expect(store.getRun("r6")?.threadId).toBe("th_mbp");
     expect(store.getRun("r1")?.threadId).toBe("th_app");
     expect(store.getRun("r2")?.threadId).toBe("th_app");
     expect(store.getRun("r3")?.threadId).toBe(null);
@@ -221,6 +245,7 @@ describe("scopeFilter", () => {
     root: "/Users/v/.bb/worktrees/env_other/indexed/ios/App/.build/DerivedData",
     branch: "bb/other-branch",
     worktree: "indexed",
+    hostId: null,
   };
   const mine = { ...foreign, threadId: "thr_mine" };
 

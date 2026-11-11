@@ -18,8 +18,11 @@ export interface ThreadScope {
   /** Absolute worktree/checkout path of the thread's environment. */
   path: string;
   /**
-   * Machine the checkout lives on. bb supports a server with enrolled Macs, so
-   * `path` names a directory on that host — see `src/launcher.ts`.
+   * The enrolled Mac the checkout lives on, or null for the machine running
+   * bb. Normalized by `ScopeSync`: an environment on this machine is null
+   * here, exactly as its runs are, so the host comparison in
+   * `runMatchesScope` is a plain equality. `path` names a directory on that
+   * host — see `src/launcher.ts`.
    */
   hostId: string | null;
   branch: string | null;
@@ -73,6 +76,9 @@ export class ThreadScopes {
    * path wins; among equals, an active scope beats an idle one and the most
    * recently updated beats the rest — two threads can share a checkout (a
    * thread plus its side chat), and the one actually running is the answer.
+   *
+   * Only scopes on this machine are candidates: the signals come from this
+   * machine's process table, and another Mac can hold the very same path.
    */
   threadFor(signals: {
     root?: string | null;
@@ -83,6 +89,7 @@ export class ThreadScopes {
     for (const path of [signals.cwd, signals.container, signals.root]) {
       if (!path) continue;
       for (const scope of this.byThread.values()) {
+        if (scope.hostId !== null) continue;
         if (!pathIsUnder(path, scope.path)) continue;
         if (!best) {
           best = scope;
@@ -135,10 +142,18 @@ export function pathIsUnder(path: string, base: string): boolean {
 export function scopeFilter<
   T extends Parameters<typeof runMatchesScope>[0],
 >(
-  scope: { threadId: string; path: string; branch: string | null } | null,
+  scope: RunScopeLike | null,
 ): (run: T) => boolean {
   if (!scope) return () => false;
   return (run) => runMatchesScope(run, scope);
+}
+
+/** The parts of a scope the predicate reads. `hostId` null = this machine. */
+export interface RunScopeLike {
+  threadId: string;
+  path: string;
+  branch: string | null;
+  hostId: string | null;
 }
 
 export function runMatchesScope(
@@ -149,10 +164,16 @@ export function runMatchesScope(
     root: string | null;
     branch: string | null;
     worktree: string | null;
+    hostId: string | null;
   },
-  scope: { threadId: string; path: string; branch: string | null },
+  scope: RunScopeLike,
 ): boolean {
+  // A run attributed to this thread is this thread's, wherever it ran.
   if (run.threadId && run.threadId === scope.threadId) return true;
+  // Every other arm compares paths and names, and two Macs can hold the same
+  // `/Users/me/App` on the same branch. A path only means something on its
+  // own machine. Mirrored in `scopeClause` (store.ts).
+  if ((run.hostId ?? null) !== (scope.hostId ?? null)) return false;
   for (const path of [run.cwd, run.container, run.root]) {
     if (path && pathIsUnder(path, scope.path)) return true;
   }
