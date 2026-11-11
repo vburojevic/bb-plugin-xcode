@@ -265,6 +265,17 @@ export class Engine {
       // process table speaks for it. A watched one is adopted under its own
       // Mac, so only that Mac's snapshots can confirm or retire it.
       if (isHostBuildRun(run)) continue;
+      // An Xcode.app action left `finishing` by a stretch it could not be
+      // seen through, its bundle still to come: held as the sweeps held it,
+      // until its machine has answered again and the sweeps can say.
+      if (
+        run.status === "finishing" &&
+        run.bundlePath !== null &&
+        isBuildServiceCommand(run.cmdline) &&
+        now - run.startedAt < MAX_ACTION_AGE_MS
+      ) {
+        this.awaiting.set(run.id, now);
+      }
       if (run.status === "running" && run.pid !== null) {
         this.live.set(liveKey(run.hostId, run.pid), {
           runId: run.id,
@@ -340,6 +351,9 @@ export class Engine {
       this.awaiting.delete(run.id);
       return false;
     }
+    // Restored at boot, and its machine has not answered since: nothing yet
+    // says its service has gone.
+    if (!this.presence.has(run.hostId ?? "")) return true;
     return this.producerAlive(run);
   }
 

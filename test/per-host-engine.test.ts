@@ -9,10 +9,10 @@
  */
 
 import Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { Collector } from "../src/collector";
 import { Engine, MISSES_BEFORE_FINISHING, observedRunId } from "../src/engine";
@@ -31,6 +31,7 @@ import {
 } from "../src/store";
 import type { LiveActivity } from "../src/types";
 import { DerivedDataActions, MAX_ACTION_AGE_MS } from "../src/xcode-actions";
+import { waitForVerdict } from "../src/wrapped";
 
 const NOW = 1_800_000_000_000;
 const MBP = "host_mbp";
@@ -1092,5 +1093,122 @@ describe("an Xcode.app run around a stretch it could not be seen through", () =>
           ?.endedAt,
       ).toBe(NOW + 30_000);
     });
+  });
+});
+
+describe("review of e069a6c: a reload while a test cannot be seen", () => {
+  const SERVICE =
+    "/Applications/Xcode.app/Contents/SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/SWBBuildService.bundle/Contents/MacOS/SWBBuildService";
+  /** The reload: 60 s past the row's inferred end, past the 45 s timeout. */
+  const RELOAD = NOW + 70_000;
+
+  function reloaded(options: { serviceAlive: boolean; hostId?: string | null; startedAt?: number }) {
+    const dir = mkdtempSync(join(tmpdir(), "xcode-reload-"));
+    cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const bundle = join(dir, "Logs/Test/Test-App.xcresult");
+    mkdirSync(join(bundle, "Data"), { recursive: true });
+    const hostId = options.hostId ?? null;
+    const startedAt = options.startedAt ?? NOW;
+    const store = migrated();
+    // What the last instance left: held out of `ended` by its sweeps.
+    const row = run(observedRunId(hostId, 812, startedAt), {
+      status: "finishing",
+      kind: "test",
+      pid: 812,
+      cmdline: SERVICE,
+      hostId,
+      startedAt,
+      bundlePath: bundle,
+      endedAt: NOW + 10_000,
+    });
+    store.insertRun(row);
+
+    // The new instance: engine hydrated, a collector over the real process
+    // observer and bundle listing of this machine.
+    const engine = engineWith(store);
+    engine.hydrate(RELOAD);
+    const local = new LocalMachine({
+      dataDir: "",
+      resolveTool: async () => null,
+      observer: new ProcessObserver({
+        ps: async () =>
+          `    1     0 10-00:00:00 /sbin/launchd\n${options.serviceAlive ? `  812     1 10-00:00:00 ${SERVICE}\n` : ""}`,
+        cwdOf: async () => "/",
+        gitOf: async () => null,
+        actions: new DerivedDataActions(join(dir, "none")),
+      }),
+    });
+    const io: MachineIO = {
+      snapshot: (now, signal) => local.snapshot(now, signal),
+      services: () => local.services(),
+      discoverRoots: async () => [],
+      readManifests: async () => [],
+      listBundles: (roots, claimed) => local.listBundles(roots, claimed),
+      parseBundle: async () => ({
+        status: "ok",
+        build: {
+          status: "passed",
+          startedAt: NOW,
+          endedAt: RELOAD + 20_000,
+          errorCount: 0,
+          warningCount: 0,
+          analyzerCount: 0,
+          actionTitle: null,
+          destination: null,
+          issues: [],
+        },
+        summary: null,
+        tests: [],
+      }),
+    };
+    const collector = new Collector(
+      { store, engine, listProjects: async () => [], log: { debug: () => undefined, warn: () => undefined }, dataDir: "", io },
+      { scanProjects: false, extraRoots: [] },
+    );
+    const pending = async () =>
+      (await waitForVerdict(store, { runId: row.id }, { timeoutMs: 20, pollMs: 5 }))?.status;
+    return { store, row, bundle, collector, pending };
+  }
+  const cleanup: Array<() => void> = [];
+  afterEach(() => {
+    for (const fn of cleanup.splice(0)) fn();
+  });
+
+  it("keeps the test pending through the first probe and sweep, until its bundle says", async () => {
+    const { store, row, bundle, collector, pending } = reloaded({ serviceAlive: true });
+    // The loop's own order: a probe, then a sweep.
+    for (let tick = 0; tick < 5; tick += 1) {
+      await collector.probeTick(RELOAD + tick * 4_000);
+      expect(await pending()).toBe("finishing");
+      await collector.sweepBundles(RELOAD + tick * 4_000 + 1_000);
+      expect(await pending()).toBe("finishing");
+    }
+    writeFileSync(join(bundle, "Info.plist"), "");
+    await collector.sweepBundles(RELOAD + 21_000);
+    expect(await pending()).toBe("passed");
+    expect(store.getRun(row.id)).toMatchObject({ statusRank: RANK.verified, endedAt: RELOAD + 20_000 });
+  });
+
+  it("ends it at the first probe that shows its service gone", async () => {
+    const { collector, pending } = reloaded({ serviceAlive: false });
+    await collector.probeTick(RELOAD);
+    expect(await pending()).toBe("ended");
+  });
+
+  it("holds another Mac's no longer than a sweep's worth while that Mac does not answer", async () => {
+    // Only this machine's collector runs: the MacBook has not answered yet.
+    const { collector, pending } = reloaded({ serviceAlive: true, hostId: MBP });
+    await collector.probeTick(RELOAD + 2_000);
+    expect(await pending()).toBe("finishing");
+    await collector.probeTick(RELOAD + 89_000);
+    expect(await pending()).toBe("finishing");
+    await collector.probeTick(RELOAD + 91_000);
+    expect(await pending()).toBe("ended");
+  });
+
+  it("does not hold an action past how long one can be believed to last", async () => {
+    const { collector, pending } = reloaded({ serviceAlive: true, startedAt: RELOAD - MAX_ACTION_AGE_MS });
+    await collector.probeTick(RELOAD);
+    expect(await pending()).toBe("ended");
   });
 });
