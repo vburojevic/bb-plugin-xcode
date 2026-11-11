@@ -768,6 +768,29 @@ describe("a launch the worker did not finish", () => {
     expect(second.experimental_getSignals().filter((signal) => signal.signal === "exited")).toHaveLength(1);
   });
 
+  it("never starts a second wrapper for a launch it has not confirmed", async () => {
+    const ws = workspace();
+    const { ProcessInspectionError } = await import("../src/host/identity");
+    const failing = {
+      readIdentity: async (): Promise<null> => {
+        throw new ProcessInspectionError("ps timed out");
+      },
+    };
+    const harness = harnessFor(ws, failing);
+    const buildId = mintBuildId(Date.now());
+    const request = {
+      buildId,
+      argv: ["/usr/bin/xcodebuild", "-scheme", "pass", "build"],
+      root: ws.checkout,
+    };
+    await expect(harness.experimental_call("startBuild", request)).rejects.toThrow(/could not read its process/);
+    const dir = join(ws.dataDir, "builds", buildId);
+    const wrapper = readFileSync(join(dir, "wrapper.pid"), "utf8");
+    await expect(harness.experimental_call("startBuild", request)).rejects.toThrow(/still launching/);
+    expect(readFileSync(join(dir, "wrapper.pid"), "utf8")).toBe(wrapper);
+    expect(existsSync(join(dir, "ready"))).toBe(false);
+  });
+
   it("leaves no wrapper waiting at a gate whose directory is gone", async () => {
     const ws = workspace();
     const first = harnessFor(ws, hanging);

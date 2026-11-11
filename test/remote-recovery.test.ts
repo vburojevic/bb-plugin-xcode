@@ -350,6 +350,68 @@ describe("a process table that cannot be read", () => {
       return t.store.getRun(runId)?.status === "passed";
     });
   });
+
+  // Ten five-second `ps` timeouts while the worker reads the new wrapper's
+  // start: a start time guessed from the clock then would be ~50 s late, and
+  // the same live wrapper would fail every identity check once `ps` recovers.
+  async function startWhilePsTimesOut(scheme: string) {
+    const { readProcessIdentity, ProcessInspectionError } = await import("../src/host/identity");
+    let timeouts = 10;
+    const t = setup({
+      firstWorker: (clock) => ({
+        now: () => clock.now,
+        readIdentity: async (pid) => {
+          if (timeouts > 0) {
+            timeouts -= 1;
+            clock.now += 5_000;
+            throw new ProcessInspectionError("ps timed out");
+          }
+          return readProcessIdentity(pid);
+        },
+      }),
+    });
+    const remote = t.server();
+    const started = await remote.start(MBP, t.request(scheme), t.scope);
+    if (started.ok) throw new Error("expected the start to stay unconfirmed");
+    const runId = runIdIn(started.message);
+    const dir = join(t.ws.dataDir, "builds", runId.slice(2));
+    // Held at its gate, with no record made from a guess.
+    expect(existsSync(join(dir, "wrapper.pid"))).toBe(true);
+    expect(existsSync(join(dir, "record.json"))).toBe(false);
+    expect(existsSync(join(dir, "ready"))).toBe(false);
+    expect(t.store.getRun(runId)?.status).toBe("running");
+    // The server backs off from a start it could not confirm; let that pass.
+    t.clock.now += 60_000;
+    return { t, remote, runId, dir };
+  }
+
+  it("holds a launch whose start ps never read, then runs it to its verdict", async () => {
+    const { t, remote, runId, dir } = await startWhilePsTimesOut("pass");
+    await until(async () => {
+      await remote.reconcile();
+      return t.store.getRun(runId)?.status === "passed";
+    });
+    expect(readdirSync(dir)).toContain("record.json");
+  });
+
+  it("can still stop that build once ps reads it", async () => {
+    const { t, remote, runId } = await startWhilePsTimesOut("gated");
+    await until(async () => {
+      await remote.reconcile();
+      return t.store.getRun(runId)?.pid != null;
+    });
+    // Live, and itself, through several liveness checks: not lost.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await remote.reconcile();
+    expect(t.store.getRun(runId)?.status).toBe("running");
+
+    const stopped = await remote.stop(t.store.getRun(runId)!);
+    expect(stopped).toMatchObject({ stopped: true });
+    await until(async () => {
+      await remote.reconcile();
+      return t.store.getRun(runId)?.status === "cancelled";
+    });
+  });
 });
 
 describe("a Mac that cannot be reached", () => {

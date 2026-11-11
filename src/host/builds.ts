@@ -344,6 +344,10 @@ export class HostBuilds {
     await this.adoptAll(hooks);
     const existing = await this.recordFor(buildId, hooks);
     if (existing) return { ok: true, buildId, ...startedOf(existing) };
+    if (await exists(join(this.dirFor(buildId), LAUNCH_FILE))) {
+      // Launched, but not yet confirmed: starting it again would run it twice.
+      throw new Error(`Build ${buildId} is still launching on this Mac.`);
+    }
     const checked = await this.validate(request);
     if (!checked.ok) return checked;
 
@@ -429,11 +433,20 @@ export class HostBuilds {
       return { ok: false, message: "Could not start the build wrapper (/bin/sh)." };
     }
 
-    const record: BuildRecord = {
-      ...intent,
-      pid,
-      startedAt: await this.startTimeOf(pid, intent.marker),
-    };
+    const startedAt = await this.startTimeOf(pid, intent.marker);
+    if (startedAt === null) {
+      // `ps` never answered for it. A guessed start time would later fail
+      // the identity check against the real one and orphan a live build, so
+      // the wrapper stays at its gate. Whoever next asks about this build
+      // recovers it from the intent once `ps` reads its real start, and
+      // opens the gate then; until then it reports as launching.
+      this.deps.log?.(`build ${buildId} (pid ${pid}) waits for a readable process table`);
+      throw new Error(
+        `Started build ${buildId}, but could not read its process yet; ` +
+          "it runs once this Mac can confirm it.",
+      );
+    }
+    const record: BuildRecord = { ...intent, pid, startedAt };
     await writeJsonAtomic(join(dir, RECORD_FILE), record);
     // Only now may xcodebuild run.
     await openGate(record);
@@ -511,11 +524,11 @@ export class HostBuilds {
   /**
    * The wrapper's start time as identity checks will later read it.
    *
-   * Read back from `ps` rather than taken from the clock, so a later read of
-   * the same process differs only by `etime` jitter. Falls back to the clock
-   * when `ps` has not caught up with the new process yet.
+   * Read back from `ps`, never taken from the clock: identity checks compare
+   * later reads of the same process against it, within `etime` jitter.
+   * `null` when `ps` could not show the wrapper in ten tries.
    */
-  private async startTimeOf(pid: number, marker: string): Promise<number> {
+  private async startTimeOf(pid: number, marker: string): Promise<number | null> {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const identity = await this.probe(pid);
       if (identity?.startedAt != null && identity.command?.includes(marker)) {
@@ -523,7 +536,7 @@ export class HostBuilds {
       }
       await delay(50);
     }
-    return this.now();
+    return null;
   }
 
   // ----------------------------------------------------------------- state
