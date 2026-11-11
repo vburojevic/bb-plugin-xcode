@@ -30,6 +30,14 @@ export default defineConfig({
         ),
       },
       {
+        // The host-entry harness is real code, like host-policy: it applies the
+        // contract schemas and JSON round-trips exactly as the daemon does.
+        find: "@get-bb/plugin-sdk/testing/host",
+        replacement: fileURLToPath(
+          new URL("./node_modules/@get-bb/plugin-sdk/dist/testing/host.js", import.meta.url),
+        ),
+      },
+      {
         find: "@get-bb/plugin-sdk/app",
         replacement: fileURLToPath(
           new URL("./test/sim/stubs/plugin-sdk-app.ts", import.meta.url),

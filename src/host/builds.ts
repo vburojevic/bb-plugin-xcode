@@ -1,0 +1,969 @@
+/**
+ * Tracked builds on the Mac this worker runs on.
+ *
+ * This is the host half of a tracked build whose checkout lives on an
+ * enrolled Mac rather than on the machine running bb. The worker validates
+ * the request there, spawns `xcodebuild` detached, tails its result stream and
+ * reports progress, and parses the bundle once it is done. The server keeps
+ * the store, the engine and every surface; it reaches this through
+ * `src/host/contract.ts`.
+ *
+ * The one thing that shapes everything here: **a build outlives its worker.**
+ * Measured on bb 0.49 (`scout-xcode-detached-test`): a detached child of a
+ * host worker survives a plugin reload, a disable/enable and the daemon's
+ * five-minute idle stop, re-parented to launchd, and bb never cleans it up.
+ * That is what a build needs — a reload must not kill a twenty-minute test
+ * run — but it means the worker that finds out how the build went is usually
+ * not the one that started it, and so cannot `wait()` for it. Hence:
+ *
+ *  - every build has a durable record in the host data dir (pid, start time,
+ *    marker, paths), so a fresh worker can re-adopt it;
+ *  - liveness is pid + start time + a marker in the command line, never the
+ *    pid alone (see `identity.ts`);
+ *  - xcodebuild runs under a tiny `sh` wrapper that writes its exit status to
+ *    a file, because after a reload nobody is left to collect it any other way.
+ */
+
+import { spawn as nodeSpawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { closeSync, openSync } from "node:fs";
+import {
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { join } from "node:path";
+
+import { confinedBuildCwd, validateBuildArguments } from "../build-security";
+import { curatedChildEnv } from "../child-env";
+import { findDeveloperTool, xcresultJson } from "../exec";
+import { treeSize } from "../shim";
+import {
+  applyStreamEvent,
+  emptyProgress,
+  injectStreamFlags,
+  parseStreamLine,
+  splitLines,
+  type StreamProgress,
+} from "../stream";
+import type { IssueRow, TestRow } from "../types";
+import { parseBuildResults, parseTestNodes, parseTestSummary } from "../xcresult";
+import type {
+  BuildProgress,
+  BuildRequest,
+  BuildState,
+  StartBuildResult,
+  SummarizeResult,
+} from "./contract";
+import {
+  isSameProcess,
+  readProcessIdentity,
+  START_TIME_TOLERANCE_MS,
+  type ReadIdentity,
+} from "./identity";
+
+/** The only program a tracked build may run, as the server names it. */
+export const XCODEBUILD = "/usr/bin/xcodebuild";
+
+/** Same ceiling as the server's runner, per Mac. */
+export const MAX_LIVE_BUILDS = 4;
+
+const RECORD_FILE = "record.json";
+const STREAM_READ_BYTES = 64 * 1024;
+const MAX_STREAM_BYTES = 64 * 1024 * 1024;
+const MAX_STREAM_LINE_BYTES = 1024 * 1024;
+const STDERR_TAIL_BYTES = 4096;
+/** Upper bound on the summary reply, well under the 8 MiB host-RPC cap. */
+const SUMMARY_BUDGET_BYTES = 6 * 1024 * 1024;
+const MAX_TESTS = 10_000;
+const MAX_ISSUES = 2_000;
+/**
+ * Consecutive failed liveness reads before a build without an exit status is
+ * called lost. `ps` can time out on a loaded Mac, and one bad read must not
+ * end a build that is still compiling.
+ */
+export const LOST_AFTER_MISSES = 3;
+/** Longest `stop` waits for a just-started build to finish launching. */
+const LAUNCH_WAIT_MS = 3_000;
+/** A record with no exit status is only pruned once it is this old. */
+const UNSETTLED_PRUNE_AFTER_MS = 24 * 3_600_000;
+
+/**
+ * The wrapper xcodebuild runs under.
+ *
+ * `$0` is the build's marker (so `ps` shows it and identity checks can find
+ * it), `$@` is the validated argv. It forwards SIGTERM/SIGHUP to xcodebuild
+ * rather than dying of them, waits for the real exit, and writes the status
+ * atomically. A status above 128 is a signal, as sh reports one. A stop that
+ * arrives before xcodebuild has even forked is remembered and delivered.
+ *
+ * xcodebuild runs as a background job so the wrapper can trap signals while
+ * waiting; a non-interactive sh gives such a job /dev/null as stdin and
+ * ignores SIGINT in it, neither of which a tracked build uses. Nothing from
+ * the request is interpolated into the script: paths come from the
+ * environment and arguments from `$@`.
+ */
+export const WRAPPER_SCRIPT =
+  `child=""; stop=""; ` +
+  `trap 'stop=1; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; fi' TERM HUP; ` +
+  `"$@" & child=$!; ` +
+  // A stop that landed before `$child` was known is delivered now.
+  `if [ -n "$stop" ]; then kill -TERM "$child" 2>/dev/null; fi; ` +
+  `printf '%s\\n' "$child" > "$XCODE_TRACK_PID"; ` +
+  `wait "$child"; status=$?; ` +
+  `while kill -0 "$child" 2>/dev/null; do wait "$child"; status=$?; done; ` +
+  `printf '%s\\n' "$status" > "$XCODE_TRACK_EXIT.tmp" && mv -f "$XCODE_TRACK_EXIT.tmp" "$XCODE_TRACK_EXIT"`;
+
+const SIGNALS: Readonly<Record<number, string>> = {
+  1: "SIGHUP",
+  2: "SIGINT",
+  3: "SIGQUIT",
+  6: "SIGABRT",
+  9: "SIGKILL",
+  13: "SIGPIPE",
+  14: "SIGALRM",
+  15: "SIGTERM",
+};
+
+/** sh's `$?` → the exit code / signal pair the server's runner reports. */
+export function decodeExitStatus(status: number): {
+  exitCode: number | null;
+  signal: string | null;
+} {
+  const signal = status > 128 ? SIGNALS[status - 128] : undefined;
+  return signal ? { exitCode: null, signal } : { exitCode: status, signal: null };
+}
+
+/** What survives a worker: everything needed to find the build again. */
+export interface BuildRecord {
+  version: 1;
+  buildId: string;
+  /** `$0` of the wrapper, so its command line names the build. */
+  marker: string;
+  /** The wrapper's pid, which is also its process group. */
+  pid: number;
+  /** The wrapper's start time as `ps` reported it, epoch ms. */
+  startedAt: number;
+  root: string;
+  workingDir: string;
+  argv: string[];
+  bundlePath: string;
+  streamPath: string;
+  exitPath: string;
+  pidPath: string;
+  stderrPath: string;
+}
+
+/** What one worker call lends the long-lived watcher it may start. */
+export interface WorkerHooks {
+  emitProgress(buildId: string, progress: BuildProgress): Promise<void>;
+  emitExited(state: BuildState): Promise<void>;
+  retainWorker(): { dispose(): Promise<void> };
+}
+
+export interface HostBuildsDeps {
+  dataDir: string;
+  readIdentity?: ReadIdentity;
+  spawn?: typeof nodeSpawn;
+  kill?: (pid: number, signal: NodeJS.Signals) => void;
+  /** The binary the wrapper actually runs; tests point it at a fake. */
+  xcodebuildBinary?: string;
+  findTool?: (name: string) => Promise<string | null>;
+  xcresult?: (tool: string, args: readonly string[]) => Promise<unknown | null>;
+  /** Stream tail cadence. */
+  pollMs?: number;
+  /** Minimum gap between progress signals for one build. */
+  progressIntervalMs?: number;
+  /** How often a watcher re-confirms the wrapper is still alive. */
+  livenessMs?: number;
+  now?: () => number;
+  log?: (message: string) => void;
+}
+
+interface Watch {
+  record: BuildRecord;
+  progress: StreamProgress;
+  stopped: boolean;
+  done: Promise<void>;
+}
+
+export class HostBuilds {
+  private readonly readIdentity: ReadIdentity;
+  private readonly spawn: typeof nodeSpawn;
+  private readonly kill: (pid: number, signal: NodeJS.Signals) => void;
+  private readonly now: () => number;
+  private readonly watches = new Map<string, Watch>();
+  /** Final states, so a finished build's stream is parsed once. */
+  private readonly settled = new Map<string, BuildState>();
+  /** Consecutive failed liveness reads, per build. See `LOST_AFTER_MISSES`. */
+  private readonly misses = new Map<string, number>();
+  private lease: { dispose(): Promise<void> } | null = null;
+  private adopted: Promise<void> | null = null;
+  private tool: Promise<string | null> | null = null;
+  private disposed = false;
+
+  constructor(private readonly deps: HostBuildsDeps) {
+    this.readIdentity = deps.readIdentity ?? readProcessIdentity;
+    this.spawn = deps.spawn ?? nodeSpawn;
+    this.kill = deps.kill ?? ((pid, signal) => process.kill(pid, signal));
+    this.now = deps.now ?? Date.now;
+  }
+
+  private get buildsDir(): string {
+    return join(this.deps.dataDir, "builds");
+  }
+
+  private dirFor(buildId: string): string {
+    return join(this.buildsDir, buildId);
+  }
+
+  // ------------------------------------------------------------ validation
+
+  /**
+   * The plugin's checkout boundary, enforced on the disk the build will use.
+   *
+   * These are the same checks a build on the server gets (`build-security.ts`):
+   * cwd and every path argument must resolve inside the thread's checkout, and
+   * host-mutating options are refused. They must run HERE — on the server the
+   * remote checkout does not exist, and a lexical check would let a symlink in
+   * the checkout point a build anywhere on the Mac.
+   */
+  async validate(request: BuildRequest): Promise<
+    { ok: true; workingDir: string } | { ok: false; message: string }
+  > {
+    if (request.argv[0] !== XCODEBUILD) {
+      return { ok: false, message: "Only xcodebuild may be run as a tracked build." };
+    }
+    try {
+      const workingDir = await confinedBuildCwd(request.root, request.cwd);
+      await validateBuildArguments(request.argv, request.root, workingDir);
+      return { ok: true, workingDir };
+    } catch (error) {
+      return { ok: false, message: messageOf(error) };
+    }
+  }
+
+  // ----------------------------------------------------------------- start
+
+  async start(request: BuildRequest, hooks: WorkerHooks): Promise<StartBuildResult> {
+    const checked = await this.validate(request);
+    if (!checked.ok) return checked;
+    await this.adoptAll(hooks);
+    if (this.watches.size >= MAX_LIVE_BUILDS) {
+      return {
+        ok: false,
+        message: `${MAX_LIVE_BUILDS} tracked builds are already running on this Mac.`,
+      };
+    }
+
+    const buildId = `${this.now().toString(36)}-${randomBytes(6).toString("hex")}`;
+    const dir = this.dirFor(buildId);
+    await mkdir(dir, { recursive: true });
+    const paths = {
+      bundlePath: join(dir, "result.xcresult"),
+      streamPath: join(dir, "stream.ndjson"),
+      exitPath: join(dir, "exit"),
+      pidPath: join(dir, "xcodebuild.pid"),
+      stderrPath: join(dir, "stderr.log"),
+    };
+    // xcodebuild refuses a stream path that does not already exist.
+    await writeFile(paths.streamPath, "");
+    const injected = injectStreamFlags(request.argv, paths.bundlePath, paths.streamPath);
+    const marker = `bb-xcode-build:${buildId}`;
+    const runArgv = [this.deps.xcodebuildBinary ?? XCODEBUILD, ...injected.argv.slice(1)];
+
+    const stderrFd = openSync(paths.stderrPath, "a");
+    let pid: number | undefined;
+    try {
+      const child = this.spawn("/bin/sh", ["-c", WRAPPER_SCRIPT, marker, ...runArgv], {
+        cwd: checked.workingDir,
+        // Its own process group: `stop` can then signal the whole tree, and
+        // nothing that signals the daemon's group takes the build with it.
+        detached: true,
+        stdio: ["ignore", "ignore", stderrFd],
+        env: {
+          ...curatedChildEnv(process.env),
+          XCODE_TRACK_PID: paths.pidPath,
+          XCODE_TRACK_EXIT: paths.exitPath,
+        },
+      });
+      child.on("error", () => undefined);
+      pid = child.pid;
+      child.unref();
+    } finally {
+      closeSync(stderrFd);
+    }
+    if (pid === undefined) {
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      return { ok: false, message: "Could not start the build wrapper (/bin/sh)." };
+    }
+
+    const startedAt = await this.startTimeOf(pid, marker);
+    const record: BuildRecord = {
+      version: 1,
+      buildId,
+      marker,
+      pid,
+      startedAt,
+      root: request.root,
+      workingDir: checked.workingDir,
+      argv: injected.argv,
+      ...paths,
+    };
+    await writeJsonAtomic(join(dir, RECORD_FILE), record);
+    this.watch(record, hooks);
+    this.deps.log?.(`started build ${buildId} (pid ${pid}) in ${checked.workingDir}`);
+    return {
+      ok: true,
+      buildId,
+      bundlePath: paths.bundlePath,
+      workingDir: checked.workingDir,
+      argv: injected.argv,
+      pid,
+      startedAt,
+    };
+  }
+
+  /**
+   * The wrapper's start time as identity checks will later read it.
+   *
+   * Read back from `ps` rather than taken from the clock, so a later read of
+   * the same process differs only by `etime` jitter. Falls back to the clock
+   * when `ps` has not caught up with the new process yet.
+   */
+  private async startTimeOf(pid: number, marker: string): Promise<number> {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const identity = await this.readIdentity(pid);
+      if (identity?.startedAt != null && identity.command?.includes(marker)) {
+        return identity.startedAt;
+      }
+      await delay(50);
+    }
+    return this.now();
+  }
+
+  // ----------------------------------------------------------------- state
+
+  async states(buildIds: readonly string[], hooks: WorkerHooks): Promise<BuildState[]> {
+    await this.adoptAll(hooks);
+    const out: BuildState[] = [];
+    for (const buildId of buildIds) out.push(await this.stateOf(buildId, hooks));
+    return out;
+  }
+
+  private async stateOf(buildId: string, hooks: WorkerHooks | null): Promise<BuildState> {
+    const cached = this.settled.get(buildId);
+    if (cached) return cached;
+    const record = await this.loadRecord(buildId);
+    if (record === null) return unknownState(buildId);
+
+    const exited = await this.readExit(record);
+    if (exited) return this.settle(record, exited);
+
+    if (!(await this.confirmLost(record))) {
+      if (hooks) this.watch(record, hooks);
+      return {
+        buildId,
+        status: "running",
+        exitCode: null,
+        signal: null,
+        endedAt: null,
+        progress: toWire(this.watches.get(buildId)?.progress ?? (await readProgress(record.streamPath))),
+        stderrTail: null,
+      };
+    }
+    // The wrapper may have written its status between the two reads.
+    const late = await this.readExit(record);
+    if (late) return this.settle(record, late);
+    return this.settle(record, null);
+  }
+
+  /** Freeze a finished build's state. `null` exit means the wrapper was lost. */
+  private async settle(
+    record: BuildRecord,
+    exit: { status: number; endedAt: number } | null,
+  ): Promise<BuildState> {
+    const decoded = exit ? decodeExitStatus(exit.status) : { exitCode: null, signal: null };
+    const state: BuildState = {
+      buildId: record.buildId,
+      status: exit ? "exited" : "lost",
+      exitCode: decoded.exitCode,
+      signal: decoded.signal,
+      endedAt: exit?.endedAt ?? null,
+      progress: toWire(await readProgress(record.streamPath)),
+      stderrTail: await readTail(record.stderrPath, STDERR_TAIL_BYTES),
+    };
+    this.misses.delete(record.buildId);
+    if (exit) {
+      if (this.settled.size > 256) this.settled.clear();
+      this.settled.set(record.buildId, state);
+    }
+    return state;
+  }
+
+  private async isAlive(record: BuildRecord): Promise<boolean> {
+    return isSameProcess(await this.readIdentity(record.pid), record);
+  }
+
+  /**
+   * True once the wrapper has failed `LOST_AFTER_MISSES` liveness reads in a
+   * row; any successful read resets the count.
+   */
+  private async confirmLost(record: BuildRecord): Promise<boolean> {
+    if (await this.isAlive(record)) {
+      this.misses.delete(record.buildId);
+      return false;
+    }
+    const misses = (this.misses.get(record.buildId) ?? 0) + 1;
+    this.misses.set(record.buildId, misses);
+    return misses >= LOST_AFTER_MISSES;
+  }
+
+  private async readExit(
+    record: BuildRecord,
+  ): Promise<{ status: number; endedAt: number } | null> {
+    try {
+      const [text, info] = await Promise.all([
+        readFile(record.exitPath, "utf8"),
+        stat(record.exitPath),
+      ]);
+      const status = Number.parseInt(text.trim(), 10);
+      if (!Number.isFinite(status)) return null;
+      return { status, endedAt: Math.round(info.mtimeMs) };
+    } catch {
+      return null;
+    }
+  }
+
+  // ----------------------------------------------------------------- watch
+
+  /**
+   * Re-adopt every build a previous worker left running.
+   *
+   * Once per worker, on its first call. Without it a reload would leave the
+   * live row frozen until the server's next reconcile asked about each build
+   * by name; with it, progress resumes as soon as anything wakes the worker.
+   */
+  private adoptAll(hooks: WorkerHooks): Promise<void> {
+    this.adopted ??= (async () => {
+      for (const record of await this.listRecords()) {
+        if (this.watches.has(record.buildId)) continue;
+        if (await this.readExit(record)) continue;
+        if (await this.isAlive(record)) this.watch(record, hooks);
+      }
+    })().catch((error: unknown) => {
+      this.deps.log?.(`re-adopting builds failed: ${messageOf(error)}`);
+    });
+    return this.adopted;
+  }
+
+  /**
+   * Tail one build's stream until it exits, emitting progress and its end.
+   *
+   * Holds a worker lease while any build is being watched, because the daemon
+   * stops an idle worker after five minutes and a quiet build makes no calls.
+   */
+  private watch(record: BuildRecord, hooks: WorkerHooks): void {
+    if (this.disposed || this.watches.has(record.buildId)) return;
+    const entry: Watch = {
+      record,
+      progress: emptyProgress(),
+      stopped: false,
+      done: Promise.resolve(),
+    };
+    this.watches.set(record.buildId, entry);
+    try {
+      this.lease ??= hooks.retainWorker();
+    } catch (error) {
+      // Only possible outside an open call. Watching still works; the worker
+      // may just be idle-stopped sooner, and the server's reconcile covers it.
+      this.deps.log?.(`could not retain the worker: ${messageOf(error)}`);
+    }
+    entry.done = this.tail(entry, hooks)
+      .catch((error: unknown) => {
+        this.deps.log?.(`watching ${record.buildId} failed: ${messageOf(error)}`);
+      })
+      .finally(() => {
+        this.watches.delete(record.buildId);
+        if (this.watches.size === 0 && this.lease) {
+          const lease = this.lease;
+          this.lease = null;
+          void lease.dispose().catch(() => undefined);
+        }
+      });
+  }
+
+  private async tail(entry: Watch, hooks: WorkerHooks): Promise<void> {
+    const pollMs = this.deps.pollMs ?? 250;
+    const progressMs = this.deps.progressIntervalMs ?? 500;
+    const livenessMs = this.deps.livenessMs ?? 5_000;
+    const { record } = entry;
+    const reader = new StreamReader(record.streamPath);
+    let lastEmitAt = 0;
+    let lastLivenessAt = this.now();
+    let emitted = toWire(entry.progress);
+
+    const emitIfChanged = async (force: boolean): Promise<void> => {
+      const wire = toWire(entry.progress);
+      if (sameProgress(wire, emitted)) return;
+      if (!force && this.now() - lastEmitAt < progressMs) return;
+      lastEmitAt = this.now();
+      emitted = wire;
+      await hooks.emitProgress(record.buildId, wire).catch(() => undefined);
+    };
+
+    try {
+      while (!entry.stopped && !this.disposed) {
+        entry.progress = await reader.drain(entry.progress);
+        await emitIfChanged(false);
+
+        let exit = await this.readExit(record);
+        if (!exit && this.now() - lastLivenessAt >= livenessMs) {
+          lastLivenessAt = this.now();
+          if (await this.confirmLost(record)) {
+            exit = await this.readExit(record);
+            if (!exit) {
+              await hooks.emitExited(await this.settle(record, null)).catch(() => undefined);
+              return;
+            }
+          }
+        }
+        if (exit) {
+          // Let the tail catch whatever xcodebuild flushed as it exited.
+          await delay(Math.min(400, pollMs * 2));
+          entry.progress = await reader.drain(entry.progress);
+          await emitIfChanged(true);
+          await hooks.emitExited(await this.settle(record, exit)).catch(() => undefined);
+          return;
+        }
+        await delay(pollMs);
+      }
+    } finally {
+      await reader.close();
+    }
+  }
+
+  // ------------------------------------------------------------------ stop
+
+  async stop(buildId: string, graceMs?: number): Promise<{ stopped: boolean; message: string }> {
+    const record = await this.loadRecord(buildId);
+    if (record === null) return { stopped: false, message: "No such build on this Mac." };
+    if (await this.readExit(record)) {
+      return { stopped: false, message: `Build ${buildId} has already finished.` };
+    }
+    // The one place a stale pid would do real harm: never signal a process
+    // that does not prove it is the wrapper this record describes.
+    if (!(await this.isAlive(record))) {
+      return { stopped: false, message: `Build ${buildId} is no longer running.` };
+    }
+    await this.launched(record);
+    try {
+      // The group: the wrapper forwards TERM and waits, xcodebuild and its
+      // children get it directly.
+      this.kill(-record.pid, "SIGTERM");
+    } catch {
+      try {
+        this.kill(record.pid, "SIGTERM");
+      } catch {
+        return { stopped: false, message: `Build ${buildId} is already gone.` };
+      }
+    }
+    if (graceMs !== undefined) {
+      const timer = setTimeout(() => {
+        void this.escalate(record);
+      }, graceMs);
+      timer.unref?.();
+    }
+    return { stopped: true, message: `Sent SIGTERM to build ${buildId} (pid ${record.pid}).` };
+  }
+
+  /**
+   * Wait, briefly, until the build is past its first milliseconds.
+   *
+   * A stop that lands right after the start can find the wrapper before it
+   * has set its trap (TERM would kill it before it records anything), or its
+   * child forked but not yet exec'd into xcodebuild — still a copy of the
+   * wrapper shell, trap included, so TERM would be swallowed and the build
+   * would run on. Both are over once the wrapper has written the child's pid
+   * and that pid no longer carries the wrapper's marker. Bounded: past
+   * `LAUNCH_WAIT_MS` the signal goes anyway.
+   */
+  private async launched(record: BuildRecord): Promise<void> {
+    const deadline = this.now() + LAUNCH_WAIT_MS;
+    while (this.now() < deadline) {
+      const childPid = await readPid(record.pidPath);
+      if (childPid !== null) {
+        const identity = await this.readIdentity(childPid);
+        if (identity === null || !identity.command?.includes(record.marker)) return;
+      }
+      if (await this.readExit(record)) return;
+      await delay(25);
+    }
+  }
+
+  /**
+   * SIGKILL xcodebuild itself, never the wrapper, so the wrapper still lives
+   * to write the exit status. Only when the pid it recorded still looks like
+   * an xcodebuild that started with this build.
+   */
+  private async escalate(record: BuildRecord): Promise<void> {
+    if (await this.readExit(record)) return;
+    const childPid = await readPid(record.pidPath);
+    if (childPid === null) return;
+    const identity = await this.readIdentity(childPid);
+    if (
+      identity?.command?.includes("xcodebuild") !== true ||
+      identity.startedAt === null ||
+      identity.startedAt < record.startedAt - START_TIME_TOLERANCE_MS
+    ) {
+      return;
+    }
+    try {
+      this.kill(childPid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+
+  // ------------------------------------------------------------- summarize
+
+  async summarize(buildId: string): Promise<SummarizeResult> {
+    const record = await this.loadRecord(buildId);
+    if (record === null) return { status: "unavailable", reason: "No such build on this Mac." };
+    const exited = (await this.readExit(record)) !== null;
+    const finalized = await stat(join(record.bundlePath, "Info.plist"))
+      .then((info) => info.isFile())
+      .catch(() => false);
+    if (!finalized) {
+      if (!exited && (await this.isAlive(record))) return { status: "pending" };
+      // xcodebuild finalizes on every normal exit, failures included; a
+      // bundle that is still unfinalized after the wrapper reported is one
+      // a killed build left behind. Give the exit a moment to have flushed.
+      return exited
+        ? { status: "unavailable", reason: "The result bundle was never finalized." }
+        : { status: "unavailable", reason: "The build is gone and left no finished bundle." };
+    }
+
+    const tool = await (this.tool ??= (this.deps.findTool ?? findDeveloperTool)("xcresulttool"));
+    if (!tool) {
+      this.tool = null; // Xcode may be selected later; ask again next time.
+      return { status: "unavailable", reason: "xcresulttool was not found on this Mac." };
+    }
+    const query = this.deps.xcresult ?? xcresultJson;
+    const build = parseBuildResults(
+      await query(tool, ["get", "build-results", "--path", record.bundlePath]),
+    );
+    const summary = parseTestSummary(
+      await query(tool, ["get", "test-results", "summary", "--path", record.bundlePath]),
+    );
+    if (!build && !summary) return { status: "unparseable" };
+    const tests =
+      summary && summary.total > 0
+        ? parseTestNodes(
+            await query(tool, ["get", "test-results", "tests", "--path", record.bundlePath]),
+          )
+        : [];
+    return {
+      status: "ok",
+      bundlePath: record.bundlePath,
+      build: build
+        ? {
+            ...build,
+            actionTitle: clip(build.actionTitle, 2000),
+            destination: clip(build.destination, 2000),
+            issues: boundIssues(build.issues),
+          }
+        : null,
+      summary: summary ? { ...summary, destination: clip(summary.destination, 2000) } : null,
+      tests: boundTests(tests),
+    };
+  }
+
+  // ----------------------------------------------------------------- prune
+
+  /**
+   * Delete finished builds' directories (bundle, stream, logs): age first,
+   * then oldest-first down to the budget. A running build is never touched,
+   * and neither is a record a worker cannot read — it may be mid-write.
+   */
+  async prune(
+    retention: { maxAgeMs: number; maxTotalBytes: number },
+  ): Promise<{ removed: number; bytesFreed: number; bytesRetained: number }> {
+    const now = this.now();
+    const result = { removed: 0, bytesFreed: 0, bytesRetained: 0 };
+    const surviving: Array<{ dir: string; settledAt: number; size: number }> = [];
+    for (const record of await this.listRecords()) {
+      if (this.watches.has(record.buildId)) continue;
+      const exit = await this.readExit(record);
+      const dir = this.dirFor(record.buildId);
+      const settledAt =
+        exit?.endedAt ??
+        (await stat(join(dir, RECORD_FILE)).then((info) => info.mtimeMs).catch(() => now));
+      // No exit status: only a long-dead build is fair game. One negative
+      // `ps` read is not enough to delete a running build's bundle.
+      if (!exit) {
+        if (now - settledAt < UNSETTLED_PRUNE_AFTER_MS) continue;
+        if (await this.isAlive(record)) continue;
+      }
+      const size = await treeSize(dir);
+      if (now - settledAt > retention.maxAgeMs) {
+        await rm(dir, { recursive: true, force: true });
+        this.settled.delete(record.buildId);
+        result.removed += 1;
+        result.bytesFreed += size;
+        continue;
+      }
+      surviving.push({ dir, settledAt, size });
+    }
+    surviving.sort((a, b) => a.settledAt - b.settledAt);
+    let held = surviving.reduce((sum, entry) => sum + entry.size, 0);
+    for (const entry of surviving) {
+      if (held <= retention.maxTotalBytes) break;
+      await rm(entry.dir, { recursive: true, force: true });
+      held -= entry.size;
+      result.removed += 1;
+      result.bytesFreed += entry.size;
+    }
+    result.bytesRetained = held;
+    return result;
+  }
+
+  // -------------------------------------------------------------- lifecycle
+
+  /**
+   * Stop watching. Never stops a build: the worker going away (reload, idle
+   * stop, disable) is exactly when the build must carry on.
+   */
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    const pending = [...this.watches.values()];
+    for (const entry of pending) entry.stopped = true;
+    await Promise.all(pending.map((entry) => entry.done));
+  }
+
+  /** For tests: resolve when every watcher has finished. */
+  async idle(): Promise<void> {
+    await Promise.all([...this.watches.values()].map((entry) => entry.done));
+  }
+
+  get watching(): number {
+    return this.watches.size;
+  }
+
+  // --------------------------------------------------------------- records
+
+  private async loadRecord(buildId: string): Promise<BuildRecord | null> {
+    try {
+      const raw = JSON.parse(
+        await readFile(join(this.dirFor(buildId), RECORD_FILE), "utf8"),
+      ) as Partial<BuildRecord>;
+      return isRecord(raw) && raw.buildId === buildId ? raw : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async listRecords(): Promise<BuildRecord[]> {
+    let names: string[];
+    try {
+      names = await readdir(this.buildsDir);
+    } catch {
+      return [];
+    }
+    const out: BuildRecord[] = [];
+    for (const name of names) {
+      const record = await this.loadRecord(name);
+      if (record) out.push(record);
+    }
+    return out;
+  }
+}
+
+/** Incremental reader for a growing NDJSON stream file. */
+class StreamReader {
+  private offset = 0;
+  private carry = "";
+  private handle: Awaited<ReturnType<typeof open>> | null = null;
+
+  constructor(private readonly path: string) {}
+
+  async drain(progress: StreamProgress): Promise<StreamProgress> {
+    this.handle ??= await open(this.path, "r").catch(() => null);
+    if (!this.handle) return progress;
+    let next = progress;
+    for (;;) {
+      const { size } = await this.handle.stat();
+      if (size <= this.offset || this.offset >= MAX_STREAM_BYTES) return next;
+      const length = Math.min(size - this.offset, STREAM_READ_BYTES, MAX_STREAM_BYTES - this.offset);
+      const buffer = Buffer.allocUnsafe(length);
+      const { bytesRead } = await this.handle.read(buffer, 0, length, this.offset);
+      if (bytesRead === 0) return next;
+      this.offset += bytesRead;
+      const { lines, rest } = splitLines(this.carry + buffer.subarray(0, bytesRead).toString("utf8"));
+      this.carry = Buffer.byteLength(rest, "utf8") > MAX_STREAM_LINE_BYTES ? "" : rest;
+      for (const line of lines) {
+        const event = parseStreamLine(line);
+        if (event) next = applyStreamEvent(next, event);
+      }
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.handle?.close().catch(() => undefined);
+    this.handle = null;
+  }
+}
+
+async function readPid(path: string): Promise<number | null> {
+  try {
+    const pid = Number.parseInt((await readFile(path, "utf8")).trim(), 10);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readProgress(path: string): Promise<StreamProgress> {
+  const reader = new StreamReader(path);
+  try {
+    return await reader.drain(emptyProgress());
+  } finally {
+    await reader.close();
+  }
+}
+
+async function readTail(path: string, bytes: number): Promise<string | null> {
+  try {
+    const handle = await open(path, "r");
+    try {
+      const { size } = await handle.stat();
+      if (size === 0) return null;
+      const length = Math.min(size, bytes);
+      const buffer = Buffer.allocUnsafe(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, size - length);
+      // A cut through a multi-byte character decodes to U+FFFD; harmless.
+      return buffer.subarray(0, bytesRead).toString("utf8").slice(-bytes);
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+function toWire(progress: StreamProgress): BuildProgress {
+  return {
+    section: clip(progress.currentSection, 2000),
+    opened: progress.sectionsOpened,
+    closed: progress.sectionsClosed,
+    errors: progress.errors,
+    warnings: progress.warnings,
+  };
+}
+
+function sameProgress(a: BuildProgress, b: BuildProgress): boolean {
+  return (
+    a.section === b.section &&
+    a.opened === b.opened &&
+    a.closed === b.closed &&
+    a.errors === b.errors &&
+    a.warnings === b.warnings
+  );
+}
+
+function unknownState(buildId: string): BuildState {
+  return {
+    buildId,
+    status: "unknown",
+    exitCode: null,
+    signal: null,
+    endedAt: null,
+    progress: toWire(emptyProgress()),
+    stderrTail: null,
+  };
+}
+
+function clip(value: string, max: number): string;
+function clip(value: string | null, max: number): string | null;
+function clip(value: string | null, max: number): string | null {
+  return value === null || value.length <= max ? value : `${value.slice(0, max - 1)}…`;
+}
+
+function boundIssues(issues: readonly IssueRow[]): IssueRow[] {
+  // Errors first: if anything has to be dropped, it is the long tail of notes.
+  const rank = { error: 0, warning: 1, analyzer: 2, note: 3 } as const;
+  return [...issues]
+    .sort((a, b) => rank[a.severity] - rank[b.severity])
+    .slice(0, MAX_ISSUES)
+    .map((issue) => ({
+      ...issue,
+      message: clip(issue.message, 4000),
+      filePath: clip(issue.filePath, 4096),
+      target: clip(issue.target, 1000),
+    }));
+}
+
+/**
+ * Failed tests first, then the rest, until the reply budget is spent.
+ *
+ * The full list feeds history and flakiness; the failures are what a person
+ * or an agent is waiting for, so they are the last thing to be dropped.
+ */
+function boundTests(tests: readonly TestRow[]): TestRow[] {
+  const ordered = [
+    ...tests.filter((test) => test.status === "failed"),
+    ...tests.filter((test) => test.status !== "failed"),
+  ];
+  const out: TestRow[] = [];
+  let bytes = 0;
+  for (const test of ordered) {
+    if (out.length >= MAX_TESTS) break;
+    const row: TestRow = {
+      ...test,
+      suite: clip(test.suite, 2000),
+      name: clip(test.name, 2000),
+      identifier: clip(test.identifier, 4000),
+      failureMessage: clip(test.failureMessage, 4000),
+      target: clip(test.target, 1000),
+    };
+    bytes += JSON.stringify(row).length;
+    if (bytes > SUMMARY_BUDGET_BYTES) break;
+    out.push(row);
+  }
+  return out;
+}
+
+function isRecord(raw: Partial<BuildRecord>): raw is BuildRecord {
+  return (
+    raw.version === 1 &&
+    typeof raw.buildId === "string" &&
+    typeof raw.marker === "string" &&
+    typeof raw.pid === "number" &&
+    typeof raw.startedAt === "number" &&
+    typeof raw.bundlePath === "string" &&
+    typeof raw.streamPath === "string" &&
+    typeof raw.exitPath === "string" &&
+    typeof raw.pidPath === "string" &&
+    typeof raw.stderrPath === "string" &&
+    Array.isArray(raw.argv)
+  );
+}
+
+async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
+  const temp = `${path}.${process.pid}.tmp`;
+  await writeFile(temp, JSON.stringify(value));
+  await rename(temp, path);
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

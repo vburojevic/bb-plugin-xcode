@@ -170,7 +170,7 @@ export interface BundlePruneResult {
 }
 
 /** Recursive size of a directory tree, resilient to a build writing into it. */
-async function treeSize(path: string): Promise<number> {
+export async function treeSize(path: string): Promise<number> {
   let total = 0;
   const walk = async (dir: string, depth: number): Promise<void> => {
     if (depth > 12) return;
