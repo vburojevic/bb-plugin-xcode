@@ -161,8 +161,14 @@ async function buildInProgress(root: string, now: number): Promise<XcodeAction |
   if (!(await isOwnEntry(journal, root, "file"))) return null;
   const info = await stat(journal).catch(() => null);
   if (!info?.isFile()) return null;
-  // Birth time where the file system keeps one; the change time otherwise.
-  const startedAt = info.birthtimeMs > 0 ? info.birthtimeMs : info.ctimeMs;
+  // The earliest time the file system reports: its birth time where it keeps
+  // one, else the change time, and never later than the modification time.
+  // On a Mac the birth time is already the earliest (setting an earlier
+  // modification time moves it back too); elsewhere, such as the Linux CI that
+  // runs this module's tests, the birth time stays at creation, and a journal
+  // dated back with `utimes` must still read as old.
+  const created = info.birthtimeMs > 0 ? info.birthtimeMs : info.ctimeMs;
+  const startedAt = Math.min(created, info.mtimeMs);
   if (now - startedAt > MAX_ACTION_AGE_MS) return null;
   return { root, kind: "build", startedAt, bundlePath: null, scheme: null };
 }

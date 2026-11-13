@@ -281,7 +281,9 @@ describe("a worker replaced between spawning a build and recording it", () => {
     const t = setup({ firstWorker: { readIdentity: () => new Promise(() => undefined) } });
     t.net.startTimeoutMs = 300;
     const remote = t.server();
-    const started = await remote.start(MBP, t.request("pass"), t.scope);
+    // Gated, so the adopted build is still running when it is looked at: a
+    // `pass` build can finish inside the first reconcile on a fast runner.
+    const started = await remote.start(MBP, t.request("gated"), t.scope);
     if (started.ok) throw new Error("expected the start to time out");
     const runId = runIdIn(started.message);
     const dir = join(t.ws.dataDir, "builds", runId.slice(2));
@@ -299,6 +301,7 @@ describe("a worker replaced between spawning a build and recording it", () => {
     expect(adopted.status).toBe("running");
     expect(adopted.bundlePath).toBe(join(dir, "result.xcresult"));
 
+    t.ws.release();
     await until(async () => {
       await remote.reconcile();
       return t.store.getRun(runId)?.status === "passed";
