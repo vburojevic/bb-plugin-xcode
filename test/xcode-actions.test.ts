@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { Engine, MISSES_BEFORE_FINISHING, observedRunId } from "../src/engine";
+import { Engine, MISSES_BEFORE_FINISHING, observedRunId, ownedBy } from "../src/engine";
 import { RANK, type Run } from "../src/model";
 import { ProcessObserver } from "../src/observe";
 import { argv0 } from "../src/proc";
@@ -168,6 +168,33 @@ describe("a quiet build service with an action in progress", () => {
       actions: new DerivedDataActions(dir),
     });
     expect((await observer.snapshot(Date.now()))?.map((activity) => activity.pid)).toEqual([950]);
+  });
+
+  it("nor that of a terminal build of a Swift package, whose workspace is its directory", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "xcode-actions-")));
+    cleanups.push(() => rmSync(base, { recursive: true, force: true }));
+    const dir = join(base, "DerivedData");
+    const checkout = join(base, "Pkg");
+    // Xcode 27.2 writes the package directory itself as a package root's WorkspacePath.
+    const root = makeDerivedRoot(join(dir, "Pkg-abc"), { workspace: checkout });
+    const data = join(root, "Build/Intermediates.noindex/XCBuildData");
+    mkdirSync(data, { recursive: true });
+    writeFileSync(join(data, "build.db-journal"), "");
+    const observer = new ProcessObserver({
+      ps: async () => `${ps}  950     1 00:20 /usr/bin/xcodebuild -scheme Pkg build\n`,
+      cwdOf: async (pid) => (pid === 950 ? checkout : null),
+      gitOf: async () => null,
+      actions: new DerivedDataActions(dir),
+    });
+    expect((await observer.snapshot(Date.now()))?.map((activity) => activity.pid)).toEqual([950]);
+  });
+});
+
+describe("a Swift package built in its own directory", () => {
+  it("owns the artifacts of the root that names that directory as its workspace", () => {
+    const pkg = "/Users/me/Pkg";
+    expect(ownedBy({ root: null, container: null, cwd: pkg }, { root: null, workspace: pkg })).toBe(true);
+    expect(ownedBy({ root: null, container: null, cwd: "/Users/me/Other" }, { root: null, workspace: pkg })).toBe(false);
   });
 });
 

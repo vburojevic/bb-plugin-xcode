@@ -1317,8 +1317,12 @@ export function ownedBy(
   // so that directory must be the workspace's own. Ancestry proves nothing —
   // a worktree nested in a checkout (`/w/App/.worktrees/feature`) is another
   // checkout — and a run that says nothing about where it built cannot claim
-  // an artifact that does.
-  if (run.cwd !== null && isAbsolute(run.cwd)) return resolve(run.cwd) === dirname(workspace);
+  // an artifact that does. A Swift package is its own workspace: Xcode names
+  // the package directory itself.
+  if (run.cwd !== null && isAbsolute(run.cwd)) {
+    const dir = resolve(run.cwd);
+    return dir === dirname(workspace) || dir === workspace;
+  }
   return false;
 }
 

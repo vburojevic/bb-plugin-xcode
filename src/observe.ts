@@ -301,7 +301,8 @@ export class ProcessObserver {
             : null;
         return container === workspace;
       }
-      return cwd !== null && resolve(cwd) === dirname(workspace);
+      // A Swift package is its own workspace: Xcode names the package directory.
+      return cwd !== null && (resolve(cwd) === dirname(workspace) || resolve(cwd) === workspace);
     });
   }
 
