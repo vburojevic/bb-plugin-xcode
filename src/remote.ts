@@ -32,6 +32,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { posix } from "node:path";
 
 import type { ExperimentalHostClient } from "@get-bb/plugin-sdk";
 
@@ -189,7 +190,12 @@ export class RemoteBuilds {
       configuration: attribution.configuration,
       destination: attribution.destination,
       projectId: scope.projectId,
-      root: attribution.derivedDataPath,
+      // Absolute, as the Mac's DerivedData roots are named, so the build's own
+      // log entry folds into this run rather than becoming a second one.
+      root:
+        attribution.derivedDataPath === null
+          ? null
+          : posix.resolve(request.workingDir, attribution.derivedDataPath),
       cwd: request.workingDir,
       pid: null,
       cmdline: commandLine.slice(0, 4000),

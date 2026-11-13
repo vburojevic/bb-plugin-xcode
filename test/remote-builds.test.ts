@@ -167,6 +167,18 @@ describe("xcode_build for a checkout on another Mac", () => {
     expect(String(row.bundle_path).startsWith(join(hostData, "builds"))).toBe(true);
   });
 
+  it("names a relative DerivedData by its absolute path on that Mac", async () => {
+    // So the build's own log entry, read from the root a project scan finds
+    // as an absolute path, folds into this run instead of a second one.
+    const { harness, checkout } = await setup();
+    await harness.callAgentTool(
+      "xcode_build",
+      { args: ["-scheme", "pass", "-derivedDataPath", "build", "build"] },
+      toolContext(),
+    );
+    expect(runRow(harness)).toMatchObject({ status: "passed", root: join(checkout, "build") });
+  });
+
   it("returns the errors read from the bundle on that Mac", async () => {
     const { harness } = await setup();
     const answer = (await harness.callAgentTool(
