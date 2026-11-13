@@ -99,7 +99,15 @@ export class RemoteMachine implements MachineIO {
   ): Promise<RootManifests[]> {
     const reply = await this.host.call(
       "readManifests",
-      { roots: roots.slice(0, 200).map((root) => ({ ...root })), notBefore: this.notBefore() },
+      {
+        // A build's relative `-derivedDataPath` (`.dd`) is recorded as given;
+        // the worker takes absolute paths only, and one would fail the call.
+        roots: roots
+          .filter((root) => root.path.startsWith("/"))
+          .slice(0, 200)
+          .map((root) => ({ ...root })),
+        notBefore: this.notBefore(),
+      },
       this.options(READ_TIMEOUT_MS),
     );
     return reply.roots;
@@ -109,7 +117,7 @@ export class RemoteMachine implements MachineIO {
     const reply = await this.host.call(
       "inspectBundles",
       {
-        roots: roots.slice(0, 200),
+        roots: roots.filter((path) => path.startsWith("/")).slice(0, 200),
         paths: claimed.filter((path) => path.startsWith("/")).slice(0, 500),
       },
       this.options(READ_TIMEOUT_MS),

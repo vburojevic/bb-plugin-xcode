@@ -24,7 +24,7 @@ import { createHostEntry } from "../host";
 import plugin from "../server";
 import { Engine } from "../src/engine";
 import type { HostCaller } from "../src/remote";
-import { RemoteWatch } from "../src/remote-watch";
+import { RemoteMachine, RemoteWatch } from "../src/remote-watch";
 import { runMatchesScope, ThreadScopes, type ThreadScope } from "../src/scopes";
 import { MIGRATIONS, Store, type Db } from "../src/store";
 import { makeDerivedRoot, makeTestBundle, writeBuildManifest, xcodeAppPs } from "./support/derived-data";
@@ -587,5 +587,24 @@ describe("a test run through a stretch two Xcodes leave unseen", () => {
     expect([...seen]).not.toContain("cancelled");
     expect([...seen]).not.toContain("ended");
     expect(statuses()).toHaveLength(1);
+  });
+});
+
+describe("a build there with a relative -derivedDataPath", () => {
+  it("does not stop the watch from reading that Mac's other roots", async () => {
+    const mac = macBook();
+    const host = {
+      call: async (method: string, input: unknown) =>
+        mac.worker.experimental_call(method as never, input as never),
+    } as unknown as HostCaller;
+    const machine = new RemoteMachine(host, MBP.id);
+    // `-derivedDataPath .dd/ios` is recorded as given; the worker takes only
+    // absolute paths and would refuse the whole call.
+    const manifests = await machine.readManifests([
+      { path: ".dd/ios", ifModifiedSince: null },
+      { path: mac.root, ifModifiedSince: null },
+    ]);
+    expect(manifests.map((read) => read.root)).toEqual([mac.root]);
+    await expect(machine.listBundles([".dd/ios", mac.root], [])).resolves.toBeDefined();
   });
 });
