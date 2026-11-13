@@ -96,8 +96,15 @@ export function createLauncher(deps: LauncherDeps): BuildLauncher {
   return {
     async targetFor(scope) {
       if (scope.hostId === null) return { kind: "local", machineName: null };
+      // The host list only names the Mac. A scope with a host is already known
+      // to be on another one (`ScopeSync.hostOf`), so a failed list must not
+      // send its build to this machine's copy of the same path.
+      const listHosts = deps.listHosts().catch((error: unknown) => {
+        deps.log.debug(`host list failed, naming the Mac by id: ${String(error)}`);
+        return [];
+      });
       try {
-        const [serverHostId, hosts] = await Promise.all([deps.serverHostId(), deps.listHosts()]);
+        const [serverHostId, hosts] = await Promise.all([deps.serverHostId(), listHosts]);
         return buildTargetFor(scope, serverHostId, hosts);
       } catch (error) {
         // Never block a build on this machine because host discovery failed.

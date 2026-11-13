@@ -58,3 +58,30 @@ describe("the Simulators half on a thread whose checkout is on another Mac", () 
     expect(describeCheckoutLocation(locateCheckout("host_server", "host_server", HOSTS))).toBeNull();
   });
 });
+
+describe("createLauncher().targetFor", () => {
+  it("keeps a checkout on another Mac there when the host list cannot be read", async () => {
+    const { createLauncher } = await import("../src/launcher");
+    const launcher = createLauncher({
+      wrapped: {} as never,
+      remote: {} as never,
+      serverHostId: async () => "host_server",
+      listHosts: async () => {
+        throw new Error("hosts.list timed out");
+      },
+      log: { debug: () => undefined },
+    });
+    const target = await launcher.targetFor({
+      threadId: "thr_1",
+      projectId: null,
+      environmentId: "env_1",
+      path: "/Users/me/App",
+      hostId: "host_other",
+      branch: null,
+      active: true,
+      activeAt: null,
+      updatedAt: 0,
+    });
+    expect(target).toEqual({ kind: "remote", hostId: "host_other", machineName: "host_other" });
+  });
+});
