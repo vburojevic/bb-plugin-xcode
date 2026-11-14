@@ -17,6 +17,9 @@ import type {
   RunKind,
 } from "./types";
 
+/** `…/Xcode.app/Contents/MacOS/Xcode`, under whatever name the app has. */
+const XCODE_APP_RE = /\.app\/Contents\/MacOS\/Xcode$/;
+
 /** The `ps` invocation this module's parser expects. */
 export const PS_ARGS = ["-Aww", "-o", "pid=,ppid=,etime=,args="] as const;
 
@@ -301,7 +304,8 @@ export function parsePsOutput(
  * Executable paths may contain spaces (`/Applications/Xcode 26.app/...`), so a
  * naive split on whitespace is wrong. Xcode's own toolchain paths never do, but
  * a user-renamed Xcode.app does — prefer the longest prefix that looks like a
- * path to a known toolchain binary, else fall back to the first token.
+ * path to a known toolchain binary or to Xcode.app itself, else fall back to
+ * the first token.
  */
 export function argv0(args: string): string {
   const first = args.split(" ")[0] ?? args;
@@ -318,6 +322,8 @@ export function argv0(args: string): string {
   for (let i = candidates.length - 1; i >= 0; i--) {
     const candidate = candidates[i]!;
     if (TOOLCHAIN_BINARIES.has(basename(candidate))) return candidate;
+    // Xcode.app itself — but not an argument naming it (`open …/Xcode`).
+    if (XCODE_APP_RE.test(candidate) && !candidate.includes(" /")) return candidate;
   }
   return first;
 }
@@ -721,4 +727,61 @@ function inheritFromAncestors(
  */
 export function activityKey(activity: LiveActivity): string {
   return String(activity.pid);
+}
+
+/**
+ * Xcode.app's build services in a snapshot, busy or idle: the ones not
+ * running under an `xcodebuild`, which would make them part of that build.
+ */
+export function buildServices(procs: readonly ObservedProcess[]): ObservedProcess[] {
+  const byPid = new Map(procs.map((proc) => [proc.pid, proc]));
+  return procs.filter((proc) => {
+    if (!DAEMON_ROOTS.has(proc.comm)) return false;
+    const seen = new Set<number>([proc.pid]);
+    let cursor = byPid.get(proc.ppid);
+    while (cursor && !seen.has(cursor.pid)) {
+      seen.add(cursor.pid);
+      if (cursor.comm === DIRECT_ROOT) return false;
+      cursor = byPid.get(cursor.ppid);
+    }
+    return true;
+  });
+}
+
+/** A build service with nothing under it, as an activity of its own. */
+export function quietServiceActivity(proc: ObservedProcess, now: number): LiveActivity {
+  return {
+    ...parseXcodebuildArgs(proc.args),
+    pid: proc.pid,
+    comm: proc.comm,
+    args: proc.args,
+    startedAt: proc.startedAt ?? now,
+    roots: [],
+    workerCount: 0,
+    phase: null,
+    currentFile: null,
+    isDaemon: true,
+  };
+}
+
+/**
+ * The Xcode.app process a build service belongs to: the one above it, else
+ * the only one running. Null when that cannot be told — two open, or the
+ * service under launchd with none above it.
+ */
+export function xcodeAppOf(
+  procs: readonly ObservedProcess[],
+  service: ObservedProcess,
+): ObservedProcess | null {
+  const isXcode = (proc: ObservedProcess) => proc.comm === "Xcode" && XCODE_APP_RE.test(argv0(proc.args));
+  const byPid = new Map(procs.map((proc) => [proc.pid, proc]));
+  const seen = new Set<number>([service.pid]);
+  let cursor = byPid.get(service.ppid);
+  while (cursor && !seen.has(cursor.pid)) {
+    if (isXcode(cursor)) return cursor;
+    seen.add(cursor.pid);
+    cursor = byPid.get(cursor.ppid);
+  }
+  const apps = procs.filter(isXcode);
+  return apps.length === 1 ? apps[0]! : null;
 }

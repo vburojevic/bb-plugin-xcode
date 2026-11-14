@@ -11,7 +11,7 @@ import { destinationLabel } from "./destination";
 import type { Engine } from "./engine";
 import { durationMs, type Run } from "./model";
 import type { Store } from "./store";
-import type { BuildPhase } from "./types";
+import type { BuildPhase, LiveActivity } from "./types";
 
 export interface RunDto {
   id: string;
@@ -41,6 +41,10 @@ export interface RunDto {
   branch: string | null;
   worktree: string | null;
   threadId: string | null;
+  /** The enrolled Mac a remote build ran on; null for this machine. */
+  hostId: string | null;
+  /** That Mac's name, when bb knows it. */
+  hostName: string | null;
   destinationLabel: string | null;
   workerCount: number | null;
   // The union lives in `types.ts` and nowhere else. Spelling it out here meant
@@ -72,7 +76,15 @@ export class DtoMapper {
     private readonly store: Store,
     private readonly engine: Engine,
     private readonly collector: Collector,
+    private readonly machineName: (hostId: string) => string | null = () => null,
+    /** Another Mac's latest process snapshot, while it is watched. */
+    private readonly activitiesOn: (hostId: string) => readonly LiveActivity[] = () => [],
   ) {}
+
+  /** The latest snapshot of the machine a run is on. */
+  private activitiesFor(run: Run): readonly LiveActivity[] {
+    return run.hostId === null ? this.collector.getLastActivities() : this.activitiesOn(run.hostId);
+  }
 
   /** Re-read the collector's project list. Cheap; call before a batch. */
   refreshProjectNames(): void {
@@ -87,7 +99,7 @@ export class DtoMapper {
   }
 
   private typicalFor(run: Run): number | null {
-    const key = `${run.root}|${run.scheme}|${run.kind}`;
+    const key = `${run.hostId ?? ""}|${run.root}|${run.scheme}|${run.kind}`;
     const now = Date.now();
     const hit = this.typicalMemo.get(key);
     if (hit && now - hit.at < TYPICAL_TTL_MS) return hit.value;
@@ -95,6 +107,7 @@ export class DtoMapper {
       root: run.root,
       scheme: run.scheme,
       kind: run.kind,
+      hostId: run.hostId,
     });
     if (this.typicalMemo.size > TYPICAL_MAX_ENTRIES) this.typicalMemo.clear();
     this.typicalMemo.set(key, { at: now, value });
@@ -107,7 +120,7 @@ export class DtoMapper {
     // the worker count, once for the phase and once for the current file.
     const activity =
       run.status === "running"
-        ? this.engine.liveActivity(run.id, this.collector.getLastActivities())
+        ? this.engine.liveActivity(run.id, this.activitiesFor(run))
         : null;
 
     return {
@@ -138,6 +151,8 @@ export class DtoMapper {
       branch: run.branch,
       worktree: run.worktree,
       threadId: run.threadId,
+      hostId: run.hostId,
+      hostName: run.hostId !== null ? (this.machineName(run.hostId) ?? run.hostId) : null,
       destinationLabel: destinationLabel(
         run.destination,
         this.collector.getSimulators(),

@@ -203,6 +203,10 @@ These commands require a bb thread with a resolvable checkout, must be run from 
 
 `run` detaches on purpose: a build's lifetime belongs to the build, not to the command that asked for it. `--wait` and `wait` only change who is *watching*. If the request disconnects or the wait times out, the build carries on and `bb xcode status` still finds it. Both exit non-zero on a failed build, so they compose with `&&`.
 
+**Threads on another Mac.** When a thread's checkout lives on an enrolled Mac rather than on the machine running bb, `xcode_build`, `bb xcode run`, `wait` and `stop` run the build *on that Mac*, through the plugin's `bb.host` worker, which bb's daemon already runs there. The Mac needs Xcode and nothing else. The checkout boundary is checked on that Mac's disk, the confirmation sheet names the Mac, and the run shows up in the live row, `xcode_status` and `bb xcode show` with the machine's name. The build survives a plugin reload or the worker's idle stop: the worker keeps a record of each build in its data dir on that Mac and re-adopts it by pid and start time. A dropped connection does not lose it either: the run is recorded before the Mac is asked to start it, and a Mac that is asleep or offline is asked again, with backoff, until it answers, even after a night with the lid closed. The Simulators tabs still drive the simulators of the machine running bb.
+
+**Builds on another Mac that the plugin did not start.** Builds from Xcode.app, a terminal, or Xcode's own agent tools (`BuildProject`, `RunSomeTests`, `RunProject`, which build inside Xcode.app) are *watched* on that Mac. The same probe and DerivedData sweep that run on the machine running bb run there, through the same worker. The worker reads its own `ps`, `lsof`, log stores and result bundles. Its builds show in the thread's live row, with phase, compiler count and current file, and on the plugin page, named by machine. An Xcode.app build is matched to its thread through its DerivedData root's `info.plist`, which records the workspace it builds. Nothing else about the build names the checkout. Xcode's build service shows up in `ps` only while it has compilers under it, and a test run spends minutes with none, because its runner lives in the simulator. So the action itself is read from DerivedData too. A test action creates its `Logs/Test/Test-<scheme>-<start>.xcresult` when it begins and finalizes it when it ends, and a build holds `build.db-journal` open while it runs. One RunAllTests is therefore one run, on the thread from its first seconds, with its verdict read from that bundle. A bundle or journal counts for a build service only if it began after that service's Xcode.app started, or after the service itself when its Xcode.app cannot be told (two open, the service under launchd). Nothing in the DerivedData root a terminal `xcodebuild` is building in counts either. With two Xcodes open, each with its own build service, a service is given only the actions its own compilers were seen working on, and keeps each one through quiet stretches (tests running in the simulator) until it ends. An action no compiler has shown yet, such as one still planning, goes unseen rather than one session's crash leftovers showing as the other's build. A run that cannot be seen while its service is still alive is never called cancelled or ended on that account. It waits for its bundle, goes back to running when it is seen again, and takes its end time from the bundle. With a single, identifiable Xcode, a test whose bundle was created up to a minute before its service started still counts, as long as it began after that Xcode.app opened. A Mac is watched while a thread whose checkout is on it is active, or was active in the last 30 minutes, and for as long as a build seen there is still open. The **Always watch builds on these Macs** setting adds Macs to that set. A watched build can be followed but not stopped from bb: `bb xcode stop` says to stop it on that Mac.
+
 </details>
 
 <details>
@@ -238,6 +242,9 @@ Two separate budgets, because they are two very different things.
 | Keep history for | 30 days | Run rows, issues, per-test results (kilobytes) |
 | Keep result bundles for | 2 days | `.xcresult` directory trees (hundreds of MB each) |
 | Result bundle disk budget | 5 GB | Hard ceiling; oldest bundles evicted first |
+| Always watch builds on these Macs | (none) | Enrolled Macs, by name, whose untracked builds are watched even with no recent thread there |
+
+Bundle retention applies on every Mac separately: a build that ran on another Mac keeps its bundle in the plugin's data dir there, and the daily prune asks that Mac to apply the same age and budget.
 
 Everything the tracker needs is extracted from a bundle on the first sweep, so a bundle only has to outlive the gap between the build finishing and the sweep reading it. Pointing a month of *history* retention at *bundles*, which is what a single shared setting did, meant following the shim instructions above could quietly cost tens of gigabytes. Age alone is not enough either: an afternoon of snapshot-test runs passes any sane budget well inside two days, which is what the disk ceiling is for.
 
@@ -297,8 +304,12 @@ The simulator capture host binds only to an ephemeral `127.0.0.1` port. The plug
 <details>
 <summary><b>Known limits</b></summary>
 
-- **Live process observation is server-host-local.** The plugin SDK has no general remote-exec primitive, so Tiers 0 and 3 cover the machine running the bb server. Tiers 1 and 2 are file-based and can read other hosts via `bb.sdk.files`.
-- **Xcode.app (IDE) builds are not fully validated.** Everything here was verified against `xcodebuild`; IDE attribution is designed to flow through child compiler args, then the DerivedData root, then the project, but was not exercised against a live Xcode.app session. The `SWBBuildService` rename above was the concrete reason they could not work at all on Xcode 26; that is fixed and unit-tested, but still not confirmed against a real IDE build.
+- **Another Mac is watched only while there is a reason to.** A Mac is watched while a thread whose checkout is on it is active or was in the last 30 minutes, while it is listed in **Always watch builds on these Macs**, or while a build seen there is still open. A build there outside those windows is picked up from its log store the next time that Mac is watched, so it appears in history but was never live. The machine running bb has to know its own host id (bb 0.49 provides it). Without that, no other Mac is watched.
+- **The shim and extra DerivedData roots are this machine's only.** `bb xcode shim install` installs on the machine running bb, and the **Extra DerivedData roots** setting names paths there. On another Mac, a terminal `xcodebuild` without `-resultBundlePath` therefore gets its verdict only from the thread's command exit. Xcode writes no Build log entry for it, the same gap the shim fills locally. Xcode.app builds do get log entries, and test runs leave bundles in `Logs/Test`, so both get verdicts on any Mac.
+- **A build on another Mac is followed through its process table, not a result stream.** An Xcode.app build there shows its phase, compiler count and current file, as one on this machine does. It has no per-section progress and no live error count: only `xcode_build` and `bb xcode run` builds have a result stream, and that is true here too.
+- **Simulators and Stills drive the machine running bb.** Stills refuses a thread whose checkout is on another Mac and says so.
+- **Removing the plugin does not stop builds on other Macs.** bb gives a plugin no uninstall hook, so a build in flight finishes on its own, and the plugin's data dir on that Mac stays behind, as bb leaves every plugin's host data.
+- **Xcode.app (IDE) builds are not fully validated.** Everything here was verified against `xcodebuild`. IDE attribution is designed to flow from the child compilers' arguments to the DerivedData root, then from the root's `info.plist` to the workspace and the thread. That path is tested against real Xcode 26 DerivedData layouts, on this machine and on another Mac, but was not exercised against a live Xcode.app session. The `SWBBuildService` rename above was the concrete reason IDE builds could not work at all on Xcode 26. That is fixed and unit-tested, and each new build the service picks up now gets its own run. Neither is confirmed against a real IDE build yet.
 - Builds shorter than the scan interval are missed by the probe, then picked up by the manifest sweep. They appear in history but never in the live strip.
 
 </details>
@@ -314,7 +325,7 @@ npm run check     # both, as CI runs them
 bb plugin dev     # rebuild + reload on save
 ```
 
-The suite runs on Linux in CI. That is a constraint, not a convenience: every `ps`, `xcrun` and `xcresulttool` call is injected as fixture text, so the whole reconciliation layer is testable without a Mac, and a Linux runner is what keeps it honest.
+The suite runs on Linux in CI. That is a constraint, not a convenience: every `ps`, `xcrun` and `xcresulttool` call is injected as fixture text, so the whole reconciliation layer is testable without a Mac, and a Linux runner is what keeps it honest. The one exception is the host worker's suite (`test/host-builds.test.ts`, `test/remote-builds.test.ts`): it runs the worker's real `/bin/sh` wrapper and `ps` identity checks over a fake `xcodebuild` script, through the SDK's own host-entry harness, because the exit-status file and the process group are what it is testing. Both exist on the Linux runner. The worker's watching half (`test/host-watch.test.ts`, `test/remote-watch.test.ts`) goes back to scripted `ps` text, over a temp directory laid out as Xcode lays out DerivedData.
 
 Architecture (v2): **one run, one identity, monotonic enrichment.** A run is born from a process observation; every other source (log store, result bundle) may only *enrich* it, carrying a confidence rank (observed < logged < verified) that can never go backward. The lifecycle is explicit: running, then finishing, then passed, warnings, failed or cancelled, or a timeout to the honest terminal `ended`.
 
@@ -323,14 +334,19 @@ Architecture (v2): **one run, one identity, monotonic enrichment.** A run is bor
 | `src/model.ts` | The rules: rank lattice, lifecycle, what counts as noise |
 | `src/engine.ts` | The single writer that applies them |
 | `src/store.ts` | Every read and write, with the SQL scope filter |
-| `src/collector.ts` | All I/O: `ps`, manifests, `xcresulttool`, discovery |
+| `src/collector.ts` | What to read and what it means: probe, discovery, manifest and bundle sweeps, for one machine |
+| `src/machine.ts`, `src/observe.ts` | How a machine is read: `ps`, `lsof`, manifests, `xcresulttool` (shared with the host worker) |
+| `src/remote-watch.ts` | Which other Macs are watched, and one collector per Mac through its host worker |
 | `src/wrapped.ts` | Launching a build we can speak for |
+| `src/launcher.ts` | Which machine a thread's build runs on |
+| `src/remote.ts` | Run rows for builds on other Macs, fed by the host worker |
+| `host.ts`, `src/host/` | The `bb.host` worker: validate, spawn, watch, stop and summarize builds on its Mac, and report the builds it did not start |
 | `src/cli.ts`, `src/tools.ts` | The two agent-facing surfaces |
 | `src/rpc.ts`, `src/dto.ts` | The two frontend-facing ones |
 | `src/scope-sync.ts`, `src/thread-sync.ts` | Talking to bb about threads |
 | `server.ts` | Wiring, and nothing else |
 
-Identity is the thing to be careful with. A run is keyed by pid *within one instance's lifetime*, because the tracker drops a pid the moment it leaves the snapshot. It is not keyed by pid across a restart, where the OS may have handed that pid to something else. A re-adopted run therefore has to prove itself by reporting the start time the store expects (`ADOPTION_SLACK_MS`), or it is retired and the build genuinely holding the pid gets its own row. A bundle path, by contrast, *is* an identity, and is indexed as one.
+Identity is the thing to be careful with. A run is keyed by machine and pid *within one instance's lifetime*, because the tracker drops a pid the moment it leaves that machine's snapshot. Each Mac's snapshot is folded on its own, so a pid missing from one Mac's process table ends runs only on that Mac. It is not keyed by pid across a restart, where the OS may have handed that pid to something else. A re-adopted run therefore has to prove itself by reporting the start time the store expects (`ADOPTION_SLACK_MS`), or it is retired and the build genuinely holding the pid gets its own row. A bundle path, by contrast, *is* an identity, and is indexed as one.
 
 The engine, the store and the thread reconciler are tested against a real in-memory SQLite. `test/store-scope.test.ts` asserts the SQL and in-memory scope predicates agree on the same fixtures, because two implementations of one rule is how a thread quietly stops seeing its own builds.
 

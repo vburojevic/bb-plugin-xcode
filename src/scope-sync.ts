@@ -50,6 +50,11 @@ export interface ScopeSyncDeps {
     /** Machine the checkout is on; `path` is only local when this is ours. */
     hostId?: string | null;
   }>;
+  /**
+   * The machine running bb (`primaryHostId`), or null when unknown. Used to
+   * normalize a scope's host: this machine is null, like its runs.
+   */
+  serverHostId(): Promise<string | null>;
   log(message: string): void;
   isDisposed(): boolean;
   /** Called when a scope newly resolves, moves, or claims existing runs. */
@@ -110,6 +115,8 @@ export class ScopeSync {
       // below belong to the fresh instance then.
       if (this.deps.isDisposed()) return null;
       if (!env.path) return null;
+      const hostId = await this.hostOf(env.hostId ?? null);
+      if (this.deps.isDisposed()) return null;
 
       const before = this.scopes.get(threadId);
       this.scopes.upsert(
@@ -118,9 +125,11 @@ export class ScopeSync {
           projectId: env.projectId ?? null,
           environmentId,
           path: env.path,
-          hostId: env.hostId ?? null,
+          hostId,
           branch: env.branchName ?? null,
           active,
+          // Resolving a scope is not a turn: keep when the last one was.
+          activeAt: before?.activeAt ?? null,
         },
         this.now(),
       );
@@ -128,6 +137,7 @@ export class ScopeSync {
       const backfilled = this.deps.store.attributeRunsToThread(
         threadId,
         env.path,
+        hostId,
         this.now() - BACKFILL_WINDOW_MS,
       );
       // The banner reads the thread's runs on every publish, so a late claim
@@ -146,6 +156,23 @@ export class ScopeSync {
       this.deps.log(`thread scope resolve failed (${threadId}): ${String(error)}`);
       return null;
     }
+  }
+
+  /**
+   * An environment's host as scopes and runs record it: null for the machine
+   * running bb. When that machine's identity is unknown, null too, which is
+   * also where `buildTargetFor` sends the build: the two must agree, or a
+   * thread would not see the builds it just started.
+   */
+  private async hostOf(environmentHostId: string | null): Promise<string | null> {
+    if (environmentHostId === null) return null;
+    let serverHostId: string | null = null;
+    try {
+      serverHostId = await this.deps.serverHostId();
+    } catch (error) {
+      this.deps.log(`server host lookup failed: ${String(error)}`);
+    }
+    return serverHostId === null || serverHostId === environmentHostId ? null : environmentHostId;
   }
 
   /** Cached when known, otherwise one bounded refresh. See the constant. */

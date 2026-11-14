@@ -85,6 +85,16 @@ export type BuildPhase =
   | "signing"
   | "testing";
 
+/**
+ * An Xcode.app build service process seen alive in a snapshot, busy or not.
+ * Whether its build is reported is another matter; this says only that the
+ * process that would finish it has not gone.
+ */
+export interface ServicePresence {
+  pid: number;
+  startedAt: number | null;
+}
+
 export interface LiveActivity extends ActivityAttribution {
   pid: number;
   comm: string;
@@ -104,6 +114,17 @@ export interface LiveActivity extends ActivityAttribution {
    * when the build ends, they just go quiet.
    */
   isDaemon: boolean;
+  /**
+   * For a build service: when the Xcode action it is serving began, read from
+   * DerivedData (`src/xcode-actions.ts`). The service's own start is when
+   * Xcode opened; this is the build's.
+   */
+  actionStartedAt?: number | null;
+  /**
+   * `resultBundlePath` was found on disk, not named by the build: it is
+   * evidence of an action, never a path the build asked to have read.
+   */
+  resultBundleFound?: boolean;
 }
 
 /** One entry from a `LogStoreManifest.plist` `logs` dict. */

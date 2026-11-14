@@ -180,6 +180,11 @@ export interface Run {
   worktree: string | null;
   /** bb thread whose environment this build ran in, when attributable. */
   threadId: string | null;
+  /**
+   * The enrolled Mac the build ran on, when it is not the machine running bb.
+   * Null for every run this machine observed itself.
+   */
+  hostId: string | null;
 }
 
 export interface Finding {

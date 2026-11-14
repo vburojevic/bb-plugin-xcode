@@ -9,6 +9,8 @@ The focused security regression suites are:
 
 - `test/build-security.test.ts`
 - `test/agent-scope-security.test.ts`
+- `test/host-builds.test.ts`
+- `test/remote-builds.test.ts`
 - `test/bounded-file.test.ts`
 - `test/stream.test.ts`
 - `test/sim/sim-host-security.test.ts`
@@ -38,6 +40,70 @@ plugin, or test can execute with the bb server user's filesystem, keychain, and
 network access. The current plugin SDK has no host execution primitive that
 attaches a thread's filesystem or network permission sandbox. Do not use the
 tracked runner for an untrusted checkout on a privileged host.
+
+### Builds on another Mac
+
+When a thread's checkout lives on an enrolled Mac, the build runs there, in the
+plugin's `bb.host` worker, as that Mac's bb user. Everything above applies
+unchanged, and is enforced **on that Mac**: the working directory and every
+path argument are resolved with real paths on the disk the build will use,
+never lexically on the server, where the checkout does not exist. The worker
+checks the request before the person is asked to confirm, and again when it
+starts the build.
+
+The worker runs `/usr/bin/xcodebuild` under a fixed `/bin/sh` wrapper that
+records the exit status. The validated arguments reach xcodebuild as positional
+parameters and the wrapper's file paths through the environment, so nothing
+from the request is interpolated into the script. Each Mac allows four tracked
+builds at once, counting builds still starting.
+
+Builds are addressed by an id the server mints and records before it asks for
+the start, so a start whose reply is lost is still accounted for; the id's
+format admits no path characters, and starting an id the worker already
+recorded returns that build rather than starting another. xcodebuild does not
+run until the worker's record of it is on disk: the wrapper waits at a gate the
+worker opens only after writing it, so no build runs that the plugin cannot
+find, stop or clean up. The worker acts only
+on builds it recorded in its own data dir. A server request cannot name a
+bundle to parse, a directory to delete, or a process to signal. Before
+`stop` signals anything, the worker proves that the recorded pid is still the
+same build: the process's command line must carry the build's marker, and its
+start time must match the record within two seconds. A recycled pid is never
+signalled. Signals reach the build's own process group, never the daemon's.
+Run rows are updated only by the Mac that ran them; a host signal carries
+bb's authenticated host id.
+
+### Watching builds on another Mac
+
+The worker also reports builds on its Mac that the plugin did not start. This
+covers Xcode.app, a terminal and Xcode's own agent tools. This half is read-only:
+it runs `ps`, `lsof` and `xcresulttool`, reads files, and starts, signals,
+writes or deletes nothing except a small list of bundle paths in its own data
+dir. What it reads is fenced on that Mac, with symlinks resolved there:
+
+- log-store manifests only at their fixed place inside a directory that is a
+  DerivedData root (it has `Logs/Build`), and never through a link that leads
+  out of it;
+- result bundles only in a root's `Logs/Test`, in the plugin's own shim
+  directory, or at a `-resultBundlePath` that a build on that Mac was seen
+  using. A path the server names that is none of these is refused, so the
+  server can no longer name an arbitrary bundle to parse. A bundle or
+  `build.db-journal` found on disk as evidence of an Xcode.app action counts
+  only as a real directory or file inside its root, never through a link, and
+  never joins the list of paths builds named;
+- checkouts to scan for DerivedData only as existing directories, walked
+  without following links.
+
+Replies are capped well under bb's 8 MiB host-RPC limit. A Mac is probed only
+while a thread whose checkout is on it is active or was recently, while the
+person has opted it in, or while a build seen there is still open. Each Mac's
+probe is held to the same duty cycle as the local one. `bb xcode stop` refuses
+a watched build on another Mac: the plugin signals only builds it started.
+
+Thread scoping compares machines as well as paths. Two Macs can hold the same
+checkout path on the same branch, so a path or checkout-name match only counts
+for a run on the scope's own machine; a thread can never read, wait on or stop
+a build on another Mac through such a match.
 
 ## Simulator capture host
 

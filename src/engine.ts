@@ -20,10 +20,12 @@ import {
   VERDICT_STATUSES,
   statusTransitionAllowed,
 } from "./model";
-import type { Store } from "./store";
-import type { LiveActivity } from "./types";
+import { isHostBuildRun, type Store } from "./store";
+import type { LiveActivity, ServicePresence } from "./types";
 import type { BuildResults, TestResults } from "./types";
 import type { BackgroundCommandOutcome } from "./thread-outcome";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { MAX_ACTION_AGE_MS, parseTestBundleName } from "./xcode-actions";
 
 /**
  * Consecutive probe misses before a running process is considered gone.
@@ -67,18 +69,27 @@ export function looksLikeBuildLauncher(command: string): boolean {
 }
 
 export interface EngineHooks {
-  /** Resolve which bb project owns a path, most specific wins. */
-  projectFor(signals: {
-    root?: string | null;
-    cwd?: string | null;
-    container?: string | null;
-  }): string | null;
-  /** Resolve which bb thread's environment contains a path, if any. */
-  threadFor(signals: {
-    root?: string | null;
-    cwd?: string | null;
-    container?: string | null;
-  }): string | null;
+  /**
+   * Resolve which bb project owns a path, most specific wins. `hostId` is the
+   * machine the path is on (null: this one); a path means nothing elsewhere.
+   */
+  projectFor(
+    signals: {
+      root?: string | null;
+      cwd?: string | null;
+      container?: string | null;
+    },
+    hostId: string | null,
+  ): string | null;
+  /** Resolve which bb thread's environment, on that machine, contains a path. */
+  threadFor(
+    signals: {
+      root?: string | null;
+      cwd?: string | null;
+      container?: string | null;
+    },
+    hostId: string | null,
+  ): string | null;
   /** Notify the host when a newly observed process becomes a tracked run. */
   onRunStarted?(run: Run): void;
   log(message: string): void;
@@ -95,6 +106,9 @@ export interface EngineHooks {
  */
 export const ADOPTION_SLACK_MS = 10_000;
 
+/** Two actions starting this close are one (a test action's bundle, then its build). */
+const ACTION_SLACK_MS = 5_000;
+
 /**
  * A `running` row older than this cannot be believed.
  *
@@ -105,8 +119,34 @@ export const ADOPTION_SLACK_MS = 10_000;
  */
 export const RUNNING_MAX_AGE_MS = 12 * 3_600_000;
 
+/**
+ * How recently a sweep must have found a run's bundle still being written for
+ * the run to be held out of `ended`: a few sweeps' worth.
+ */
+const AWAITING_FRESH_MS = 90_000;
+
 interface LiveEntry {
   runId: string;
+  /** The machine whose process table this pid is in; null for this one. */
+  hostId: string | null;
+  pid: number;
+  /**
+   * What the run was building: its DerivedData root and workspace. Xcode.app's
+   * build service keeps its pid from one build to the next, so for it a
+   * change of these is a new build.
+   */
+  root: string | null;
+  container: string | null;
+  /** For a build service: when the Xcode action it serves began. */
+  actionStartedAt?: number | null;
+  /**
+   * When the run began as far as it knows: its row's start. Its action, once
+   * named, cannot have begun after it — the run was already that action when
+   * it was first seen — so an action that did is the next one.
+   */
+  runStartedAt: number;
+  /** The result bundle the run is known to write, once it is. */
+  bundlePath?: string | null;
   misses: number;
   lastSeenAt: number;
   /**
@@ -130,9 +170,82 @@ interface LiveEntry {
   sawWork?: boolean;
 }
 
+/**
+ * A live process's identity: its pid, on its machine.
+ *
+ * A pid alone stopped being enough once other Macs' process tables were folded
+ * in: two Macs hand out the same numbers, and keyed by pid, one Mac's build
+ * would have adopted — or retired — the other's.
+ */
+function liveKey(hostId: string | null, pid: number): string {
+  return `${hostId ?? ""}#${pid}`;
+}
+
+/**
+ * A process-observed run's id. This machine's keep the form they always had;
+ * another Mac's carry its host, because the same pid can start in the same
+ * second on two Macs.
+ */
+export function observedRunId(hostId: string | null, pid: number, startedAt: number): string {
+  const seconds = Math.round(startedAt / 1000);
+  return hostId === null ? `r:${pid}:${seconds}` : `r:${hostId}:${pid}:${seconds}`;
+}
+
+/** Is a build service now serving another root or workspace than its run's? */
+function switchedBuild(
+  entry: Pick<LiveEntry, "root" | "container" | "actionStartedAt" | "bundlePath" | "runStartedAt">,
+  activity: LiveActivity,
+): boolean {
+  // Another test action: every one writes a bundle of its own.
+  const bundle = activity.resultBundlePath;
+  if (bundle !== null && entry.bundlePath && bundle !== entry.bundlePath) return true;
+  // Another action began: back to back in one workspace, with no quiet
+  // snapshot between them to end the first.
+  const began = activity.actionStartedAt ?? null;
+  const was = entry.actionStartedAt ?? null;
+  if (began !== null && was !== null && Math.abs(began - was) > ACTION_SLACK_MS) return true;
+  // A run that has not learned its action's start yet — first seen through
+  // children alone, or adopted after a restart with nothing on disk to name
+  // it — still knows when it was already running. An action that began after
+  // that is not its own, whichever snapshot shows it first. (Should Xcode
+  // name a build's journal only after its first compilers are seen, one
+  // build reads as two runs; never two builds as one.)
+  if (began !== null && was === null && began > entry.runStartedAt + ACTION_SLACK_MS) return true;
+  const root = activity.derivedDataPath ?? activity.roots[0] ?? null;
+  if (entry.root !== null && root !== null) return !activity.roots.includes(entry.root) && root !== entry.root;
+  if (entry.container !== null && activity.container !== null) {
+    return entry.container !== activity.container;
+  }
+  return false;
+}
+
+/**
+ * Is the process in a snapshot the one a run adopted at boot was started by?
+ *
+ * An `xcodebuild` must report the start time the run recorded. Xcode.app's
+ * build service cannot: the run started when the service picked up work, long
+ * after the service itself started. What a recycled pid cannot do is predate
+ * the run — a process that took over the number after a restart started after
+ * the build did — so for the service that is the test.
+ */
+function sameProcess(activity: LiveActivity, expectedStartedAt: number): boolean {
+  if (activity.isDaemon) return activity.startedAt <= expectedStartedAt + ADOPTION_SLACK_MS;
+  return Math.abs(activity.startedAt - expectedStartedAt) <= ADOPTION_SLACK_MS;
+}
+
 export class Engine {
-  /** Keyed by pid — the probe's identity for a live activity. */
-  private readonly live = new Map<number, LiveEntry>();
+  /** Keyed by `liveKey` — the probe's identity for a live activity. */
+  private readonly live = new Map<string, LiveEntry>();
+  /**
+   * The build services each machine's last answered snapshot saw alive (key:
+   * host id, "" for this one); a machine missing or null is not known.
+   */
+  private readonly presence = new Map<string, readonly ServicePresence[] | null>();
+  /**
+   * Runs whose bundle the last sweeps found still being written while their
+   * service lived, with when that was last seen.
+   */
+  private readonly awaiting = new Map<string, number>();
 
   constructor(
     private readonly store: Store,
@@ -148,9 +261,35 @@ export class Engine {
    */
   hydrate(now: number): void {
     for (const run of this.store.listUnresolved()) {
+      // A tracked build on another Mac is `src/remote.ts`'s to settle; no
+      // process table speaks for it. A watched one is adopted under its own
+      // Mac, so only that Mac's snapshots can confirm or retire it.
+      if (isHostBuildRun(run)) continue;
+      // An Xcode.app action left `finishing` by a stretch it could not be
+      // seen through, its bundle still to come: held as the sweeps held it,
+      // until its machine has answered again and the sweeps can say.
+      if (
+        run.status === "finishing" &&
+        run.bundlePath !== null &&
+        isBuildServiceCommand(run.cmdline) &&
+        now - run.startedAt < MAX_ACTION_AGE_MS
+      ) {
+        this.awaiting.set(run.id, now);
+      }
       if (run.status === "running" && run.pid !== null) {
-        this.live.set(run.pid, {
+        this.live.set(liveKey(run.hostId, run.pid), {
           runId: run.id,
+          hostId: run.hostId,
+          pid: run.pid,
+          root: run.root,
+          container: run.container,
+          // A test action's bundle names the second it began: the identity
+          // the next action is told apart by survives a restart with it.
+          actionStartedAt: isBuildServiceCommand(run.cmdline)
+            ? (parseTestBundleName(basename(run.bundlePath ?? ""))?.startedAt ?? null)
+            : null,
+          bundlePath: run.bundlePath,
+          runStartedAt: run.startedAt,
           misses: 0,
           lastSeenAt: now,
           expectedStartedAt: run.startedAt,
@@ -165,9 +304,65 @@ export class Engine {
     }
   }
 
-  /** True while anything is running or awaiting its verdict. */
-  hasOpenRuns(): boolean {
-    return this.store.hasUnresolved();
+  /**
+   * What one machine's last answered snapshot saw of its build services.
+   * Kept until the next answer: a machine out of reach is no evidence that
+   * a process there has gone.
+   */
+  notePresence(hostId: string | null, services: readonly ServicePresence[] | null): void {
+    this.presence.set(hostId ?? "", services);
+  }
+
+  /**
+   * Is the build service that ran this run still alive on its machine, by
+   * the last snapshot there? False when that is not known, or the pid now
+   * belongs to a process started after the run began.
+   */
+  producerAlive(run: Pick<Run, "hostId" | "pid" | "startedAt">): boolean {
+    const present = this.presence.get(run.hostId ?? "") ?? null;
+    if (present === null || run.pid === null) return false;
+    return present.some(
+      (service) =>
+        service.pid === run.pid &&
+        (service.startedAt === null || service.startedAt <= run.startedAt + ADOPTION_SLACK_MS),
+    );
+  }
+
+  /**
+   * The bundle sweep found this run's bundle still being written, and the
+   * service that writes it alive. See `awaitingBundle`.
+   */
+  noteAwaitingBundle(runId: string, now: number): void {
+    this.awaiting.set(runId, now);
+  }
+
+  /**
+   * An Xcode.app action left `running` because it could not be seen, whose
+   * bundle the sweeps keep finding unfinished while its service lives: still
+   * going, as far as anything can tell, so not yet `ended`. Lapses as soon as
+   * the sweeps stop saying so — the bundle was finalized (it is read, or
+   * cannot be here), or the service went — and is bounded by how long an
+   * action can be believed to last.
+   */
+  private awaitingBundle(run: Run, now: number): boolean {
+    const at = this.awaiting.get(run.id);
+    if (at === undefined) return false;
+    if (now - at > AWAITING_FRESH_MS || now - run.startedAt >= MAX_ACTION_AGE_MS) {
+      this.awaiting.delete(run.id);
+      return false;
+    }
+    // Restored at boot, and its machine has not answered since: nothing yet
+    // says its service has gone.
+    if (!this.presence.has(run.hostId ?? "")) return true;
+    return this.producerAlive(run);
+  }
+
+  /**
+   * True while anything is running or awaiting its verdict, on one machine
+   * (null: this one).
+   */
+  hasOpenRuns(hostId: string | null = null): boolean {
+    return this.store.hasUnresolved(hostId);
   }
 
   liveWorkerCount(runId: string, activities: readonly LiveActivity[]): number | null {
@@ -196,48 +391,73 @@ export class Engine {
     return phase;
   }
 
-  /** The live process snapshot backing a run, for phase and current file. */
+  /**
+   * The live process snapshot backing a run, for phase and current file.
+   * `activities` is the latest snapshot of the run's own machine.
+   */
   liveActivity(
     runId: string,
     activities: readonly LiveActivity[],
   ): LiveActivity | null {
-    for (const [pid, entry] of this.live) {
+    for (const entry of this.live.values()) {
       if (entry.runId !== runId) continue;
-      return activities.find((a) => a.pid === pid) ?? null;
+      return activities.find((a) => a.pid === entry.pid) ?? null;
     }
     return null;
+  }
+
+  /** Forget the live process behind a run that has been settled. */
+  private dropLive(runId: string): void {
+    for (const [key, entry] of this.live) {
+      if (entry.runId === runId) this.live.delete(key);
+    }
   }
 
   // ------------------------------------------------------------- probe fold
 
   /**
-   * Fold one probe snapshot. Returns true when persisted state changed.
+   * Fold one machine's probe snapshot (`hostId` null: this machine). Returns
+   * true when persisted state changed.
+   *
+   * A snapshot is complete for its own machine only: a pid missing from it
+   * ends a run on that machine and nowhere else. Each Mac is folded on its
+   * own, at its own pace, and a slow or unreachable one simply sends nothing.
    */
-  foldSnapshot(activities: readonly LiveActivity[], now: number): boolean {
+  foldSnapshot(
+    activities: readonly LiveActivity[],
+    now: number,
+    hostId: string | null = null,
+  ): boolean {
     let changed = false;
-    const seenPids = new Set<number>();
+    const seenKeys = new Set<string>();
 
     for (const activity of activities) {
-      seenPids.add(activity.pid);
-      const tracked = this.live.get(activity.pid);
+      const key = liveKey(hostId, activity.pid);
+      seenKeys.add(key);
+      const tracked = this.live.get(key);
       if (tracked) {
         // A provisionally adopted pid has to prove it is still the process the
         // stored run described. A mismatch means the pid was recycled while
         // this plugin was down: retire the orphan and let the loop fall
         // through to mint a run for the build that is genuinely there.
         const expected = tracked.expectedStartedAt;
-        if (
-          expected !== undefined &&
-          Math.abs(activity.startedAt - expected) > ADOPTION_SLACK_MS
-        ) {
-          this.live.delete(activity.pid);
+        if (expected !== undefined && !sameProcess(activity, expected)) {
+          this.live.delete(key);
           this.retire(tracked, now, "pid reused across a restart");
+          changed = true;
+        } else if (activity.isDaemon && switchedBuild(tracked, activity)) {
+          // The same build service, now building another workspace: the build
+          // it was serving is over, however briefly it went quiet (or however
+          // long the Mac was out of reach) in between.
+          this.live.delete(key);
+          this.retire(tracked, now, "the build service moved to another workspace");
           changed = true;
         } else {
           // Identity confirmed; it is an ordinary tracked pid from here on.
           delete tracked.expectedStartedAt;
           tracked.misses = 0;
           tracked.lastSeenAt = now;
+          if (this.learn(tracked, activity, hostId)) changed = true;
           if (activity.phase && activity.phase !== "preparing") {
             tracked.sawWork = true;
           }
@@ -246,8 +466,30 @@ export class Engine {
       }
 
       const root = activity.derivedDataPath ?? activity.roots[0] ?? null;
+      /**
+       * When this build began, as far as anyone can tell.
+       *
+       * For `xcodebuild` that is the process's own start. Xcode.app's build
+       * service is different: it stays resident for the whole Xcode session
+       * and serves build after build, so its start time is when Xcode was
+       * opened. Used as the run's start, a build began hours ago; used in the
+       * run's id, every build after the first in a session minted the id the
+       * first one already had, and was silently dropped. The service shows up
+       * here only while it has work, so the first sighting is the start.
+       */
+      const startedAt = activity.isDaemon
+        ? (activity.actionStartedAt ?? Math.max(now, activity.startedAt))
+        : activity.startedAt;
+      const id = observedRunId(hostId, activity.pid, startedAt);
+      // The same process — or the same Xcode action — as a run already
+      // stored: it is that run seen again, not a new one.
+      const known = this.store.getRun(id);
+      if (known) {
+        if (this.resume(known, key, activity, now, hostId)) changed = true;
+        continue;
+      }
       const run: Run = {
-        id: `r:${activity.pid}:${Math.round(activity.startedAt / 1000)}`,
+        id,
         status: "running",
         statusRank: RANK.observed,
         kind: activity.kind,
@@ -255,16 +497,19 @@ export class Engine {
         container: activity.container,
         configuration: activity.configuration,
         destination: activity.destination,
-        projectId: this.hooks.projectFor({
-          root,
-          cwd: activity.cwd,
-          container: activity.container,
-        }),
+        projectId: this.hooks.projectFor(
+          {
+            root,
+            cwd: activity.cwd,
+            container: activity.container,
+          },
+          hostId,
+        ),
         root,
         cwd: activity.cwd,
         pid: activity.pid,
         cmdline: activity.args.slice(0, 4000),
-        startedAt: activity.startedAt,
+        startedAt,
         endedAt: null,
         errorCount: 0,
         warningCount: 0,
@@ -276,15 +521,27 @@ export class Engine {
         detailed: false,
         branch: activity.branch ?? null,
         worktree: activity.worktree ?? null,
-        threadId: this.hooks.threadFor({
-          root,
-          cwd: activity.cwd,
-          container: activity.container,
-        }),
+        threadId: this.hooks.threadFor(
+          {
+            root,
+            cwd: activity.cwd,
+            container: activity.container,
+          },
+          hostId,
+        ),
+        // The machine whose process table this came from.
+        hostId,
       };
       this.store.insertRun(run);
-      this.live.set(activity.pid, {
+      this.live.set(key, {
         runId: run.id,
+        hostId,
+        pid: activity.pid,
+        root,
+        container: activity.container,
+        actionStartedAt: activity.actionStartedAt ?? null,
+        bundlePath: activity.resultBundlePath,
+        runStartedAt: startedAt,
         misses: 0,
         lastSeenAt: now,
         sawWork: Boolean(activity.phase && activity.phase !== "preparing"),
@@ -297,15 +554,111 @@ export class Engine {
     // Hysteresis: only repeated absence moves a run to `finishing`, and the
     // end time is when the process was last SEEN — our detection grace is
     // never billed to the build.
-    for (const [pid, entry] of [...this.live]) {
-      if (seenPids.has(pid)) continue;
+    for (const [key, entry] of [...this.live]) {
+      if (entry.hostId !== hostId || seenKeys.has(key)) continue;
       entry.misses += 1;
       if (entry.misses < MISSES_BEFORE_FINISHING) continue;
 
-      this.live.delete(pid);
+      this.live.delete(key);
       if (this.retire(entry, now)) changed = true;
     }
 
+    return changed;
+  }
+
+  /**
+   * A stored run's process or action, showing again after it was taken out
+   * of `running`.
+   *
+   * Leaving `running` is only ever inferred: a process missing from three
+   * snapshots. For Xcode.app's service that is often a stretch in which its
+   * build could not be seen, not one in which it stopped — and when it is
+   * seen again, with the same identity, it is the same run, back to
+   * `running`. Only an outcome stated by evidence (a log entry, a bundle)
+   * closes a run for good; such a run is not followed again.
+   */
+  private resume(
+    run: Run,
+    key: string,
+    activity: LiveActivity,
+    now: number,
+    hostId: string | null,
+  ): boolean {
+    if (run.statusRank > RANK.observed) return false;
+    // Retired for running longer than can be believed: not brought back to
+    // be retired again on the next tick.
+    if (now - run.startedAt >= RUNNING_MAX_AGE_MS) return false;
+    let changed = false;
+    if (run.status !== "running") {
+      this.hooks.log(`run resumed: ${run.id} (was ${run.status})`);
+      run.status = "running";
+      run.endedAt = null;
+      this.store.updateRun(run);
+      changed = true;
+    }
+    const entry: LiveEntry = {
+      runId: run.id,
+      hostId,
+      pid: activity.pid,
+      root: run.root,
+      container: run.container,
+      actionStartedAt: activity.actionStartedAt ?? null,
+      bundlePath: run.bundlePath,
+      runStartedAt: run.startedAt,
+      misses: 0,
+      lastSeenAt: now,
+      sawWork: true,
+    };
+    this.live.set(key, entry);
+    if (this.learn(entry, activity, hostId)) changed = true;
+    return changed;
+  }
+
+  /**
+   * What a later snapshot of a run's process knows that its first did not.
+   *
+   * Xcode.app's build service is often first seen through children that name
+   * no project — SDK modules compiled before any of the project's — and only
+   * a few probes later through its action on disk: the action's start, its
+   * bundle, its root and so its workspace. All of it is kept the moment it
+   * arrives: the start and bundle tell the next action from this one, and
+   * the root and workspace put the run on its project and thread while it is
+   * still running. Only what is missing is filled; nothing known is replaced.
+   */
+  private learn(tracked: LiveEntry, activity: LiveActivity, hostId: string | null): boolean {
+    tracked.actionStartedAt ??= activity.actionStartedAt ?? null;
+    const root = activity.derivedDataPath ?? activity.roots[0] ?? null;
+    const bundle = !tracked.bundlePath ? activity.resultBundlePath : null;
+    const newRoot = tracked.root === null ? root : null;
+    const newContainer = tracked.container === null ? activity.container : null;
+    if (!bundle && !newRoot && !newContainer) return false;
+    tracked.bundlePath ||= bundle;
+    tracked.root ??= newRoot;
+    tracked.container ??= newContainer;
+
+    const run = this.store.getRun(tracked.runId);
+    if (!run) return false;
+    let changed = false;
+    // A test action's bundle can be named after the run began: claim it, so
+    // its verdict is read from that bundle when the action ends.
+    if (bundle && run.bundlePath === null) {
+      run.bundlePath = bundle;
+      if (activity.kind === "test") run.kind = "test";
+      run.scheme ??= activity.scheme;
+      changed = true;
+    }
+    if ((newRoot && run.root === null) || (newContainer && run.container === null)) {
+      run.root ??= newRoot;
+      run.container ??= newContainer;
+      run.cwd ??= activity.cwd;
+      run.branch ??= activity.branch ?? null;
+      run.worktree ??= activity.worktree ?? null;
+      const signals = { root: run.root, cwd: run.cwd, container: run.container };
+      run.projectId ??= this.hooks.projectFor(signals, hostId);
+      run.threadId ??= this.hooks.threadFor(signals, hostId);
+      changed = true;
+    }
+    if (changed) this.store.updateRun(run);
     return changed;
   }
 
@@ -348,7 +701,7 @@ export class Engine {
     for (const run of this.store.listUnresolved()) {
       if (run.status === "running") {
         if (now - run.startedAt < RUNNING_MAX_AGE_MS) continue;
-        if (run.pid !== null) this.live.delete(run.pid);
+        this.dropLive(run.id);
         run.status = "ended";
         run.statusRank = RANK.observed;
         run.endedAt ??= now;
@@ -360,6 +713,9 @@ export class Engine {
       if (run.status !== "finishing") continue;
       const since = run.endedAt ?? run.startedAt;
       if (now - since < FINISHING_TIMEOUT_MS) continue;
+      // Not "ended" — which a waiter takes as the outcome — while its
+      // outcome is still on its way.
+      if (this.awaitingBundle(run, now)) continue;
       run.status = "ended";
       run.statusRank = RANK.observed;
       this.store.updateRun(run);
@@ -388,8 +744,9 @@ export class Engine {
       warnings: number;
     },
     now: number,
+    hostId: string | null = null,
   ): boolean {
-    const target = this.store.getRunByBundlePath(bundlePath);
+    const target = this.store.getRunByBundlePath(bundlePath, hostId);
     if (!target) return false;
 
     const verdict: RunStatus =
@@ -415,9 +772,7 @@ export class Engine {
     target.status = verdict;
     target.statusRank = RANK.logged;
     target.endedAt ??= now;
-    for (const [pid, live] of this.live) {
-      if (live.runId === target.id) this.live.delete(pid);
-    }
+    this.dropLive(target.id);
     this.store.updateRun(target);
     this.hooks.log(`verdict from wrapped exit: ${verdict} (${target.id})`);
     return true;
@@ -471,6 +826,10 @@ export class Engine {
       // simply never got its verdict.
       .listRuns({ limit: 200, includeNoise: true, threadId: outcome.threadId })
       .filter((run) => !VERDICT_STATUSES.has(run.status))
+      // Xcode.app's builds — its build service, or a row only its log store
+      // knows — are attributed to a thread through their workspace, but no
+      // command launched them, so no command's exit speaks for them.
+      .filter((run) => !run.id.startsWith("m:") && !isBuildServiceCommand(run.cmdline))
       .filter((run) => run.startedAt >= outcome.startedAt - LAUNCH_SLACK_MS)
       .filter(
         (run) =>
@@ -502,9 +861,7 @@ export class Engine {
       target.status = verdict;
       target.statusRank = RANK.logged;
       target.endedAt ??= Math.min(outcome.endedAt, now);
-      for (const [pid, live] of this.live) {
-        if (live.runId === target.id) this.live.delete(pid);
-      }
+      this.dropLive(target.id);
       this.store.updateRun(target);
       this.hooks.log(
         `verdict from thread command exit: ${verdict} (${target.id})`,
@@ -540,6 +897,33 @@ export class Engine {
     return true;
   }
 
+  /**
+   * A build on another Mac whose wrapper is gone without having written how
+   * it ended — SIGKILLed, the Mac rebooted, or its record was deleted.
+   *
+   * "ended", not "cancelled": nobody here knows whether it was stopped, and
+   * the verdict-less status says exactly that. A finalized bundle read later
+   * still upgrades it through the rank lattice.
+   */
+  foldUnaccountedExit(runId: string, now: number, why: string): boolean {
+    const run = this.store.getRun(runId);
+    if (!run) return false;
+    if (
+      !statusTransitionAllowed(
+        { status: run.status, rank: run.statusRank },
+        { status: "ended", rank: RANK.observed },
+      )
+    ) {
+      return false;
+    }
+    run.status = "ended";
+    run.statusRank = RANK.observed;
+    run.endedAt ??= now;
+    this.store.updateRun(run);
+    this.hooks.log(`run ended without an exit status: ${run.id} (${why})`);
+    return true;
+  }
+
   // ---------------------------------------------------------- manifest fold
 
   /**
@@ -550,6 +934,12 @@ export class Engine {
    * A manifest entry ENRICHES the overlapping run. It creates a standalone
    * run only when nothing overlaps — an IDE build from before the plugin
    * loaded, for example.
+   *
+   * `context` says where the entry was read: the machine (null: this one),
+   * and the workspace or project the root belongs to, from the root's own
+   * `info.plist`. That workspace is what ties an Xcode.app build to a
+   * thread: nothing else about it names the checkout, because its build
+   * service runs from `/` and its DerivedData lives in `~/Library`.
    */
   foldManifestEntry(
     root: string,
@@ -567,17 +957,49 @@ export class Engine {
       testFailureCount: number;
     },
     now: number,
+    context: { hostId?: string | null; container?: string | null } = {},
   ): boolean {
     if (entry.startedAt === null) return false;
     const key = `manifest:${entry.uniqueIdentifier}`;
     if (this.store.hasSeen(key)) return false;
+    const hostId = context.hostId ?? null;
+    const container = context.container ?? null;
 
+    const owner: ArtifactOwner = { root, workspace: container };
     const candidates = this.store
-      .findVerdictCandidates(entry.startedAt, MATCH_SLACK_MS)
-      .filter((run) => !run.root || run.root === root)
-      .filter((run) => domainCompatible(domainKind, run.kind));
+      .findVerdictCandidates(entry.startedAt, MATCH_SLACK_MS, hostId)
+      .filter((run) => ownedBy(run, owner))
+      .filter((run) => domainCompatible(domainKind, run.kind))
+      // A tracked build on another Mac claims only its own scheme's entry; an
+      // Xcode.app build of something else alongside it keeps its own row.
+      .filter(
+        (run) =>
+          !isHostBuildRun(run) || !run.scheme || !entry.scheme || run.scheme === entry.scheme,
+      );
 
-    const target = candidates[0] ?? null;
+    // A tracked build stops being a verdict candidate once its own bundle has
+    // been read (rank verified), but its log entry still lands here, often
+    // later: look for it whatever its rank before filing a standalone row.
+    const target =
+      candidates[0] ??
+      (hostId === null
+        ? null
+        : (this.store
+            .findHostBuildsAround(entry.startedAt, MATCH_SLACK_MS, hostId)
+            .find(
+              (run) =>
+                ownedBy(run, owner) &&
+                (!run.scheme || !entry.scheme || run.scheme === entry.scheme),
+            ) ??
+          null));
+
+    if (target && isHostBuildRun(target)) {
+      // The build the host worker ran writes this entry too. Its verdict
+      // comes from its exit and its own bundle (`src/remote.ts`), so the
+      // entry is absorbed, never folded — and never becomes a second row.
+      if (target.status !== "running") this.store.markSeen(key, now);
+      return false;
+    }
 
     if (target) {
       // A test run's compile phase writes a Build entry whose status covers
@@ -590,6 +1012,8 @@ export class Engine {
       target.analyzerCount = Math.max(target.analyzerCount, entry.analyzerCount);
       target.scheme ??= entry.scheme;
       target.root ??= root;
+      target.container ??= container;
+      target.threadId ??= this.hooks.threadFor({ root, container }, hostId);
 
       // A live process has not finished, whatever a log entry claims. One
       // invocation writes an entry per action, so the clean phase of
@@ -638,12 +1062,10 @@ export class Engine {
           { status: verdict, rank: RANK.logged },
         )
       ) {
+        target.endedAt = settledEnd(target, entry.endedAt, now);
         target.status = verdict;
         target.statusRank = RANK.logged;
-        target.endedAt ??= entry.endedAt ?? now;
-        for (const [pid, live] of this.live) {
-          if (live.runId === target.id) this.live.delete(pid);
-        }
+        this.dropLive(target.id);
         this.hooks.log(`verdict from manifest: ${verdict} (${target.id})`);
       }
       this.store.updateRun(target);
@@ -658,10 +1080,10 @@ export class Engine {
       statusRank: RANK.logged,
       kind: domainKind,
       scheme: entry.scheme,
-      container: null,
+      container,
       configuration: null,
       destination: null,
-      projectId: this.hooks.projectFor({ root }),
+      projectId: this.hooks.projectFor({ root, container }, hostId),
       root,
       cwd: null,
       pid: null,
@@ -678,7 +1100,8 @@ export class Engine {
       detailed: false,
       branch: null,
       worktree: null,
-      threadId: null,
+      threadId: this.hooks.threadFor({ root, container }, hostId),
+      hostId,
     };
     this.store.insertRun(run);
     return true;
@@ -690,6 +1113,9 @@ export class Engine {
    * Fold a parsed `.xcresult`. The bundle is ground truth (rank: verified):
    * it attaches to the overlapping run, or the run that already claims the
    * bundle path, and sets the final verdict, findings, and per-test rows.
+   *
+   * `hostId` is the machine the bundle was read on (null: this one); only
+   * that machine's runs can have written it.
    */
   foldBundle(
     bundlePath: string,
@@ -710,6 +1136,9 @@ export class Engine {
       target: string | null;
     }[],
     now: number,
+    hostId: string | null = null,
+    /** Where an unclaimed bundle was found; only that checkout's runs may take it. */
+    owner: ArtifactOwner | null = null,
   ): boolean {
     if (!build && !tests) return false;
     const anchor =
@@ -718,12 +1147,17 @@ export class Engine {
 
     // Prefer the run that already recorded this bundle path (wrapper/`bb
     // xcode run` case), else window-match.
-    const byPath = this.store.getRunByBundlePath(bundlePath);
+    const byPath = this.store.getRunByBundlePath(bundlePath, hostId);
     const target =
       byPath ??
       this.store
-        .findVerdictCandidates(anchor, MATCH_SLACK_MS)
-        .filter((run) => run.kind !== "index")[0] ??
+        .findVerdictCandidates(anchor, MATCH_SLACK_MS, hostId)
+        // A tracked build on another Mac is folded only from its own bundle,
+        // by path; a bundle Xcode left nearby must not take it over.
+        .filter(
+          (run) =>
+            run.kind !== "index" && !isHostBuildRun(run) && (owner === null || ownedBy(run, owner)),
+        )[0] ??
       null;
     if (!target) return false;
 
@@ -821,6 +1255,10 @@ export class Engine {
     // Only a failure is allowed to speak early.
     if (target.status === "running" && verdict !== "failed") {
       verdict = null;
+      // Its outcome is not applied yet, so this bundle is not done with: the
+      // run now claims it, which keeps every sweep off it while the run is
+      // live, and the first sweep after it ends reads it again and settles it.
+      this.store.clearSeen(key);
     }
 
     if (
@@ -832,18 +1270,82 @@ export class Engine {
           { status: verdict, rank: RANK.verified },
         ))
     ) {
+      target.endedAt = settledEnd(target, tests?.endedAt ?? build?.endedAt ?? null, now);
       target.status = verdict;
       target.statusRank = RANK.verified;
-      target.endedAt ??= tests?.endedAt ?? build?.endedAt ?? now;
-      for (const [pid, live] of this.live) {
-        if (live.runId === target.id) this.live.delete(pid);
-      }
+      this.dropLive(target.id);
     }
 
     this.store.updateRun(target);
     this.hooks.log(`verdict from bundle: ${target.status} (${target.id})`);
     return true;
   }
+}
+
+/**
+ * Where an artifact (a log entry, a test bundle) came from: the DerivedData
+ * root it was found in, and the workspace that root belongs to.
+ */
+export interface ArtifactOwner {
+  root: string | null;
+  workspace: string | null;
+}
+
+/**
+ * Could this run have written an artifact from that owner?
+ *
+ * Time overlap alone is not enough once two checkouts on one Mac build at
+ * once — two worktrees of one repo routinely share a scheme too. A known root
+ * decides; otherwise the workspace, against the run's container or the
+ * directory it built in. Only when the artifact names no workspace is it left
+ * to time, as it always was; when it does and the run cannot be shown to own
+ * it, the artifact stays unmatched.
+ */
+export function ownedBy(
+  run: Pick<Run, "root" | "container" | "cwd">,
+  owner: ArtifactOwner,
+): boolean {
+  if (run.root !== null && owner.root !== null) return run.root === owner.root;
+  const workspace = owner.workspace;
+  if (workspace === null) return true;
+  const container =
+    run.container !== null && !isAbsolute(run.container) && run.cwd !== null
+      ? resolve(run.cwd, run.container)
+      : run.container;
+  if (container !== null && isAbsolute(container)) return container === workspace;
+  // No workspace named: xcodebuild builds the one in its working directory,
+  // so that directory must be the workspace's own. Ancestry proves nothing —
+  // a worktree nested in a checkout (`/w/App/.worktrees/feature`) is another
+  // checkout — and a run that says nothing about where it built cannot claim
+  // an artifact that does. A Swift package is its own workspace: Xcode names
+  // the package directory itself.
+  if (run.cwd !== null && isAbsolute(run.cwd)) {
+    const dir = resolve(run.cwd);
+    return dir === dirname(workspace) || dir === workspace;
+  }
+  return false;
+}
+
+/**
+ * A run's end once an outcome is stated: the end it has, unless that was
+ * only inferred — the last snapshot it was seen in, before a stretch it could
+ * not be seen through — and the evidence says it went on later.
+ */
+function settledEnd(
+  run: Pick<Run, "endedAt" | "statusRank">,
+  stated: number | null,
+  now: number,
+): number {
+  if (run.endedAt === null) return stated ?? now;
+  if (run.statusRank === RANK.observed && stated !== null && stated > run.endedAt) {
+    return Math.min(stated, now);
+  }
+  return run.endedAt;
+}
+
+/** Is this the command line of Xcode.app's resident build service? */
+function isBuildServiceCommand(cmdline: string | null): boolean {
+  return cmdline !== null && /\/(?:SWB|XCB)BuildService(?:\s|$)/.test(cmdline);
 }
 
 /** Which log domain may speak about which run kind. */

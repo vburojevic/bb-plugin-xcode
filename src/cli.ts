@@ -10,10 +10,10 @@ import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@get-bb/plugin-sdk";
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import { confinedBuildCwd, validateBuildArguments } from "./build-security";
 import type { Collector } from "./collector";
 import { destinationLabel } from "./destination";
 import { formatDuration } from "./duration";
+import type { BuildLauncher } from "./launcher";
 import { durationMs, type Run } from "./model";
 import { describeRun, type PresentOptions } from "./present";
 import {
@@ -23,15 +23,10 @@ import {
   shimPaths,
   uninstallShim,
 } from "./shim";
-import type { Store } from "./store";
+import { isHostBuildRun, type Store } from "./store";
 import type { BuildPhase } from "./types";
 import { pathIsUnder, runMatchesScope, type ThreadScope } from "./scopes";
-import {
-  resolveBuildArgv,
-  startWrappedBuild,
-  waitForVerdict,
-  type WrappedDeps,
-} from "./wrapped";
+import { resolveBuildArgv, waitForVerdict } from "./wrapped";
 
 export interface CliResult {
   exitCode: number;
@@ -56,9 +51,10 @@ export interface CliDeps {
   refreshProjectNames(): void;
   /** Resolve the invoking thread's checkout before host-side execution. */
   scopeFor(threadId: string): Promise<ThreadScope | null>;
-  /** Refusal sentence when the checkout is on another machine, else null. */
-  checkoutElsewhere(scope: ThreadScope): Promise<string | null>;
-  wrapped: WrappedDeps;
+  /** Starts tracked builds on whichever Mac holds the thread's checkout. */
+  launcher: BuildLauncher;
+  /** Display name of an enrolled Mac, when known. */
+  machineName(hostId: string): string | null;
   onShimStateKnown(installed: boolean): void;
   confirmHostAction(
     threadId: string,
@@ -114,6 +110,7 @@ export function createCli(deps: CliDeps) {
   const present: PresentOptions = {
     projectName: (id: string) => deps.projectName(id),
     phaseFor: (run: Run) => deps.phaseFor(run),
+    machineName: (hostId: string) => deps.machineName(hostId),
   };
 
   /** `undefined` is reserved for direct, internal calls such as showRun. */
@@ -165,6 +162,9 @@ export function createCli(deps: CliDeps) {
       `project      ${run.projectId ? (deps.projectName(run.projectId) ?? run.projectId) : "—"}`,
       `destination  ${destinationLabel(run.destination, deps.collector.getSimulators()) ?? "—"}`,
       `branch       ${run.branch ?? "—"}${run.worktree ? ` (${run.worktree})` : ""}`,
+      ...(run.hostId !== null
+        ? [`machine      ${deps.machineName(run.hostId) ?? run.hostId}`]
+        : []),
       `root         ${run.root ?? "—"}`,
       `started      ${new Date(run.startedAt).toISOString()}`,
       `duration     ${formatDuration(durationMs(run))}`,
@@ -233,6 +233,8 @@ export function createCli(deps: CliDeps) {
 
     let root: string;
     let workingDir: string;
+    let scope: ThreadScope;
+    let target: Awaited<ReturnType<BuildLauncher["targetFor"]>>;
     try {
       if (ctx.threadId === undefined) {
         return {
@@ -241,26 +243,31 @@ export function createCli(deps: CliDeps) {
             "Tracked builds require a bb thread so the checkout security boundary can be enforced.\n",
         };
       }
-      const scope = await scopeForInvocation(ctx);
-      if (scope === null) {
+      const resolved = await scopeForInvocation(ctx);
+      if (resolved === null) {
         return {
           exitCode: 1,
           stderr: "The invoking checkout does not match this thread, so xcodebuild was not started.\n",
         };
       }
-      // Before any node:fs work: this thread's checkout may live on another
-      // enrolled Mac, where every path below resolves to nothing.
-      const elsewhere = await deps.checkoutElsewhere(scope);
-      if (elsewhere !== null) return { exitCode: 1, stderr: `${elsewhere}\n` };
+      scope = resolved;
+      // The thread's environment decides the machine: a checkout on another
+      // enrolled Mac is validated and built there, by its host worker.
+      target = await deps.launcher.targetFor(scope);
       root = scope.path;
-      workingDir = await confinedBuildCwd(root, ctx.cwd);
-      await validateBuildArguments(argv, root, workingDir);
+      workingDir = await deps.launcher.prepare(target, {
+        argv,
+        root,
+        ...(ctx.cwd !== undefined ? { cwd: ctx.cwd } : {}),
+      });
+      const machine = target.machineName;
       const approved = await deps.confirmHostAction(ctx.threadId, {
-        title: "Run xcodebuild on the host?",
+        title: machine ? `Run xcodebuild on ${machine}?` : "Run xcodebuild on the host?",
         facts: [
+          ...(machine ? [`Machine: ${machine}`] : []),
           `Checkout: ${root}`,
           `Command: ${argv.join(" ").slice(0, 500)}`,
-          "Xcode projects can run build phases, package plugins, compiler plugins, and tests as your host user.",
+          `Xcode projects can run build phases, package plugins, compiler plugins, and tests as your user on ${machine ?? "the host"}.`,
         ],
         confirmLabel: "Run xcodebuild",
       });
@@ -273,21 +280,32 @@ export function createCli(deps: CliDeps) {
     } catch (error) {
       return { exitCode: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
     }
-    const started = await startWrappedBuild(deps.wrapped, {
-      argv,
-      cwd: workingDir,
-    });
-    if (!started) return { exitCode: 1, stderr: "Failed to start the build.\n" };
+    const started = await deps.launcher.start(
+      target,
+      { argv, root, workingDir, ...(ctx.cwd !== undefined ? { cwd: ctx.cwd } : {}) },
+      scope,
+    );
+    if (typeof started === "string") return { exitCode: 1, stderr: `${started}\n` };
 
     if (!wait) {
-      const lines = [
-        "Build started; the background probe will assign its run id.",
-        "It keeps running if this command disconnects.",
-        "Watch it with: bb xcode status (then stop it with: bb xcode stop <run-id>).",
-        "It also appears in the live row above the composer.",
-        "",
-        `result bundle: ${started.bundlePath}`,
-      ];
+      const lines =
+        target.kind === "remote"
+          ? [
+              `Build started on ${target.machineName} as ${started.runId}.`,
+              "It keeps running if this command disconnects.",
+              `Wait for it with: bb xcode wait ${started.runId} (stop it with: bb xcode stop ${started.runId}).`,
+              "It also appears in the live row above the composer.",
+              "",
+              `result bundle (on ${target.machineName}): ${started.bundlePath}`,
+            ]
+          : [
+              "Build started; the background probe will assign its run id.",
+              "It keeps running if this command disconnects.",
+              "Watch it with: bb xcode status (then stop it with: bb xcode stop <run-id>).",
+              "It also appears in the live row above the composer.",
+              "",
+              `result bundle: ${started.bundlePath}`,
+            ];
       return { exitCode: 0, stdout: capOutput(`${lines.join("\n")}\n`) };
     }
 
@@ -300,7 +318,9 @@ export function createCli(deps: CliDeps) {
     ]);
     const settled = await waitForVerdict(
       deps.store,
-      { bundlePath: started.bundlePath },
+      // A build on another Mac is found by its run id: its bundle path names
+      // a file on that Mac, and the same path could exist here.
+      started.runId !== null ? { runId: started.runId } : { bundlePath: started.bundlePath },
       {
         timeoutMs: 20_000,
         ...(ctx.signal ? { signal: ctx.signal } : {}),
@@ -370,6 +390,16 @@ export function createCli(deps: CliDeps) {
     if (target.status !== "running" || target.pid === null) {
       return { exitCode: 1, stderr: `Run ${id} is not running.\n` };
     }
+    if (target.hostId !== null) {
+      if (isHostBuildRun(target)) return stopRemote(target, ctx);
+      // Watched, not run: this plugin started nothing there to stop, and it
+      // will not signal a process on another Mac it did not start.
+      const machine = deps.machineName(target.hostId) ?? target.hostId;
+      return {
+        exitCode: 1,
+        stderr: `Run ${id} is a build this plugin only watches on ${machine}; stop it there (Xcode's Stop button, or Ctrl-C in its terminal).\n`,
+      };
+    }
     /**
      * Only signal a pid the probe can still see.
      *
@@ -412,6 +442,39 @@ export function createCli(deps: CliDeps) {
       return { exitCode: 1, stderr: `Process ${target.pid} is already gone.\n` };
     }
     return { exitCode: 0, stdout: `Sent SIGTERM to ${target.pid} (${id}).\n` };
+  }
+
+  /**
+   * Stop a build on another Mac. Its worker proves the pid is still that
+   * build (start time + marker) before it signals anything, which is the
+   * remote equivalent of the live-snapshot check above.
+   */
+  async function stopRemote(target: Run, ctx: CliContext): Promise<CliResult> {
+    if (ctx.threadId === undefined) {
+      return {
+        exitCode: 1,
+        stderr:
+          "Stopping a host build requires a bb thread so a person can confirm it.\n",
+      };
+    }
+    const machine = deps.machineName(target.hostId!) ?? target.hostId!;
+    const approved = await deps.confirmHostAction(ctx.threadId, {
+      title: `Stop this Xcode build on ${machine}?`,
+      facts: [
+        `Run: ${target.id}`,
+        `Machine: ${machine}`,
+        `Process: ${target.pid}`,
+        `Checkout: ${target.cwd ?? target.container ?? target.root ?? "unknown"}`,
+      ],
+      confirmLabel: "Stop build",
+    });
+    if (!approved) {
+      return { exitCode: 1, stderr: `Stopping ${target.id} was not confirmed.\n` };
+    }
+    const result = await deps.launcher.stopRemote(target);
+    return result.stopped
+      ? { exitCode: 0, stdout: `${result.message}\n` }
+      : { exitCode: 1, stderr: `${result.message}\n` };
   }
 
   async function shim(action: string): Promise<CliResult> {

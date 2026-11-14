@@ -1,40 +1,41 @@
 /**
  * The collector: turns the outside world into engine observations.
  *
- * Owns all I/O — `ps` snapshots, manifest reads, `xcresulttool` invocations,
- * root discovery — and hands plain data to the engine. The engine owns all
- * state; the collector owns none beyond caches.
+ * Decides what to read — `ps` snapshots, manifests, result bundles, root
+ * discovery — and hands plain data to the engine; a `MachineIO`
+ * (`src/machine.ts`) does the reading. The engine owns all state; the
+ * collector owns none beyond caches.
+ *
+ * One collector watches one machine. The machine running bb has one for the
+ * life of the plugin, reading its own disk through `LocalMachine`; another
+ * Mac a thread works on gets one too while it is watched, reading through
+ * that Mac's host worker (`src/remote-watch.ts`). Every run, root and
+ * artifact a collector records carries its machine, so two Macs never read
+ * as one.
  */
 
-import { stat } from "node:fs/promises";
-import { join } from "node:path";
-
-import { readTextFileBounded } from "./bounded-file";
-import { Engine } from "./engine";
-import {
-  discoverDefaultRoots,
-  discoverProjectRoots,
-  findTestResultBundles,
-  looksLikeDerivedRoot,
-} from "./discovery";
-import { findDeveloperTool, processCwd, psSnapshot, run as execTool, xcresultJson } from "./exec";
-import { gitInfoFor } from "./git";
+import { Engine, type ArtifactOwner } from "./engine";
 import { parseSimctlList, type SimulatorRef } from "./destination";
-import { LOG_DOMAINS, parseManifest, schemeFromTitle } from "./manifest";
-import { findRootActivities, parsePsOutput } from "./proc";
-import { listShimBundles } from "./shim";
-import type { Store } from "./store";
-import type { LiveActivity } from "./types";
+import { findDeveloperTool, run as execTool } from "./exec";
 import {
-  parseBuildResults,
-  parseTestNodes,
-  parseTestSummary,
-} from "./xcresult";
+  LocalMachine,
+  MAX_LOG_MANIFEST_BYTES as MAX_MANIFEST_BYTES,
+  type MachineIO,
+} from "./machine";
+import { schemeFromTitle } from "./manifest";
+import { ProcessObserver } from "./observe";
+import { bundleScannedKey, type Store } from "./store";
+import type { LiveActivity } from "./types";
 
 export interface CollectorProject {
   id: string;
   name: string;
   path: string;
+  /**
+   * The Mac this source path is on; null for the machine running bb (or when
+   * that cannot be told, which is how every source was read before).
+   */
+  hostId?: string | null;
 }
 
 export interface CollectorDeps {
@@ -48,6 +49,12 @@ export interface CollectorDeps {
    * machine with no Xcode — which is also what keeps the suite runnable in CI.
    */
   findTool?(name: string): Promise<string | null>;
+  /** The Mac this collector watches; null (the default) for this one. */
+  hostId?: string | null;
+  /** How that Mac is read. Defaults to this machine's own disk. */
+  io?: MachineIO;
+  /** Extra checkouts to scan for DerivedData on that Mac (thread scopes). */
+  scanPaths?(): readonly string[];
 }
 
 /**
@@ -76,7 +83,7 @@ const PROJECT_LIST_TIMEOUT_MS = 10_000;
 const PROJECT_LIST_BREAKER_AFTER = 3;
 const PROJECT_LIST_COOLDOWN_MS = 5 * 60_000;
 /** Xcode's plist is normally KB; this prevents a corrupt root from exhausting the server. */
-export const MAX_LOG_MANIFEST_BYTES = 32 * 1024 * 1024;
+export const MAX_LOG_MANIFEST_BYTES = MAX_MANIFEST_BYTES;
 
 export interface CollectorSettings {
   scanProjects: boolean;
@@ -104,9 +111,17 @@ export function describeError(error: unknown): string {
 
 export class Collector {
   private projects: CollectorProject[] = [];
-  private readonly cwdCache = new Map<number, string | null>();
-  /** Git context per source directory; a checkout's branch rarely changes mid-build. */
-  private readonly gitCache = new Map<string, { branch: string | null; worktree: string | null }>();
+  /** The Mac this collector watches; null for this one. */
+  readonly hostId: string | null;
+  private readonly io: MachineIO;
+  /**
+   * Per root, the manifest modification time last read in full — every entry
+   * either folded or never foldable. A Mac whose host worker can tell is then
+   * not asked to resend a manifest that has not changed.
+   */
+  private readonly manifestsReadAt = new Map<string, number>();
+  /** Each root's workspace, as its manifests' reader reported it. */
+  private readonly rootWorkspaces = new Map<string, string | null>();
   private simulators: SimulatorRef[] = [];
   private lastSimRefreshAt = 0;
   private xcresultTool: string | null | undefined;
@@ -126,7 +141,16 @@ export class Collector {
   constructor(
     private readonly deps: CollectorDeps,
     private settings: CollectorSettings,
-  ) {}
+  ) {
+    this.hostId = deps.hostId ?? null;
+    this.io =
+      deps.io ??
+      new LocalMachine({
+        dataDir: deps.dataDir,
+        resolveTool: () => this.resolveTool(),
+        observer: new ProcessObserver(),
+      });
+  }
 
   updateSettings(settings: CollectorSettings): void {
     this.settings = settings;
@@ -173,46 +197,34 @@ export class Collector {
     }
   }
 
-  /** Branch/worktree for a build, from its cwd or container directory. */
-  private async gitContextFor(
-    activity: LiveActivity,
-  ): Promise<{ branch: string | null; worktree: string | null }> {
-    const containerDir = activity.container
-      ? activity.container.replace(/\/[^/]+$/, "")
-      : null;
-    const dir = activity.cwd ?? containerDir;
-    if (!dir || !dir.startsWith("/")) return { branch: null, worktree: null };
-
-    const cached = this.gitCache.get(dir);
-    if (cached) return cached;
-
-    const info = await gitInfoFor(dir);
-    const context = info
-      ? { branch: info.branch, worktree: info.worktree }
-      : { branch: null, worktree: null };
-    this.gitCache.set(dir, context);
-    // The cache is per-directory and directories recur; cap its growth.
-    if (this.gitCache.size > 500) this.gitCache.clear();
-    return context;
-  }
-
-  /** Most-specific project whose worktree contains any of the given paths. */
-  projectFor(signals: {
-    root?: string | null;
-    cwd?: string | null;
-    container?: string | null;
-  }): string | null {
+  /**
+   * Most-specific project whose worktree contains any of the given paths, on
+   * the machine the paths are on (null: this one).
+   */
+  projectFor(
+    signals: {
+      root?: string | null;
+      cwd?: string | null;
+      container?: string | null;
+    },
+    hostId: string | null = this.hostId,
+  ): string | null {
     for (const path of [signals.root, signals.container, signals.cwd]) {
-      const match = this.matchProject(path ?? null);
+      const match = this.matchProject(path ?? null, hostId);
       if (match) return match;
     }
     return null;
   }
 
-  private matchProject(path: string | null): string | null {
+  /** This collector's Mac's project sources. */
+  private projectsHere(hostId: string | null = this.hostId): CollectorProject[] {
+    return this.projects.filter((project) => (project.hostId ?? null) === hostId);
+  }
+
+  private matchProject(path: string | null, hostId: string | null = this.hostId): string | null {
     if (!path) return null;
     let best: { id: string; length: number } | null = null;
-    for (const project of this.projects) {
+    for (const project of this.projectsHere(hostId)) {
       const base = project.path.endsWith("/")
         ? project.path.slice(0, -1)
         : project.path;
@@ -267,46 +279,34 @@ export class Collector {
    * the composer silently stops rendering.
    */
   async probeTick(now = Date.now(), signal?: AbortSignal): Promise<boolean> {
-    const stdout = await psSnapshot();
-    if (!stdout.trim()) return false;
+    const activities = await this.io.snapshot(now, signal);
+    if (activities === null || signal?.aborted) return false;
 
-    const activities = findRootActivities(parsePsOutput(stdout, now));
-
-    // Attach cwd (cached per pid) and harvest DerivedData roots.
+    // Harvest DerivedData roots.
     for (const activity of activities) {
-      if (signal?.aborted) return false;
-      let cwd = this.cwdCache.get(activity.pid);
-      if (cwd === undefined) {
-        cwd = await processCwd(activity.pid);
-        this.cwdCache.set(activity.pid, cwd);
-      }
-      activity.cwd = cwd;
-      const git = await this.gitContextFor(activity);
-      activity.branch = git.branch;
-      activity.worktree = git.worktree;
       for (const root of activity.roots) {
         // Once a minute per root, not every 2s tick — the unconditional
         // upsert was a write transaction per tick and the main WAL churner.
         const lastUpsert = this.rootUpsertAt.get(root) ?? 0;
         if (now - lastUpsert < 60_000) continue;
         this.rootUpsertAt.set(root, now);
-        this.deps.store.upsertRoot(root, this.matchProject(root), "process", now);
-      }
-    }
-    for (const pid of [...this.cwdCache.keys()]) {
-      if (!activities.some((activity) => activity.pid === pid)) {
-        this.cwdCache.delete(pid);
+        this.deps.store.upsertRoot(root, this.matchProject(root), "process", now, this.hostId);
       }
     }
 
     this.lastActivities = activities;
     this.lastScanAt = now;
     if (signal?.aborted) return false;
-    await this.refreshSimulators(now, activities.length > 0).catch(
-      () => undefined,
-    );
+    // The simulator list is this machine's; another Mac's builds are named by
+    // their destination string alone.
+    if (this.hostId === null) {
+      await this.refreshSimulators(now, activities.length > 0).catch(
+        () => undefined,
+      );
+    }
 
-    let changed = this.deps.engine.foldSnapshot(activities, now);
+    this.deps.engine.notePresence(this.hostId, this.io.services?.() ?? null);
+    let changed = this.deps.engine.foldSnapshot(activities, now, this.hostId);
     if (this.deps.engine.expireFinishing(now)) changed = true;
     return changed;
   }
@@ -350,26 +350,28 @@ export class Collector {
   }
 
   async discoverRoots(now = Date.now()): Promise<number> {
+    const projects = this.settings.scanProjects ? this.projectsHere() : [];
+    const projectPaths = [
+      ...new Set([
+        ...projects.map((project) => project.path),
+        ...(this.settings.scanProjects ? (this.deps.scanPaths?.() ?? []) : []),
+      ]),
+    ];
+    const found = await this.io.discoverRoots({
+      projectPaths,
+      // Typed paths name this machine's disk; another Mac is not asked to
+      // look for them.
+      extraRoots: this.hostId === null ? this.settings.extraRoots : [],
+    });
     let discovered = 0;
-    for (const root of await discoverDefaultRoots()) {
-      if (this.deps.store.upsertRoot(root, this.matchProject(root), "default", now)) {
+    for (const root of found) {
+      const projectId =
+        root.via === "project-scan"
+          ? (projects.find((project) => project.path === root.projectPath)?.id ??
+            this.matchProject(root.path))
+          : this.matchProject(root.path);
+      if (this.deps.store.upsertRoot(root.path, projectId, root.via, now, this.hostId)) {
         discovered += 1;
-      }
-    }
-    for (const root of this.settings.extraRoots) {
-      if (!root.startsWith("/")) continue;
-      if (!(await looksLikeDerivedRoot(root))) continue;
-      if (this.deps.store.upsertRoot(root, this.matchProject(root), "manual", now)) {
-        discovered += 1;
-      }
-    }
-    if (this.settings.scanProjects) {
-      for (const project of this.projects) {
-        for (const root of await discoverProjectRoots(project.path)) {
-          if (this.deps.store.upsertRoot(root, project.id, "project-scan", now)) {
-            discovered += 1;
-          }
-        }
       }
     }
     return discovered;
@@ -383,24 +385,22 @@ export class Collector {
     signal?: AbortSignal,
   ): Promise<boolean> {
     let changed = false;
-    for (const { path: root } of this.deps.store.listRoots()) {
+    const roots = this.deps.store.listRoots(this.hostId).map(({ path }) => ({
+      path,
+      ifModifiedSince: this.manifestsReadAt.get(path) ?? null,
+    }));
+    if (roots.length === 0) return false;
+    for (const read of await this.io.readManifests(roots, signal)) {
       if (signal?.aborted) return changed;
-      for (const domain of LOG_DOMAINS) {
-        const manifestPath = join(
-          root,
-          "Logs",
-          domain.dir,
-          "LogStoreManifest.plist",
-        );
-        let xml: string;
-        try {
-          xml = await readTextFileBounded(manifestPath, MAX_LOG_MANIFEST_BYTES);
-        } catch {
-          continue;
-        }
-        for (const entry of parseManifest(xml)) {
+      if (this.rootWorkspaces.size > 1000) this.rootWorkspaces.clear();
+      this.rootWorkspaces.set(read.root, read.workspace);
+      let consumed = true;
+      let readAt: number | null = null;
+      for (const domain of read.domains) {
+        readAt = Math.max(readAt ?? 0, domain.mtimeMs ?? 0) || null;
+        for (const entry of domain.entries) {
           const folded = this.deps.engine.foldManifestEntry(
-            root,
+            read.root,
             domain.kind,
             {
               uniqueIdentifier: entry.uniqueIdentifier,
@@ -415,10 +415,23 @@ export class Collector {
               testFailureCount: entry.testFailureCount,
             },
             now,
+            { hostId: this.hostId, container: read.workspace },
           );
           if (folded) changed = true;
+          // An entry the engine declined (its run is still running) has to be
+          // read again, so this manifest is not done with yet.
+          if (
+            entry.startedAt !== null &&
+            !this.deps.store.hasSeen(`manifest:${entry.uniqueIdentifier}`)
+          ) {
+            consumed = false;
+          }
         }
       }
+      // An unchanged manifest comes back with no domains: still done with.
+      if (read.domains.length === 0) continue;
+      if (consumed && readAt !== null) this.manifestsReadAt.set(read.root, readAt);
+      else this.manifestsReadAt.delete(read.root);
     }
     return changed;
   }
@@ -431,23 +444,30 @@ export class Collector {
    * logs.
    */
   async sweepBundles(now = Date.now(), signal?: AbortSignal): Promise<boolean> {
-    const candidates = new Set<string>(await listShimBundles(this.deps.dataDir));
+    const store = this.deps.store;
+    const host = this.hostId;
     // Answered in SQL rather than by scanning the newest 100 runs: `detailed`
     // means "we already extracted its contents", which is not the same
     // question as "has this bundle been scanned". The seen key is the
     // authority on the latter, and keeping them separate is what lets a
     // deliberate re-queue actually re-read.
-    for (const path of this.deps.store.listUnscannedBundlePaths()) {
-      candidates.add(path);
-    }
-    for (const { path: root } of this.deps.store.listRoots()) {
-      for (const bundle of await findTestResultBundles(root)) {
-        candidates.add(bundle);
-      }
-    }
+    const roots = store.listRoots(host).map(({ path }) => path);
+    const { candidates, finalized: finalizedSet } = await this.io.listBundles(
+      roots,
+      store.listUnscannedBundlePaths(500, host),
+    );
+    // A bundle Xcode left in a root's Test logs belongs to that root's checkout.
+    const rootByTestLogs = new Map(roots.map((root) => [`${root}/Logs/Test`, root]));
+    const ownerOf = (bundle: string): ArtifactOwner | null => {
+      const root = rootByTestLogs.get(bundle.slice(0, bundle.lastIndexOf("/")));
+      return root === undefined
+        ? null
+        : { root, workspace: this.rootWorkspaces.get(root) ?? null };
+    };
 
     /**
-     * `xcresulttool`, resolved only once a bundle actually needs parsing.
+     * Whether `xcresulttool` can be had here, learned from the first bundle
+     * that actually needs parsing.
      *
      * The tool used to gate this whole method, which meant a machine without
      * Xcode selected also lost the abandoned-bundle rescue below — a check
@@ -455,7 +475,7 @@ export class Collector {
      * killed build stayed at the verdict-less `ended` for want of a parser it
      * was never going to call.
      */
-    let tool: string | null | undefined;
+    let parserUnavailable = false;
 
     let changed = false;
     for (const bundle of candidates) {
@@ -468,20 +488,33 @@ export class Collector {
       // build is still writing, blacklisting the real bundle before it lands.
       // Looked up by indexed path, so a long build cannot age out of the
       // window and lose this protection precisely when it matters most.
-      const claimer = this.deps.store.getRunByBundlePath(bundle);
+      const claimer = store.getRunByBundlePath(bundle, host);
       if (claimer && claimer.status === "running") continue;
 
       // Root Info.plist only exists once xcodebuild finalizes the bundle
       // (verified on disk: an in-progress or killed bundle has only Data/).
-      const finalized = await stat(join(bundle, "Info.plist"))
-        .then((info) => info.isFile())
-        .catch(() => false);
+      let finalized = finalizedSet.has(bundle);
+      // The listing may be minutes old by now (each bundle parse can take a
+      // minute). Before calling a build killed, look again.
+      if (!finalized && claimer) {
+        finalized = (await this.io.listBundles([], [bundle])).finalized.has(bundle);
+      }
 
       // Process gone, bundle never finalized: xcodebuild finalizes on every
       // normal exit including failures, so after a grace period this build
       // was killed or crashed — resolve it to "cancelled" instead of letting
       // it expire into the verdict-less "ended".
       if (!finalized && claimer) {
+        // Xcode.app's service outlives every action it serves, and a run of
+        // it leaves `running` whenever its build cannot be seen — a stretch
+        // with no children it cannot be credited for. While that service is
+        // still alive, an unfinished bundle is an action still going, not
+        // one that was killed: it settles from the bundle when Xcode
+        // finalizes it, or ends verdict-less, never "cancelled" on a guess.
+        if (this.deps.engine.producerAlive(claimer)) {
+          if (claimer.status !== "running") this.deps.engine.noteAwaitingBundle(claimer.id, now);
+          continue;
+        }
         if (claimer.status === "finishing" || claimer.status === "ended") {
           const since = claimer.endedAt ?? claimer.startedAt;
           if (now - since > 20_000) {
@@ -493,8 +526,9 @@ export class Collector {
         continue; // never parse an unfinalized bundle
       }
 
+      const scannedKey = bundleScannedKey(host, bundle);
       // Cheap idempotence pre-check; the engine re-checks per matched run.
-      if (this.deps.store.hasSeen(`bundle-scanned:${bundle}`)) {
+      if (store.hasSeen(scannedKey)) {
         // Poisoned marker: the claimer never got a verified verdict, yet the
         // bundle is marked scanned (pre-fix data, or a race). One retry per
         // load — the attempts bound below re-fences genuinely corrupt ones.
@@ -505,62 +539,53 @@ export class Collector {
           !this.reparsedBundles.has(bundle);
         if (!poisoned) continue;
         this.reparsedBundles.add(bundle);
-        this.deps.store.clearSeen(`bundle-scanned:${bundle}`);
+        store.clearSeen(scannedKey);
       }
 
-      // First bundle that genuinely needs reading pays for the lookup.
-      tool ??= await this.resolveTool();
-      if (!tool) continue;
+      // Never parse a bundle that is not finalized; with no claimer there is
+      // nothing to rescue either, so a later sweep looks again.
+      if (!finalized) continue;
+      if (parserUnavailable) continue;
 
-      const build = parseBuildResults(
-        await xcresultJson(tool, ["get", "build-results", "--path", bundle]),
-      );
-      const summary = parseTestSummary(
-        await xcresultJson(tool, [
-          "get",
-          "test-results",
-          "summary",
-          "--path",
-          bundle,
-        ]),
-      );
+      const parsed = await this.io.parseBundle(bundle);
+      if (parsed.status === "unavailable") {
+        parserUnavailable = true;
+        continue;
+      }
+      if (parsed.status === "refused") {
+        this.deps.log.debug(`not reading ${bundle}: ${parsed.reason}`);
+        store.markSeen(scannedKey, now);
+        continue;
+      }
       // A bundle still being written parses as nothing — leave it unseen so a
       // later sweep retries. Bounded: a CORRUPT bundle also parses as
       // nothing, and unbounded retries meant two 60s-class xcresulttool
       // spawns every 4s forever — chronic event-loop starvation.
-      if (!build && !summary) {
+      if (parsed.status === "empty") {
         const attempts = (this.bundleAttempts.get(bundle) ?? 0) + 1;
         this.bundleAttempts.set(bundle, attempts);
         if (attempts >= 5) {
-          this.deps.store.markSeen(`bundle-scanned:${bundle}`, now);
+          store.markSeen(scannedKey, now);
           this.bundleAttempts.delete(bundle);
         }
         continue;
       }
       this.bundleAttempts.delete(bundle);
 
-      const testCases =
-        summary && summary.total > 0
-          ? parseTestNodes(
-              await xcresultJson(tool, [
-                "get",
-                "test-results",
-                "tests",
-                "--path",
-                bundle,
-              ]),
-            )
-          : [];
-
       const folded = this.deps.engine.foldBundle(
         bundle,
-        build,
-        summary ? { ...summary, tests: [] } : null,
-        testCases,
+        parsed.build,
+        parsed.summary ? { ...parsed.summary, tests: [] } : null,
+        parsed.tests,
         now,
+        host,
+        ownerOf(bundle),
       );
-      this.deps.store.markSeen(`bundle-scanned:${bundle}`, now);
       if (folded) changed = true;
+      // Matched to a run that is still running: its verdict waits for the
+      // run to end, and so does marking the bundle read (see `foldBundle`).
+      if (store.getRunByBundlePath(bundle, host)?.status === "running") continue;
+      store.markSeen(scannedKey, now);
     }
     return changed;
   }

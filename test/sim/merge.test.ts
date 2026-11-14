@@ -7,7 +7,7 @@
  * cheap to assert and expensive to rediscover.
  */
 import { describe, expect, it } from "vitest";
-import { MIGRATIONS } from "../../src/store.js";
+import { MIGRATIONS, V3_MIGRATIONS_START, V4_MIGRATIONS_START } from "../../src/store.js";
 import { MIGRATIONS as SIMULATOR_MIGRATIONS } from "../../src/sim/store.js";
 import { SETTINGS_DESCRIPTORS as SIMULATOR_SETTINGS } from "../../src/sim/settings.js";
 import { CLI_COMMANDS } from "../../src/cli.js";
@@ -20,12 +20,24 @@ const CLI_NAME = /^[a-z0-9-]+$/;
 const RPC_NAME = /^[a-zA-Z0-9_-]+$/;
 
 describe("the two halves share one plugin", () => {
-  it("appends the simulator migrations rather than interleaving them", () => {
-    // `bb.storage.migrate` applies by index, so the simulator statements must
-    // sit at the end and stay there. If this ever fails, an installed database
-    // is being re-indexed underneath itself.
-    const tail = MIGRATIONS.slice(MIGRATIONS.length - SIMULATOR_MIGRATIONS.length);
-    expect([...tail]).toEqual([...SIMULATOR_MIGRATIONS]);
+  it("keeps every migration at the index installed databases applied it at", () => {
+    // `bb.storage.migrate` applies by index. The simulator statements were
+    // appended at offset 30 when the halves merged, the tracker's v3
+    // (`run.host_id`) after them at 39, and v4 (roots keyed by machine) at
+    // 42. Every block is frozen where it is; anything new goes at the very
+    // end. If this ever fails, an installed database is being re-indexed
+    // underneath itself.
+    expect(MIGRATIONS.slice(30, 30 + SIMULATOR_MIGRATIONS.length)).toEqual([
+      ...SIMULATOR_MIGRATIONS,
+    ]);
+    expect(SIMULATOR_MIGRATIONS).toHaveLength(9);
+    expect(V3_MIGRATIONS_START).toBe(39);
+    expect(MIGRATIONS[39]).toBe("ALTER TABLE run ADD COLUMN host_id TEXT");
+    expect(MIGRATIONS[41]).toContain("CREATE TABLE IF NOT EXISTS remote_host");
+    expect(V4_MIGRATIONS_START).toBe(42);
+    expect(MIGRATIONS[42]).toContain("CREATE TABLE IF NOT EXISTS root_v4");
+    expect(MIGRATIONS[45]).toBe("ALTER TABLE root_v4 RENAME TO root");
+    expect(MIGRATIONS).toHaveLength(46);
   });
 
   it("keeps every migration to a single statement", () => {

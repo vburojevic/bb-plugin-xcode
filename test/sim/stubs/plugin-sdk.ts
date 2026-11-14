@@ -15,5 +15,26 @@ export function defineRpcContract<T>(contract: T): T {
   return contract;
 }
 
+/**
+ * The host's own `experimental_defineHostEntry`, reproduced: it only stamps
+ * the API version and copies the declared parts.
+ */
+export function experimental_defineHostEntry<T extends {
+  contract: unknown;
+  handlers: unknown;
+  experimental_signals?: unknown;
+  dispose?: unknown;
+}>(args: T): T & { experimental_apiVersion: 1 } {
+  return {
+    experimental_apiVersion: 1,
+    contract: args.contract,
+    handlers: args.handlers,
+    ...(args.experimental_signals === undefined
+      ? {}
+      : { experimental_signals: args.experimental_signals }),
+    ...(args.dispose === undefined ? {} : { dispose: args.dispose }),
+  } as T & { experimental_apiVersion: 1 };
+}
+
 export type BbPluginApi = unknown;
 export type JsonValue = unknown;

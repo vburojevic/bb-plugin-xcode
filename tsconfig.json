@@ -24,6 +24,7 @@
   },
   "include": [
     "server.ts",
+    "host.ts",
     "app.tsx",
     "vitest.config.ts",
     "types",

@@ -87,6 +87,7 @@ function run(overrides: Partial<Run> = {}): Run {
     branch: null,
     worktree: null,
     threadId: null,
+    hostId: null,
     ...overrides,
   };
 }

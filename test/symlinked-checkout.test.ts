@@ -17,6 +17,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createCli } from "../src/cli";
 import type { Collector } from "../src/collector";
+import { createLauncher } from "../src/launcher";
+import type { RemoteBuilds } from "../src/remote";
 import type { ThreadScope } from "../src/scopes";
 import { MIGRATIONS, Store, type Db } from "../src/store";
 import type { WrappedDeps } from "../src/wrapped";
@@ -48,8 +50,14 @@ function fixture(checkoutPath: string) {
     phaseFor: () => null,
     refreshProjectNames: () => undefined,
     scopeFor: async (threadId: string) => (threadId === scope.threadId ? scope : null),
-    checkoutElsewhere: async () => null,
-    wrapped: {} as WrappedDeps,
+    launcher: createLauncher({
+      wrapped: {} as WrappedDeps,
+      remote: {} as RemoteBuilds,
+      serverHostId: async () => null,
+      listHosts: async () => [],
+      log: { debug: () => undefined },
+    }),
+    machineName: () => null,
     onShimStateKnown: () => undefined,
     confirmHostAction,
   });

@@ -161,13 +161,97 @@ export const MIGRATIONS: readonly string[] = [
    */
   `CREATE INDEX IF NOT EXISTS run_bundle_idx ON run (bundle_path) WHERE bundle_path IS NOT NULL`,
 
-  // ---- Simulators (frozen from here down) ---------------------------------
+  // ---- Simulators (frozen) ------------------------------------------------
   // Spliced in, never interleaved. `bb.storage.migrate` applies statements by
   // index across the whole plugin, so the Simulators half cannot own its own
-  // array — its statements live in `src/sim/store.ts` for readability and are
-  // appended here, after everything above, permanently.
+  // array — its statements live in `src/sim/store.ts` for readability and sit
+  // here, at this offset, permanently. That array is frozen too: a statement
+  // appended to it would land in front of the tracker's v3 below and re-index
+  // every installed database. New statements from either half go at the end
+  // of THIS array. `test/sim/merge.test.ts` holds both offsets.
   ...SIMULATOR_MIGRATIONS,
+
+  // ---- v3: tracked builds on other Macs ------------------------------------
+  /**
+   * The Mac a run's process lives on, when that is not the machine running
+   * bb. NULL means this machine, which is every run the probe, the log store
+   * or the shim ever produced: those sources only see the server's own disk
+   * and process table. Set only by `src/remote.ts`, for builds the host
+   * worker ran on the thread's own Mac — and it is what keeps the server's
+   * own sweeps, which would read a remote path as "missing on disk", away
+   * from them.
+   */
+  `ALTER TABLE run ADD COLUMN host_id TEXT`,
+  `CREATE INDEX IF NOT EXISTS run_host_idx ON run (host_id) WHERE host_id IS NOT NULL`,
+  /**
+   * Macs that may still hold build directories this plugin left there. Not
+   * derived from `run`: history retention deletes the last run of a Mac that
+   * stayed offline, and its bundles would then never be cleaned. A row goes
+   * only once that Mac reports nothing left.
+   */
+  `CREATE TABLE IF NOT EXISTS remote_host (
+     host_id  TEXT PRIMARY KEY,
+     added_at INTEGER NOT NULL
+   )`,
+
+  // ---- v4: builds this plugin only watches, on other Macs -----------------
+  /**
+   * DerivedData roots, keyed by the Mac they are on as well as their path.
+   *
+   * Two Macs routinely hold the very same root path — the same user name, the
+   * same checkout location, so the same DerivedData hash — and they are
+   * different directories. Keyed by path alone, the second Mac's root would
+   * overwrite the first's and the sweep would read one Mac's manifests as the
+   * other's. `''` is this machine (a primary key cannot use NULL for that:
+   * SQLite treats every NULL as distinct), so every existing row moves over
+   * as this machine's, unchanged.
+   */
+  `CREATE TABLE IF NOT EXISTS root_v4 (
+     host_id        TEXT NOT NULL DEFAULT '',
+     path           TEXT NOT NULL,
+     project_id     TEXT,
+     discovered_via TEXT NOT NULL,
+     first_seen_at  INTEGER NOT NULL,
+     last_seen_at   INTEGER NOT NULL,
+     PRIMARY KEY (host_id, path)
+   )`,
+  `INSERT OR IGNORE INTO root_v4
+     (host_id, path, project_id, discovered_via, first_seen_at, last_seen_at)
+   SELECT '', path, project_id, discovered_via, first_seen_at, last_seen_at FROM root`,
+  `DROP TABLE root`,
+  `ALTER TABLE root_v4 RENAME TO root`,
 ];
+
+/** Where the tracker's v3 statements start; asserted by the merge test. */
+export const V3_MIGRATIONS_START = 39;
+/** Where the tracker's v4 statements start; asserted by the merge test. */
+export const V4_MIGRATIONS_START = 42;
+
+/**
+ * Run ids of builds the `bb.host` worker ran for this plugin on another Mac
+ * (`src/remote.ts`). Those runs are owned there: the probe, the sweeps and the
+ * engine's process fold leave them alone, even on the Mac they ran on.
+ */
+export const HOST_BUILD_RUN_PREFIX = "w:";
+
+/** Is this a tracked build the host worker ran, rather than one it watched? */
+export function isHostBuildRun(run: Pick<Run, "id" | "hostId">): boolean {
+  return run.hostId !== null && run.id.startsWith(HOST_BUILD_RUN_PREFIX);
+}
+
+/**
+ * The idempotence key for "this bundle has been read".
+ *
+ * This machine's keys are the bare path, as they always were. Another Mac's
+ * carry its host, because the same path on two Macs is two bundles. Tracked
+ * builds on other Macs (`src/remote.ts`) keep the bare form: their bundle
+ * lives in a per-build directory no other path can collide with.
+ */
+export function bundleScannedKey(hostId: string | null, bundlePath: string): string {
+  return hostId === null
+    ? `bundle-scanned:${bundlePath}`
+    : `bundle-scanned@${hostId}:${bundlePath}`;
+}
 
 /**
  * Escape a value for use as a LIKE prefix pattern.
@@ -204,6 +288,8 @@ export interface RunScope {
   threadId: string;
   path: string;
   branch: string | null;
+  /** The Mac the checkout is on; null for this machine. */
+  hostId: string | null;
 }
 
 interface RunRowRaw {
@@ -233,6 +319,7 @@ interface RunRowRaw {
   branch: string | null;
   worktree: string | null;
   thread_id: string | null;
+  host_id: string | null;
 }
 
 function toRun(raw: RunRowRaw): Run {
@@ -263,6 +350,7 @@ function toRun(raw: RunRowRaw): Run {
     branch: raw.branch,
     worktree: raw.worktree,
     threadId: raw.thread_id,
+    hostId: raw.host_id,
   };
 }
 
@@ -299,8 +387,8 @@ export class Store {
          destination, project_id, root, cwd, pid, cmdline, started_at,
          ended_at, error_count, warning_count, analyzer_count, test_total,
          test_failed, test_skipped, bundle_path, detailed, branch, worktree,
-         thread_id
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         thread_id, host_id
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       run.id,
       run.status,
@@ -328,6 +416,7 @@ export class Store {
       run.branch,
       run.worktree,
       run.threadId,
+      run.hostId,
     );
   }
 
@@ -346,10 +435,13 @@ export class Store {
    * `run_bundle_idx`, not a scan of whatever happens to be recent. `ORDER BY`
    * only settles the pathological case of pre-index duplicates.
    */
-  getRunByBundlePath(bundlePath: string): Run | null {
+  getRunByBundlePath(bundlePath: string, hostId: string | null): Run | null {
+    // `IS`: null-safe, and null is this machine. The same path on another Mac
+    // is another bundle.
     const raw = this.sql(
-      `SELECT * FROM run WHERE bundle_path = ? ORDER BY started_at DESC LIMIT 1`,
-    ).get(bundlePath) as RunRowRaw | undefined;
+      `SELECT * FROM run WHERE bundle_path = ? AND host_id IS ?
+        ORDER BY started_at DESC LIMIT 1`,
+    ).get(bundlePath, hostId) as RunRowRaw | undefined;
     return raw ? toRun(raw) : null;
   }
 
@@ -360,18 +452,161 @@ export class Store {
    * means "we looked at it". They are different questions, and keeping them
    * separate is what lets a deliberate re-queue actually re-read. Answered in
    * SQL so a long build's bundle cannot age out of a fixed window.
+   *
+   * One machine's bundles only (`hostId` null is this one): a bundle path
+   * names a file on the Mac its run was on, and stat'ing it anywhere else
+   * reads as "never finalized" and would mark a perfectly good build
+   * cancelled. Tracked builds on other Macs are not listed at all; they go
+   * through `listUnscannedRemoteBundles` and `src/remote.ts`.
    */
-  listUnscannedBundlePaths(limit = 500): string[] {
+  listUnscannedBundlePaths(limit = 500, hostId: string | null = null): string[] {
+    if (hostId === null) {
+      const rows = this.sql(
+        `SELECT bundle_path AS path, MAX(started_at) AS at FROM run
+          WHERE bundle_path IS NOT NULL
+            AND host_id IS NULL
+            AND (detailed = 0
+                 OR NOT EXISTS (SELECT 1 FROM seen_artifact s
+                                 WHERE s.key = 'bundle-scanned:' || run.bundle_path))
+          GROUP BY bundle_path
+          ORDER BY at DESC LIMIT ?`,
+      ).all(limit) as Array<{ path: string }>;
+      return rows.map((row) => row.path);
+    }
     const rows = this.sql(
       `SELECT bundle_path AS path, MAX(started_at) AS at FROM run
         WHERE bundle_path IS NOT NULL
+          AND host_id = ?
+          AND id NOT LIKE 'w:%'
           AND (detailed = 0
                OR NOT EXISTS (SELECT 1 FROM seen_artifact s
-                               WHERE s.key = 'bundle-scanned:' || run.bundle_path))
+                               WHERE s.key = 'bundle-scanned@' || run.host_id || ':' || run.bundle_path))
         GROUP BY bundle_path
         ORDER BY at DESC LIMIT ?`,
-    ).all(limit) as Array<{ path: string }>;
+    ).all(hostId, limit) as Array<{ path: string }>;
     return rows.map((row) => row.path);
+  }
+
+  /**
+   * Remote runs whose bundle the host worker has not summarized yet.
+   *
+   * The remote counterpart of `listUnscannedBundlePaths`: settled (a bundle of
+   * a running build is never complete), not yet detailed, not yet marked
+   * scanned. Newest first, so a backlog never starves the build someone is
+   * waiting on.
+   */
+  listUnscannedRemoteBundles(limit = 50): Array<{
+    runId: string;
+    hostId: string;
+    bundlePath: string;
+  }> {
+    const rows = this.sql(
+      `SELECT id, host_id, bundle_path FROM run
+        WHERE host_id IS NOT NULL AND id LIKE 'w:%' AND bundle_path IS NOT NULL
+          AND status NOT IN ('running','finishing')
+          AND detailed = 0
+          AND NOT EXISTS (SELECT 1 FROM seen_artifact s
+                           WHERE s.key = 'bundle-scanned:' || run.bundle_path)
+        ORDER BY started_at DESC LIMIT ?`,
+    ).all(limit) as Array<{ id: string; host_id: string; bundle_path: string }>;
+    return rows.map((row) => ({
+      runId: row.id,
+      hostId: row.host_id,
+      bundlePath: row.bundle_path,
+    }));
+  }
+
+  /**
+   * Remote runs still waiting on their Mac to say how they ended.
+   *
+   * Running ones, and also ones the engine's age cap ended without any word
+   * from their Mac (status `ended` at the observed rank, never settled by a
+   * host answer). That is a laptop asleep overnight: when it wakes, its exit
+   * file and finished bundle are still there to be read, and the rank lattice
+   * lets the real verdict replace the silence.
+   */
+  listRemoteRunsAwaitingHost(): Run[] {
+    const rows = this.sql(
+      `SELECT * FROM run WHERE host_id IS NOT NULL AND id LIKE 'w:%'
+          AND (status IN ('running','finishing')
+               OR (status = 'ended' AND status_rank = 0))
+          AND NOT EXISTS (SELECT 1 FROM seen_artifact s
+                           WHERE s.key = 'remote-settled:' || run.id)
+        ORDER BY started_at DESC`,
+    ).all() as RunRowRaw[];
+    return rows.map(toRun);
+  }
+
+  /** Record that a remote run's Mac gave a definitive answer about it. */
+  markRemoteSettled(runId: string, now: number): void {
+    this.markSeen(`remote-settled:${runId}`, now);
+  }
+
+  /** Every Mac this store holds a tracked build for. */
+  listRemoteHostIds(): string[] {
+    return (
+      this.sql(
+        `SELECT DISTINCT host_id FROM run WHERE host_id IS NOT NULL AND id LIKE 'w:%'`,
+      ).all() as Array<{ host_id: string }>
+    ).map((row) => row.host_id);
+  }
+
+  /** Tracked builds recorded for a Mac; watched builds leave nothing there. */
+  countRunsOnHost(hostId: string): number {
+    const row = this.sql(
+      `SELECT COUNT(*) AS n FROM run WHERE host_id = ? AND id LIKE 'w:%'`,
+    ).get(hostId) as
+      | { n: number }
+      | undefined;
+    return row?.n ?? 0;
+  }
+
+  /** Remember a Mac that may hold build directories. Idempotent. */
+  addCleanupHost(hostId: string, now: number): void {
+    this.sql(
+      `INSERT INTO remote_host (host_id, added_at) VALUES (?, ?)
+       ON CONFLICT(host_id) DO NOTHING`,
+    ).run(hostId, now);
+  }
+
+  listCleanupHosts(): string[] {
+    return (
+      this.sql(`SELECT host_id FROM remote_host ORDER BY added_at`).all() as Array<{
+        host_id: string;
+      }>
+    ).map((row) => row.host_id);
+  }
+
+  removeCleanupHost(hostId: string): void {
+    this.sql(`DELETE FROM remote_host WHERE host_id = ?`).run(hostId);
+  }
+
+  /** Drop a run that never existed: a start its Mac refused outright. */
+  deleteRun(id: string): void {
+    this.sql(`DELETE FROM run WHERE id = ?`).run(id);
+  }
+
+  /**
+   * Fill in what only the Mac knows about a start: the bundle it writes, the
+   * pid, the real working directory and argv, its clock's start time. Only
+   * for a run whose start was not confirmed yet (`bundle_path` still NULL).
+   */
+  adoptRemoteStart(
+    id: string,
+    started: { bundlePath: string; pid: number; cwd: string; cmdline: string; startedAt: number },
+  ): boolean {
+    const result = this.sql(
+      `UPDATE run SET bundle_path = ?, pid = ?, cwd = ?, cmdline = ?, started_at = ?
+        WHERE id = ? AND host_id IS NOT NULL AND bundle_path IS NULL`,
+    ).run(
+      started.bundlePath,
+      started.pid,
+      started.cwd,
+      started.cmdline,
+      started.startedAt,
+      id,
+    ) as { changes?: number };
+    return (result?.changes ?? 0) > 0;
   }
 
   updateRun(run: Run): void {
@@ -419,16 +654,23 @@ export class Store {
    * path — a build the probe saw before the thread's scope was registered
    * (the thread.active resolution races the first probe tick).
    */
-  attributeRunsToThread(threadId: string, path: string, since: number): number {
+  attributeRunsToThread(
+    threadId: string,
+    path: string,
+    hostId: string | null,
+    since: number,
+  ): number {
     const base = path.endsWith("/") ? path.slice(0, -1) : path;
     if (!base) return 0;
     const prefix = likePrefix(base);
+    // `IS`, not `=`: null-safe, and null is this machine. The same path on
+    // another Mac is a different checkout.
     const result = this.sql(
       `UPDATE run SET thread_id = ?
-        WHERE thread_id IS NULL AND started_at >= ?
+        WHERE thread_id IS NULL AND started_at >= ? AND host_id IS ?
           AND (cwd = ? OR cwd LIKE ? ESCAPE '\\'
                OR container = ? OR container LIKE ? ESCAPE '\\')`,
-    ).run(threadId, since, base, prefix, base, prefix) as { changes?: number };
+    ).run(threadId, since, hostId, base, prefix, base, prefix) as { changes?: number };
     return result?.changes ?? 0;
   }
 
@@ -502,15 +744,17 @@ export class Store {
     root: string | null;
     scheme: string | null;
     kind: RunKind;
+    /** The Mac the root is on; null for this one. Same path, other Mac: other root. */
+    hostId?: string | null;
   }): number | null {
     if (!query.root || !query.scheme) return null;
     const rows = this.sql(
       `SELECT (ended_at - started_at) AS ms FROM run
-        WHERE root = ? AND scheme = ? AND kind = ?
+        WHERE root = ? AND scheme = ? AND kind = ? AND host_id IS ?
           AND ended_at IS NOT NULL
           AND status IN ('passed', 'warnings')
         ORDER BY started_at DESC LIMIT 20`,
-    ).all(query.root, query.scheme, query.kind) as Array<{ ms: number }>;
+    ).all(query.root, query.scheme, query.kind, query.hostId ?? null) as Array<{ ms: number }>;
 
     const samples = rows
       .map((row) => row.ms)
@@ -558,13 +802,34 @@ export class Store {
    * every unresolved row and mapping it to a `Run` just to read `.length` —
    * alongside `expireFinishing`, which fetches the same rows for real. This is
    * the question actually being asked.
+   *
+   * Per machine (`hostId` null is this one): it sets that machine's sweep
+   * cadence, and a build on another Mac gives this machine's DerivedData
+   * nothing new to read. Tracked builds the host worker runs are not counted
+   * anywhere — `src/remote.ts` settles those, not a sweep.
    */
-  hasUnresolved(): boolean {
+  hasUnresolved(hostId: string | null = null): boolean {
     return Boolean(
       this.sql(
-        `SELECT 1 FROM run WHERE status IN ('running','finishing') LIMIT 1`,
-      ).get(),
+        `SELECT 1 FROM run WHERE status IN ('running','finishing')
+            AND host_id IS ? AND id NOT LIKE 'w:%' LIMIT 1`,
+      ).get(hostId),
     );
+  }
+
+  /**
+   * Other Macs with a watched build still open. They are watched until it
+   * resolves, whether or not a thread there is still active: a Mac that
+   * stopped being asked would leave its build `running` until the age cap.
+   */
+  listHostsWithOpenWatchedRuns(): string[] {
+    return (
+      this.sql(
+        `SELECT DISTINCT host_id FROM run
+          WHERE host_id IS NOT NULL AND id NOT LIKE 'w:%'
+            AND status IN ('running','finishing')`,
+      ).all() as Array<{ host_id: string }>
+    ).map((row) => row.host_id);
   }
 
   /**
@@ -576,16 +841,37 @@ export class Store {
    * the log-store entry spawn a duplicate standalone row (measured live).
    * The rank lattice already guards against a lower-rank source overwriting a
    * verified verdict; the filter's only job is candidacy, not protection.
+   *
+   * One machine's runs only (`hostId` null is this one). Every artifact these
+   * candidates are matched against was found on that machine's disk, so a
+   * build that overlapped in time on another Mac cannot be what it describes.
    */
-  findVerdictCandidates(aroundMs: number, slackMs: number): Run[] {
+  findVerdictCandidates(aroundMs: number, slackMs: number, hostId: string | null = null): Run[] {
     const rows = this.sql(
       `SELECT * FROM run
         WHERE status_rank < 2
           AND kind NOT IN ('index','package')
+          AND host_id IS ?
           AND started_at <= ?
           AND COALESCE(ended_at, started_at + ?) >= ?
         ORDER BY started_at DESC LIMIT 20`,
-    ).all(aroundMs + slackMs, slackMs, aroundMs - slackMs) as RunRowRaw[];
+    ).all(hostId, aroundMs + slackMs, slackMs, aroundMs - slackMs) as RunRowRaw[];
+    return rows.map(toRun);
+  }
+
+  /**
+   * Tracked builds on one Mac overlapping a moment, at any rank: the runs a
+   * log entry Xcode wrote for one of them must be absorbed by, even after
+   * its bundle made it ineligible as a verdict candidate.
+   */
+  findHostBuildsAround(aroundMs: number, slackMs: number, hostId: string): Run[] {
+    const rows = this.sql(
+      `SELECT * FROM run
+        WHERE host_id = ? AND id LIKE 'w:%'
+          AND started_at <= ?
+          AND COALESCE(ended_at, started_at + ?) >= ?
+        ORDER BY started_at DESC LIMIT 20`,
+    ).all(hostId, aroundMs + slackMs, slackMs, aroundMs - slackMs) as RunRowRaw[];
     return rows.map(toRun);
   }
 
@@ -691,32 +977,36 @@ export class Store {
     return row?.n ?? 0;
   }
 
+  /** A DerivedData root on one machine (`hostId` null is this one). */
   upsertRoot(
     path: string,
     projectId: string | null,
     via: string,
     now: number,
+    hostId: string | null = null,
   ): boolean {
-    const existed = this.sql(`SELECT 1 FROM root WHERE path = ?`).get(path);
+    const host = hostId ?? "";
+    const existed = this.sql(`SELECT 1 FROM root WHERE host_id = ? AND path = ?`).get(host, path);
     this.sql(
-      `INSERT INTO root (path, project_id, discovered_via, first_seen_at, last_seen_at)
-       VALUES (?,?,?,?,?)
-       ON CONFLICT(path) DO UPDATE SET
+      `INSERT INTO root (host_id, path, project_id, discovered_via, first_seen_at, last_seen_at)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT(host_id, path) DO UPDATE SET
          last_seen_at = excluded.last_seen_at,
          project_id = COALESCE(root.project_id, excluded.project_id)`,
-    ).run(path, projectId, via, now, now);
+    ).run(host, path, projectId, via, now, now);
     return !existed;
   }
 
-  listRoots(): Array<{
+  /** One machine's DerivedData roots, most recently seen first. */
+  listRoots(hostId: string | null = null): Array<{
     path: string;
     projectId: string | null;
     discoveredVia: string;
     firstSeenAt: number;
     lastSeenAt: number;
   }> {
-    return this.sql(`SELECT * FROM root ORDER BY last_seen_at DESC`)
-      .all()
+    return this.sql(`SELECT * FROM root WHERE host_id = ? ORDER BY last_seen_at DESC`)
+      .all(hostId ?? "")
       .map((raw) => {
         const row = raw as {
           path: string;
@@ -937,7 +1227,8 @@ export class Store {
  * The SQL half of `runMatchesScope`.
  *
  * Kept in lockstep with `scopes.ts` by `test/scopes.test.ts`, which runs the
- * same fixtures through both. The three arms, weakest last:
+ * same fixtures through both. The three arms, weakest last — the second and
+ * third only for a run on the scope's own machine:
  *
  *  - the run was attributed to this thread when it was observed;
  *  - one of its paths sits under the thread's checkout;
@@ -949,7 +1240,6 @@ function scopeClause(scope: RunScope): { sql: string; params: unknown[] } {
   const base = scope.path.endsWith("/") ? scope.path.slice(0, -1) : scope.path;
   const prefix = likePrefix(base);
   const arms = [
-    "thread_id = ?",
     "cwd = ?",
     "cwd LIKE ? ESCAPE '\\'",
     "container = ?",
@@ -958,7 +1248,6 @@ function scopeClause(scope: RunScope): { sql: string; params: unknown[] } {
     "root LIKE ? ESCAPE '\\'",
   ];
   const params: unknown[] = [
-    scope.threadId,
     base,
     prefix,
     base,
@@ -970,5 +1259,10 @@ function scopeClause(scope: RunScope): { sql: string; params: unknown[] } {
     arms.push("(worktree = ? AND branch = ?)");
     params.push(base.slice(base.lastIndexOf("/") + 1), scope.branch);
   }
-  return { sql: `(${arms.join(" OR ")})`, params };
+  // The thread arm stands alone; every path/name arm is only meaningful on
+  // the run's own machine (`IS`: null-safe, null = this machine).
+  return {
+    sql: `(thread_id = ? OR (host_id IS ? AND (${arms.join(" OR ")})))`,
+    params: [scope.threadId, scope.hostId ?? null, ...params],
+  };
 }
