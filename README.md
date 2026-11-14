@@ -4,7 +4,7 @@
 
 <p align="center">
 <a href="https://github.com/vburojevic/bb-plugin-xcode/releases/latest"><img src="https://img.shields.io/github/v/release/vburojevic/bb-plugin-xcode?style=flat-square&label=release&color=57606a" alt="Latest release"></a>
-<a href="https://getbb.app"><img src="https://img.shields.io/badge/bb-%E2%89%A5%200.47-57606a?style=flat-square" alt="Requires bb 0.47 or later"></a>
+<a href="https://getbb.app"><img src="https://img.shields.io/badge/bb-%E2%89%A5%200.49-57606a?style=flat-square" alt="Requires bb 0.49 or later"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-57606a?style=flat-square" alt="MIT license"></a>
 <a href="https://github.com/get-bb/marketplace"><img src="https://img.shields.io/badge/BB%20Community-marketplace-57606a?style=flat-square" alt="Listed in the BB Community marketplace"></a>
 </p>
